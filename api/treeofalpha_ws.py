@@ -190,10 +190,12 @@ def run_tree_of_alpha_listener(
             daemon=True, name="toa-ws",
         ).start()
     """
-    # Используем uvloop если есть (drop-in 2-4x speedup для asyncio loop)
+    # FIX: unified с parser_delist.py / parser_listing.py — set_event_loop_policy
+    # вместо deprecated uvloop.install() (deprecated с uvloop 0.18+).
+    # Идемпотентно — главный процесс мог уже выставить policy, повторный вызов OK.
     try:
         import uvloop  # type: ignore[import-not-found]
-        uvloop.install()
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     except ImportError:
         pass
 

@@ -10,6 +10,8 @@ import threading
 
 from api.delist_api import (
     _post,
+    _post_order,
+    _new_order_link_id,
     _get_qty_step,
     _round_qty,
     get_price,
@@ -98,13 +100,19 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
             if amount_tokens <= 0:
                 print(f"[QTY ZERO BYBIT] {symbol}")
             else:
+                qty_str = str(amount_tokens)
+                # FIX: один orderLinkId на WS и REST fallback — Bybit отвергнет
+                # дубль с retCode 30050, защита от double-position при WS
+                # ack timeout (см. _post_order в delist_api).
+                order_link_id = _new_order_link_id()
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
                     "side":        "Buy",
                     "orderType":   "Market",
-                    "qty":         str(amount_tokens),
+                    "qty":         qty_str,
                     "positionIdx": 1,
+                    "orderLinkId": order_link_id,
                 }
                 # FIX-batch-5: WS Trade API → fallback REST.
                 placed_via = "REST"
@@ -115,7 +123,9 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                     ws_ack = None
 
                 if ws_ack is None:
-                    _post("/v5/order/create", order_args)
+                    # FIX-batch-8 #5: fast-path _post_order вместо _post (f-string,
+                    # -2..-5мс) + тот же orderLinkId — idempotency.
+                    _post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id)
                 else:
                     placed_via = "WS"
 

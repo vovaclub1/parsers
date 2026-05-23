@@ -60,10 +60,14 @@ _RECONNECT_DELAY_MAX = 30.0
 _AUTH_EXPIRES_SEC = 10
 
 # Таймаут для ack ответа.
-# FIX: было 3.0с — слишком много. WS ack нормально приходит за 5-30мс;
-# если WS подвисает, лучше быстро вернуть None и упасть в REST fallback
-# (тот делает ордер за ~50-80мс), чем висеть 3 секунды и упустить движение.
-_ORDER_ACK_TIMEOUT = 0.5
+# FIX: 0.5с был слишком агрессивным — на любой сетевой glitch (jitter >500мс)
+# WS возвращал None → REST делал ВТОРОЙ ордер на ту же монету (double-position
+# risk), потому что первый WS-ордер уже мог быть принят Bybit.
+# Теперь orderLinkId защищает от дублей (см. place_order ниже), поэтому можем
+# поднять таймаут до 1.5с без риска. WS ack нормально приходит за 5-30мс,
+# 1.5с покрывает 99.9% случаев. Если всё же таймаут → REST с тем же
+# orderLinkId, Bybit отвергнет дубль с retCode 30050.
+_ORDER_ACK_TIMEOUT = 1.5
 
 
 class BybitWsTrade:
@@ -148,9 +152,13 @@ class BybitWsTrade:
 
                     auth_resp_raw = await asyncio.wait_for(ws.recv(), timeout=5)
                     auth_resp = _json_loads(auth_resp_raw)
-                    # FIX: V5 auth ответ — {"success": true, "ret_msg": "", "op": "auth", ...}.
-                    # retCode там НЕТ, поэтому проверяем тsолько success.
-                    if not auth_resp['retCode'] == 0:
+                    # V5 Trade auth ответ: содержит retCode (0 = OK) И success (true).
+                    # FIX: используем defensive check на оба поля — если Bybit когда-нибудь
+                    # выкатит формат без retCode, всё равно не упадём с KeyError.
+                    ret_code = auth_resp.get("retCode")
+                    success  = auth_resp.get("success")
+                    auth_ok = (ret_code == 0) or (success is True)
+                    if not auth_ok:
                         print(f"[BYBIT-WS] auth failed: {auth_resp}", flush=True)
                         await asyncio.sleep(delay)
                         continue
@@ -225,6 +233,9 @@ class BybitWsTrade:
             "header": {
                 "X-BAPI-TIMESTAMP":  ts_ms,
                 "X-BAPI-RECV-WINDOW": "5000",
+                # NOTE: Referer = Bybit affiliate-code. Если есть свой
+                # affiliate-аккаунт — замени "Parsers" на свой код, получишь
+                # rev-share с комиссий. Сейчас просто маркер для логирования.
                 "Referer":            "Parsers",
             },
             "args": [args],
@@ -276,14 +287,22 @@ class BybitWsTrade:
 # ── удобные обёртки ──────────────────────────────────────────────
 
 _global_instance: BybitWsTrade | None = None
+_init_lock = threading.Lock()
 
 
 def init(api_key: str, api_secret: str) -> BybitWsTrade:
-    """Инициализирует singleton (вызывать один раз в начале процесса)."""
+    """
+    Инициализирует singleton (вызывать один раз в начале процесса).
+    FIX-14: thread-safe — если два потока одновременно вызовут init(),
+    оба увидят None в проверке и создадут инстанс дважды (BybitWsTrade.get
+    защищён внутренним lock, так что реально создастся один, но
+    _global_instance мог бы присвоиться дважды без этого lock).
+    """
     global _global_instance
-    if _global_instance is None:
-        _global_instance = BybitWsTrade.get(api_key, api_secret)
-    return _global_instance
+    with _init_lock:
+        if _global_instance is None:
+            _global_instance = BybitWsTrade.get(api_key, api_secret)
+        return _global_instance
 
 
 def get_instance() -> BybitWsTrade | None:

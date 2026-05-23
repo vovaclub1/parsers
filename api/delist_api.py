@@ -7,6 +7,7 @@ import re
 import socket
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from config.config import BYBIT_API_KEY, BYBIT_SECRET_KEY
@@ -144,7 +145,13 @@ def _sign(ts: str, body_str: str) -> str:
 #   4. retCode проверяем без лишнего .get(..., default).
 # Win: −2...−5мс на REST-fallback ордера (когда WS Trade не сработал).
 
+# Bybit retCode для дублирующегося orderLinkId — ордер УЖЕ принят на сервере,
+# можно считать success (первая попытка прошла, ответ просто потерялся в сети).
+_BYBIT_DUPLICATE_RET_CODES = {30050}  # OrderLinkID is duplicate
+
+
 def _post_order(symbol: str, side: str, qty: str, position_idx: int,
+                order_link_id: str | None = None,
                 retries: int = 2) -> dict:
     """
     Размещает Market ордер через Bybit V5 REST максимально быстро.
@@ -152,14 +159,32 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
     :param side: "Buy" | "Sell".
     :param qty: str с количеством в токенах.
     :param position_idx: 1=long-hedge, 2=short-hedge.
+    :param order_link_id: уникальный ID ордера (max 36 chars). Защищает от
+        дубля при retry: если Timeout произошёл из-за потерянного ответа,
+        а ордер реально принят — повтор с тем же orderLinkId Bybit отвергнет
+        с retCode 30050, и мы это интерпретируем как success (первый прошёл).
+        Если None — retries безопаснее НЕ делать (см. retries-логику ниже).
     """
-    body_str = (
-        f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
-        f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}}}'
-    )
+    if order_link_id:
+        body_str = (
+            f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
+            f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx},'
+            f'"orderLinkId":"{order_link_id}"}}'
+        )
+    else:
+        body_str = (
+            f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
+            f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}}}'
+        )
+
+    # FIX: ретраи на Timeout/ConnectionError ОПАСНЫ для market-ордеров без
+    # idempotency: Timeout не значит "ордер не принят", только "ответ не дошёл".
+    # Поэтому ретраим только если есть orderLinkId — тогда Bybit сам отвергнет
+    # дубль с retCode 30050, и мы это поймаем как success.
+    effective_retries = retries if order_link_id else 0
 
     last_exc: Exception | None = None
-    for attempt in range(retries + 1):
+    for attempt in range(effective_retries + 1):
         ts = str(int(time.time() * 1000))
         sign = _sign(ts, body_str)
 
@@ -172,15 +197,24 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
             )
             resp.raise_for_status()
             data = _json_loads(resp.content)
-            if data.get("retCode") != 0:
-                raise RuntimeError(
-                    f"Bybit order error retCode={data.get('retCode')} "
-                    f"msg={data.get('retMsg')} symbol={symbol} qty={qty}"
+            ret_code = data.get("retCode")
+            if ret_code == 0:
+                return data
+            # Дубль orderLinkId → первая попытка реально прошла. Возвращаем
+            # как success, чтобы не двойнить позицию.
+            if order_link_id and ret_code in _BYBIT_DUPLICATE_RET_CODES:
+                print(
+                    f"[BYBIT] duplicate orderLinkId={order_link_id} "
+                    f"(attempt {attempt + 1}) — первый запрос прошёл, считаем success"
                 )
-            return data
+                return data
+            raise RuntimeError(
+                f"Bybit order error retCode={ret_code} "
+                f"msg={data.get('retMsg')} symbol={symbol} qty={qty}"
+            )
         except (requests.Timeout, requests.ConnectionError) as e:
             last_exc = e
-            if attempt < retries:
+            if attempt < effective_retries:
                 time.sleep(0.1 * (attempt + 1))
                 continue
             raise
@@ -190,6 +224,14 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
     if last_exc:
         raise last_exc
     return {}
+
+
+def _new_order_link_id() -> str:
+    """
+    Уникальный orderLinkId для idempotency. Bybit допускает до 36 символов
+    [A-Za-z0-9_-]. uuid4().hex = 32 hex chars — влезает с запасом.
+    """
+    return uuid.uuid4().hex
 
 
 def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
@@ -416,6 +458,12 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
             if amount_tokens > 0:
                 qty_str = str(amount_tokens)
 
+                # FIX: один orderLinkId на оба пути (WS и REST fallback) —
+                # защита от double-position при WS ack timeout: если WS-ордер
+                # реально прошёл, но ack не пришёл, REST с тем же
+                # orderLinkId Bybit отвергнет (retCode 30050 → success).
+                order_link_id = _new_order_link_id()
+
                 # FIX-batch-5: пробуем WS Trade API (−30...−80мс), при ошибке/None — REST.
                 placed_via = "REST"
                 ws_args = {
@@ -425,6 +473,7 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                     "orderType":   "Market",
                     "qty":         qty_str,
                     "positionIdx": 2,
+                    "orderLinkId": order_link_id,
                 }
                 try:
                     ws_ack = _ws_place_order(ws_args)
@@ -434,7 +483,8 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
 
                 if ws_ack is None:
                     # FIX-batch-8: специализированный _post_order (f-string JSON, −2..−5мс)
-                    _post_order(symbol, "Sell", qty_str, 2)
+                    # FIX: тот же orderLinkId, что и в WS-попытке — idempotency.
+                    _post_order(symbol, "Sell", qty_str, 2, order_link_id=order_link_id)
                 else:
                     placed_via = "WS"
 
