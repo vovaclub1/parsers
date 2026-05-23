@@ -439,9 +439,12 @@ def _get_qty_step(symbol: str) -> float:
     :raises QtyStepUnavailable: если шаг не получили.
     """
     coin = symbol.replace("USDT", "")
-    with _lot_step_lock:
-        if coin in _lot_step_cache:
-            return _lot_step_cache[coin]
+    # FIX-PERF: lockless fast-path. dict.get атомарен под GIL, lock нужен
+    # только для записи (которая случается 1 раз на символ — preload или
+    # первый ордер по неизвестному тикеру). Hot-path просто читает.
+    step = _lot_step_cache.get(coin)
+    if step is not None:
+        return step
 
     try:
         data       = _get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
@@ -455,24 +458,28 @@ def _get_qty_step(symbol: str) -> float:
     return step
 
 
+# FIX-PERF: import на модульном уровне + кеш precision по step.
+# Раньше _round_qty каждый раз делал from decimal import (~0.01мс) и
+# Decimal(str(step)).as_tuple().exponent (~0.05мс). Кеш убирает оба
+# на повторных вызовах одного шага.
+from decimal import Decimal as _Decimal
+_qty_precision_cache: dict[float, int] = {}
+
+
 def _round_qty(qty: float, step: float) -> float:
     """
     Округляет количество вниз до ближайшего шага лота.
-    :param qty: float - исходное количество.
-    :param step: float - шаг лота от биржи.
-    :return: float - округлённое количество.
 
     FIX: считаем precision через Decimal, потому что str(1e-05) == '1e-05'
     и старый код возвращал precision=0 (нет точки → ветка else), а потом
     round(..., 0) обнулял дробную часть → qty=0 → ордер не размещался либо
     падал на минимальный 1 контракт.
     """
-    from decimal import Decimal
-
-    step_d = Decimal(str(step))
-    # exponent = -precision (для шагов <1). Для шага 1.0 exponent=0 → precision=0.
-    exponent = step_d.as_tuple().exponent
-    precision = max(0, -int(exponent))
+    precision = _qty_precision_cache.get(step)
+    if precision is None:
+        exponent  = _Decimal(str(step)).as_tuple().exponent
+        precision = max(0, -int(exponent))
+        _qty_precision_cache[step] = precision
     rounded = (qty // step) * step
     return round(rounded, precision)
 
@@ -547,7 +554,9 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
 
                 with _delist_exchange_lock:
                     _delist_exchange[ticker_name] = "bybit"
-                print(f"[BYBIT SHORT/{placed_via}] {symbol} | tokens={amount_tokens} | price≈{bybit_price}")
+                # FIX-PERF: удалён print "[BYBIT SHORT/{placed_via}]" — он стоял
+                # ПЕРЕД return и добавлял ~1мс к open_ms (PYTHONUNBUFFERED=1).
+                # На WS-failure bybit_ws_trade сам пишет "[BYBIT-WS-FAST] ...".
                 return amount_tokens, bybit_price
 
     # ── Gate.io fallback ─────────────────────────────────────────
@@ -666,22 +675,24 @@ def find_pairs(text: str) -> list[str]:
     :param text: str - текст статьи о делистинге.
     :return: list[str] - список тикеров монет.
     """
+    # FIX-PERF: убраны print'ы "[FIND PAIRS] метод=..." — find_pairs
+    # вызывается в hot-path TG/article handler'а перед submit'ом, каждый
+    # print с PYTHONUNBUFFERED=1 ≈ ~0.5-1мс. "Монеты: [...]" в DELIST-блоке
+    # показывает найденные тикеры; method для debug — раскомментировать.
     text_upper = text.upper()
 
     usdt_pairs = _RE_USDT.findall(text_upper)
     if usdt_pairs:
         found = _filter_tokens(usdt_pairs)
         if found:
-            print(f"[FIND PAIRS] метод=USDT-пары → {found}")
             return found
 
-    # FIX-batch-7: $TICKER маркеры (CLW: "Monitoring Tag Added – $ALCX, $COOKIE...")
+    # FIX-batch-7: $TICKER маркеры (CLW: "Monitoring Tag Added – $ALCX...")
     # FIX: нормализуем в uppercase — каналы изредка пишут "$alcx".
     dollar_pairs = [t.upper() for t in _RE_DOLLAR_TKN.findall(text)]
     if dollar_pairs:
         found = _filter_tokens(dollar_pairs)
         if found:
-            print(f"[FIND PAIRS] метод=$ticker → {found}")
             return found
 
     m = _RE_WILL_DELIST.search(text_upper)
@@ -689,16 +700,14 @@ def find_pairs(text: str) -> list[str]:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
         found  = _filter_tokens(tokens)
         if found:
-            print(f"[FIND PAIRS] метод=Will-Delist → {found}")
             return found
 
-    # FIX-batch-6: "Will Extend the Monitoring Tag to Include ALCX, COOKIE, DODO..."
+    # FIX-batch-6: "Will Extend the Monitoring Tag to Include ALCX..."
     m = _RE_MONITORING.search(text_upper)
     if m:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
         found  = _filter_tokens(tokens)
         if found:
-            print(f"[FIND PAIRS] метод=Monitoring-Tag → {found}")
             return found
 
     m = _RE_DELIST_BLOCK.search(text_upper)
@@ -706,17 +715,10 @@ def find_pairs(text: str) -> list[str]:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
         found  = _filter_tokens(tokens)
         if found:
-            print(f"[FIND PAIRS] метод=delist-block → {found}")
             return found
 
     all_tokens = _RE_ALL_TOKENS.findall(text_upper)
-    found = [t for t in _filter_tokens(all_tokens) if t in known_coins]
-
-    if found:
-        print(f"[FIND PAIRS] метод=fallback(price_cache) → {found}")
-    else:
-        print("[FIND PAIRS] ничего не найдено в тексте")
-    return found
+    return [t for t in _filter_tokens(all_tokens) if t in known_coins]
 
 
 def _filter_tokens(tokens: list[str]) -> list[str]:

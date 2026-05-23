@@ -146,7 +146,11 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
 
                 with _last_exchange_lock:
                     _last_exchange[ticker_name] = "bybit"
-                print(f"[BYBIT LONG/{placed_via}] {symbol} | tokens={amount_tokens} | price≈{bybit_price}")
+                # FIX-PERF: удалён print "[BYBIT LONG/{placed_via}] ..." — он
+                # стоял ПЕРЕД return и добавлял ~1мс к open_ms (PYTHONUNBUFFERED=1).
+                # WS-vs-REST на success-пути не информативен; на failure-пути
+                # bybit_ws_trade уже логирует "[BYBIT-WS-FAST] send failed/timeout".
+                # Worker сразу после return пишет [OPEN] с timing.
                 return amount_tokens, bybit_price
 
     # ── Gate.io fallback ─────────────────────────────────────────
@@ -251,66 +255,53 @@ def find_listing_pairs(text: str) -> list[str]:
     :param text: str - текст сообщения.
     :return: list[str] - список тикеров.
     """
+    # FIX-PERF: убраны print'ы "[FIND LISTING] метод=..." из тела функции.
+    # find_listing_pairs вызывается в hot-path TG handler'а ДО submit'а,
+    # каждый print с PYTHONUNBUFFERED=1 = ~0.5-1мс. Метод теперь известен
+    # только через counters, но "Монеты : [...]" в LISTING-блоке всё равно
+    # показывает результат. Для диагностики — раскомментировать print'ы.
     # Метод 1: прямой паттерн TG-канала
     matches = _RE_LISTING_TG.findall(text)
     if matches:
-        tickers = list(dict.fromkeys(t.upper() for t, _ in matches))
-        print(f"[FIND LISTING] метод=TG-паттерн → {tickers}")
-        return tickers
+        return list(dict.fromkeys(t.upper() for t, _ in matches))
 
-    # FIX-batch-6: Метод 2 — тикеры в скобках (Binance "Will List X (TICKER)" формат)
-    paren_matches = _RE_TICKER_PAREN.findall(text)
-    paren_tickers = [
-        t for t in paren_matches
+    # FIX-batch-6: Метод 2 — тикеры в скобках (Binance "Will List X (TICKER)")
+    paren_tickers = list(dict.fromkeys(
+        t for t in _RE_TICKER_PAREN.findall(text)
         if t not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 10
         and not t.isdigit()
-    ]
-    paren_tickers = list(dict.fromkeys(paren_tickers))
+    ))
     if paren_tickers:
-        print(f"[FIND LISTING] метод=скобки → {paren_tickers}")
         return paren_tickers
 
-    # FIX-batch-6: Метод 3 — $TICKER маркеры
+    # FIX-batch-6: Метод 3 — $TICKER маркеры.
     # FIX: нормализуем в uppercase (каналы изредка пишут "$alcx").
-    dollar_matches = [t.upper() for t in _RE_TICKER_DOLLAR.findall(text)]
-    dollar_tickers = [
-        t for t in dollar_matches
-        if t not in EXCLUDED_TOKENS
+    dollar_tickers = list(dict.fromkeys(
+        t.upper() for t in _RE_TICKER_DOLLAR.findall(text)
+        if t.upper() not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 10
         and not t.isdigit()
-    ]
-    dollar_tickers = list(dict.fromkeys(dollar_tickers))
+    ))
     if dollar_tickers:
-        print(f"[FIND LISTING] метод=$ticker → {dollar_tickers}")
         return dollar_tickers
 
     # FIX-batch-6: Метод 4 — явные USDT-пары
     text_upper = text.upper()
-    usdt_matches = _RE_USDT_PAIR.findall(text_upper)
-    usdt_tickers = [
-        t for t in usdt_matches
+    usdt_tickers = list(dict.fromkeys(
+        t for t in _RE_USDT_PAIR.findall(text_upper)
         if t not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 10
         and not t.isdigit()
-    ]
-    usdt_tickers = list(dict.fromkeys(usdt_tickers))
+    ))
     if usdt_tickers:
-        print(f"[FIND LISTING] метод=USDT-пары → {usdt_tickers}")
         return usdt_tickers
 
     # Метод 5: fallback по known_coins
-    candidates = _RE_TICKER_PLAIN.findall(text_upper)
-    found = [
-        t for t in candidates
+    return list(dict.fromkeys(
+        t for t in _RE_TICKER_PLAIN.findall(text_upper)
         if t not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 8
         and not t.isdigit()
         and t in known_coins
-    ]
-    found = list(dict.fromkeys(found))
-    if found:
-        print(f"[FIND LISTING] метод=fallback(known_coins) → {found}")
-    else:
-        print(f"[FIND LISTING] ничего не найдено: {text[:80]}")
-    return found
+    ))
