@@ -7,6 +7,7 @@ import re
 import socket
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from config.config import BYBIT_API_KEY, BYBIT_SECRET_KEY
@@ -32,11 +33,15 @@ _DNS_TTL = 300  # 5 минут — Bybit IP редко меняется, но н
 
 def _cached_getaddrinfo(*args, **kwargs):
     now = time.monotonic()
-    cached = _dns_cache.get(args)
+    # FIX: kwargs тоже должны быть частью ключа. Раньше два вызова с разным
+    # `proto`/`flags` могли получить одинаковый кешированный результат и
+    # некоторые asyncio/aiohttp пути ломались на неправильном flag-наборе.
+    key = (args, tuple(sorted(kwargs.items())))
+    cached = _dns_cache.get(key)
     if cached and (now - cached[0]) < _DNS_TTL:
         return cached[1]
     result = _original_getaddrinfo(*args, **kwargs)
-    _dns_cache[args] = (now, result)
+    _dns_cache[key] = (now, result)
     return result
 
 socket.getaddrinfo = _cached_getaddrinfo  # патч до любых сетевых импортов
@@ -51,14 +56,17 @@ from api.gate_api import (   # noqa: E402  (импорт после monkey-patch
 )
 
 # FIX: вынесли импорт из хот-функции market_open_short на модульный уровень.
-# Если модуль не подгружается (например, отсутствует websockets) — place_order_ws
-# становится no-op возвращающий None, и market_open_short падает в REST fallback.
+# FIX-PERF: fire-and-forget вариант place_order_ws_fast — экономит ~70-100мс
+# на ack-roundtrip. Reject логируется в фоне через _watch_ack.
 try:
-    from api.bybit_ws_trade import place_order_ws as _ws_place_order
+    from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
         return None
+    class WSOrderRejected(Exception):  # type: ignore[no-redef]
+        """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
+        pass
 
 # ── Конфиг Bybit ─────────────────────────────────────────────────
 BYBIT_BASE_URL = "https://api.bybit.com"
@@ -144,7 +152,20 @@ def _sign(ts: str, body_str: str) -> str:
 #   4. retCode проверяем без лишнего .get(..., default).
 # Win: −2...−5мс на REST-fallback ордера (когда WS Trade не сработал).
 
+# Bybit retCode для дублирующегося orderLinkId — ордер УЖЕ принят на сервере,
+# можно считать success (первая попытка прошла, ответ просто потерялся в сети).
+_BYBIT_DUPLICATE_RET_CODES = {30050}  # OrderLinkID is duplicate
+
+
+# FIX-8: разрешённые символы в symbol/qty/order_link_id — guard против
+# случайного JSON injection при f-string сборке body_str. Все наши callers
+# формируют их контролируемо (ticker+USDT, str(float), uuid4().hex), но
+# assert ловит regression если когда-нибудь упадёт нестандартный ввод.
+_RE_ORDER_SAFE = re.compile(r"^[A-Za-z0-9._\-]+$")
+
+
 def _post_order(symbol: str, side: str, qty: str, position_idx: int,
+                order_link_id: str | None = None,
                 retries: int = 2) -> dict:
     """
     Размещает Market ордер через Bybit V5 REST максимально быстро.
@@ -152,14 +173,42 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
     :param side: "Buy" | "Sell".
     :param qty: str с количеством в токенах.
     :param position_idx: 1=long-hedge, 2=short-hedge.
+    :param order_link_id: уникальный ID ордера (max 36 chars). Защищает от
+        дубля при retry: если Timeout произошёл из-за потерянного ответа,
+        а ордер реально принят — повтор с тем же orderLinkId Bybit отвергнет
+        с retCode 30050, и мы это интерпретируем как success (первый прошёл).
+        Если None — retries безопаснее НЕ делать (см. retries-логику ниже).
     """
-    body_str = (
-        f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
-        f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}}}'
-    )
+    # FIX-8: проверяем safe-символы — иначе f-string выше может сломать JSON/HMAC.
+    if not _RE_ORDER_SAFE.match(symbol):
+        raise ValueError(f"unsafe symbol for _post_order: {symbol!r}")
+    if side not in ("Buy", "Sell"):
+        raise ValueError(f"invalid side: {side!r}")
+    if not _RE_ORDER_SAFE.match(qty):
+        raise ValueError(f"unsafe qty for _post_order: {qty!r}")
+    if order_link_id is not None and not _RE_ORDER_SAFE.match(order_link_id):
+        raise ValueError(f"unsafe order_link_id: {order_link_id!r}")
+
+    if order_link_id:
+        body_str = (
+            f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
+            f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx},'
+            f'"orderLinkId":"{order_link_id}"}}'
+        )
+    else:
+        body_str = (
+            f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
+            f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}}}'
+        )
+
+    # FIX: ретраи на Timeout/ConnectionError ОПАСНЫ для market-ордеров без
+    # idempotency: Timeout не значит "ордер не принят", только "ответ не дошёл".
+    # Поэтому ретраим только если есть orderLinkId — тогда Bybit сам отвергнет
+    # дубль с retCode 30050, и мы это поймаем как success.
+    effective_retries = retries if order_link_id else 0
 
     last_exc: Exception | None = None
-    for attempt in range(retries + 1):
+    for attempt in range(effective_retries + 1):
         ts = str(int(time.time() * 1000))
         sign = _sign(ts, body_str)
 
@@ -170,26 +219,62 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 headers={"X-BAPI-TIMESTAMP": ts, "X-BAPI-SIGN": sign},
                 timeout=3,
             )
+            # FIX-14: 5xx — серверная ошибка Bybit, безопасно retry с orderLinkId.
+            # 4xx — клиентская, retry бесполезен.
+            if 500 <= resp.status_code < 600:
+                last_exc = requests.HTTPError(f"server {resp.status_code}", response=resp)
+                if attempt < effective_retries:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                raise last_exc
             resp.raise_for_status()
             data = _json_loads(resp.content)
-            if data.get("retCode") != 0:
-                raise RuntimeError(
-                    f"Bybit order error retCode={data.get('retCode')} "
-                    f"msg={data.get('retMsg')} symbol={symbol} qty={qty}"
+            ret_code = data.get("retCode")
+            if ret_code == 0:
+                return data
+            # FIX-7: дубль orderLinkId → нормализуем ответ к success-формату,
+            # чтобы caller'ы которые проверяют retCode == 0 не запутались.
+            if order_link_id and ret_code in _BYBIT_DUPLICATE_RET_CODES:
+                print(
+                    f"[BYBIT] duplicate orderLinkId={order_link_id} "
+                    f"(attempt {attempt + 1}) — первый запрос прошёл, считаем success"
                 )
-            return data
+                return {
+                    "retCode": 0,
+                    "retMsg":  "OK (deduped via orderLinkId)",
+                    "result":  data.get("result", {}),
+                    "_deduped": True,
+                }
+            raise RuntimeError(
+                f"Bybit order error retCode={ret_code} "
+                f"msg={data.get('retMsg')} symbol={symbol} qty={qty}"
+            )
         except (requests.Timeout, requests.ConnectionError) as e:
             last_exc = e
-            if attempt < retries:
+            if attempt < effective_retries:
                 time.sleep(0.1 * (attempt + 1))
                 continue
             raise
-        except Exception:
-            raise
 
-    if last_exc:
-        raise last_exc
-    return {}
+    # Недостижимо: либо return data, либо raise выше. Но pyright/mypy без этого
+    # ругаются на "function may return None".
+    assert last_exc is not None
+    raise last_exc
+
+
+def _new_order_link_id() -> str:
+    """
+    Уникальный orderLinkId для idempotency. Bybit допускает до 36 символов
+    [A-Za-z0-9_-]. uuid4().hex = 32 hex chars — влезает с запасом.
+    """
+    return uuid.uuid4().hex
+
+
+# FIX-10: публичные алиасы для импорта из других модулей. Прямой импорт
+# приватных `_post_order` / `_new_order_link_id` в listing_api.py нарушал
+# Python-конвенцию. Старые имена сохраняем для backward-compat внутри модуля.
+post_order = _post_order
+new_order_link_id = _new_order_link_id
 
 
 def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
@@ -228,12 +313,10 @@ def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
                 time.sleep(0.1 * (attempt + 1))
                 continue
             raise
-        except Exception:
-            raise
 
-    if last_exc:
-        raise last_exc
-    return {}
+    # Недостижимо (см. _post_order), оставлено только для type-checker'ов.
+    assert last_exc is not None
+    raise last_exc
 
 
 def _get(endpoint: str, params: dict | None = None) -> dict:
@@ -356,9 +439,12 @@ def _get_qty_step(symbol: str) -> float:
     :raises QtyStepUnavailable: если шаг не получили.
     """
     coin = symbol.replace("USDT", "")
-    with _lot_step_lock:
-        if coin in _lot_step_cache:
-            return _lot_step_cache[coin]
+    # FIX-PERF: lockless fast-path. dict.get атомарен под GIL, lock нужен
+    # только для записи (которая случается 1 раз на символ — preload или
+    # первый ордер по неизвестному тикеру). Hot-path просто читает.
+    step = _lot_step_cache.get(coin)
+    if step is not None:
+        return step
 
     try:
         data       = _get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
@@ -372,15 +458,29 @@ def _get_qty_step(symbol: str) -> float:
     return step
 
 
+# FIX-PERF: import на модульном уровне + кеш precision по step.
+# Раньше _round_qty каждый раз делал from decimal import (~0.01мс) и
+# Decimal(str(step)).as_tuple().exponent (~0.05мс). Кеш убирает оба
+# на повторных вызовах одного шага.
+from decimal import Decimal as _Decimal
+_qty_precision_cache: dict[float, int] = {}
+
+
 def _round_qty(qty: float, step: float) -> float:
     """
     Округляет количество вниз до ближайшего шага лота.
-    :param qty: float - исходное количество.
-    :param step: float - шаг лота от биржи.
-    :return: float - округлённое количество.
+
+    FIX: считаем precision через Decimal, потому что str(1e-05) == '1e-05'
+    и старый код возвращал precision=0 (нет точки → ветка else), а потом
+    round(..., 0) обнулял дробную часть → qty=0 → ордер не размещался либо
+    падал на минимальный 1 контракт.
     """
-    precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-    rounded   = (qty // step) * step
+    precision = _qty_precision_cache.get(step)
+    if precision is None:
+        exponent  = _Decimal(str(step)).as_tuple().exponent
+        precision = max(0, -int(exponent))
+        _qty_precision_cache[step] = precision
+    rounded = (qty // step) * step
     return round(rounded, precision)
 
 
@@ -416,6 +516,12 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
             if amount_tokens > 0:
                 qty_str = str(amount_tokens)
 
+                # FIX: один orderLinkId на оба пути (WS и REST fallback) —
+                # защита от double-position при WS ack timeout: если WS-ордер
+                # реально прошёл, но ack не пришёл, REST с тем же
+                # orderLinkId Bybit отвергнет (retCode 30050 → success).
+                order_link_id = _new_order_link_id()
+
                 # FIX-batch-5: пробуем WS Trade API (−30...−80мс), при ошибке/None — REST.
                 placed_via = "REST"
                 ws_args = {
@@ -425,22 +531,32 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                     "orderType":   "Market",
                     "qty":         qty_str,
                     "positionIdx": 2,
+                    "orderLinkId": order_link_id,
                 }
                 try:
                     ws_ack = _ws_place_order(ws_args)
-                except Exception as e:
+                except WSOrderRejected as e:
+                    # Защитный путь (fast вариант reject не бросает — он
+                    # логирует асинхронно). Остался на случай если bybit_ws
+                    # модуль не подгрузился и упал на старую sync-обёртку.
+                    print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
+                    return 0, 0
+                except Exception as e:  # noqa: BLE001
                     print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
                     ws_ack = None
 
                 if ws_ack is None:
                     # FIX-batch-8: специализированный _post_order (f-string JSON, −2..−5мс)
-                    _post_order(symbol, "Sell", qty_str, 2)
+                    # FIX: тот же orderLinkId, что и в WS-попытке — idempotency.
+                    _post_order(symbol, "Sell", qty_str, 2, order_link_id=order_link_id)
                 else:
-                    placed_via = "WS"
+                    placed_via = "WS-FAST"
 
                 with _delist_exchange_lock:
                     _delist_exchange[ticker_name] = "bybit"
-                print(f"[BYBIT SHORT/{placed_via}] {symbol} | tokens={amount_tokens} | price≈{bybit_price}")
+                # FIX-PERF: удалён print "[BYBIT SHORT/{placed_via}]" — он стоял
+                # ПЕРЕД return и добавлял ~1мс к open_ms (PYTHONUNBUFFERED=1).
+                # На WS-failure bybit_ws_trade сам пишет "[BYBIT-WS-FAST] ...".
                 return amount_tokens, bybit_price
 
     # ── Gate.io fallback ─────────────────────────────────────────
@@ -559,22 +675,24 @@ def find_pairs(text: str) -> list[str]:
     :param text: str - текст статьи о делистинге.
     :return: list[str] - список тикеров монет.
     """
+    # FIX-PERF: убраны print'ы "[FIND PAIRS] метод=..." — find_pairs
+    # вызывается в hot-path TG/article handler'а перед submit'ом, каждый
+    # print с PYTHONUNBUFFERED=1 ≈ ~0.5-1мс. "Монеты: [...]" в DELIST-блоке
+    # показывает найденные тикеры; method для debug — раскомментировать.
     text_upper = text.upper()
 
     usdt_pairs = _RE_USDT.findall(text_upper)
     if usdt_pairs:
         found = _filter_tokens(usdt_pairs)
         if found:
-            print(f"[FIND PAIRS] метод=USDT-пары → {found}")
             return found
 
-    # FIX-batch-7: $TICKER маркеры (CLW: "Monitoring Tag Added – $ALCX, $COOKIE...")
+    # FIX-batch-7: $TICKER маркеры (CLW: "Monitoring Tag Added – $ALCX...")
     # FIX: нормализуем в uppercase — каналы изредка пишут "$alcx".
     dollar_pairs = [t.upper() for t in _RE_DOLLAR_TKN.findall(text)]
     if dollar_pairs:
         found = _filter_tokens(dollar_pairs)
         if found:
-            print(f"[FIND PAIRS] метод=$ticker → {found}")
             return found
 
     m = _RE_WILL_DELIST.search(text_upper)
@@ -582,16 +700,14 @@ def find_pairs(text: str) -> list[str]:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
         found  = _filter_tokens(tokens)
         if found:
-            print(f"[FIND PAIRS] метод=Will-Delist → {found}")
             return found
 
-    # FIX-batch-6: "Will Extend the Monitoring Tag to Include ALCX, COOKIE, DODO..."
+    # FIX-batch-6: "Will Extend the Monitoring Tag to Include ALCX..."
     m = _RE_MONITORING.search(text_upper)
     if m:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
         found  = _filter_tokens(tokens)
         if found:
-            print(f"[FIND PAIRS] метод=Monitoring-Tag → {found}")
             return found
 
     m = _RE_DELIST_BLOCK.search(text_upper)
@@ -599,17 +715,10 @@ def find_pairs(text: str) -> list[str]:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
         found  = _filter_tokens(tokens)
         if found:
-            print(f"[FIND PAIRS] метод=delist-block → {found}")
             return found
 
     all_tokens = _RE_ALL_TOKENS.findall(text_upper)
-    found = [t for t in _filter_tokens(all_tokens) if t in known_coins]
-
-    if found:
-        print(f"[FIND PAIRS] метод=fallback(price_cache) → {found}")
-    else:
-        print("[FIND PAIRS] ничего не найдено в тексте")
-    return found
+    return [t for t in _filter_tokens(all_tokens) if t in known_coins]
 
 
 def _filter_tokens(tokens: list[str]) -> list[str]:

@@ -52,13 +52,15 @@ _PING_TIMEOUT        = 10.0
 # Keywords для классификации сообщений.
 # FIX: убрал общий "remove" — он матчился на "remove your funds", "remove API key"
 # и т.п. шум. Оставлены только конкретные фразы делистинга.
+# FIX: убрал "removal of" — слишком широкое (ловило "removal of API key",
+# "removal of futures contract" и т.п.). Если нужны такие сигналы, добавляем
+# точные фразы типа "removal of trading pair".
 DELIST_KEYWORDS = [
     "will delist", "delisting notice", "binance will delist",
     "will be delisted", "delisting of",
     "delisted from upbit", "upbit will delist",
     "delisted from bithumb", "bithumb will delist",
     "remove from spot", "removed from spot",
-    "removal of",
 ]
 
 LISTING_KEYWORDS = [
@@ -90,13 +92,21 @@ LISTING_NEG = [
 
 def _classify(text: str) -> str | None:
     tl = text.lower()
-    # Делистинг: должны быть delist-фразы И отсутствовать negative-маркеры.
-    if any(kw in tl for kw in DELIST_KEYWORDS):
+    has_delist = any(kw in tl for kw in DELIST_KEYWORDS)
+    has_listing = any(kw in tl for kw in LISTING_KEYWORDS)
+
+    # FIX: если в одном сообщении есть И delist И listing-фразы (например,
+    # "We will delist X and will list Y") — не классифицируем как одно,
+    # потому что любой из двух выборов будет неверным. Лучше пропустить
+    # сигнал, чем открыть позицию не в ту сторону.
+    if has_delist and has_listing:
+        return None
+
+    if has_delist:
         if any(neg in tl for neg in DELIST_NEG):
             return None
         return "delist"
-    # Листинг: должны быть list-фразы И отсутствовать delist/postponed/airdrop.
-    if any(kw in tl for kw in LISTING_KEYWORDS):
+    if has_listing:
         if any(neg in tl for neg in LISTING_NEG):
             return None
         return "listing"
@@ -190,11 +200,38 @@ def run_tree_of_alpha_listener(
             daemon=True, name="toa-ws",
         ).start()
     """
-    # Используем uvloop если есть (drop-in 2-4x speedup для asyncio loop)
+    # FIX-12: создаём loop локально — НЕ мутируем глобальную asyncio policy
+    # из background thread (паттерн bybit_ws_trade._run_loop). Главный
+    # процесс уже выставил uvloop policy, а мы дополнительно делаем явный
+    # new_event_loop() — это безопасно при многократном вызове из разных thread'ов.
     try:
         import uvloop  # type: ignore[import-not-found]
-        uvloop.install()
+        loop = uvloop.new_event_loop()
     except ImportError:
-        pass
-
-    asyncio.run(_listener(delist_callback, listing_callback))
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    # FIX: outer-restart — если _listener сам по себе упадёт (баг в callback,
+    # неожиданное исключение в websockets) — поток не должен умирать молча.
+    # Внутренний `while True` в _listener защищает от разрывов WS, но не от
+    # ошибок верхнего уровня. После 5 крашей подряд — сдаёмся.
+    try:
+        consecutive_failures = 0
+        while consecutive_failures < 5:
+            try:
+                loop.run_until_complete(_listener(delist_callback, listing_callback))
+                # _listener вернулся без исключения (что нормально только при stop) — выходим.
+                break
+            except Exception as e:  # noqa: BLE001
+                consecutive_failures += 1
+                print(
+                    f"[TOA-WS] listener crashed ({consecutive_failures}/5): {e!r} — restart через 5с",
+                    flush=True,
+                )
+                try:
+                    loop.run_until_complete(asyncio.sleep(5))
+                except Exception:
+                    time.sleep(5)
+        else:
+            print("[TOA-WS] 5 крашей подряд — listener остановлен", flush=True)
+    finally:
+        loop.close()

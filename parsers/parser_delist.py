@@ -4,7 +4,6 @@ import asyncio
 import os
 import random
 import re
-import string
 import threading
 import time
 import itertools
@@ -169,9 +168,10 @@ def _parse_proxies(raw: str) -> list[str | None]:
 PROXIES: list[str | None] = _parse_proxies(DELIST_PROXIES)
 
 # ── дедупликация сигналов ────────────────────────────────────────
-_fired_lock   = threading.Lock()
-_fired_coins: set[str] = set()
-_FIRED_TTL    = 60   # секунд до снятия блокировки монеты
+_fired_lock    = threading.Lock()
+_fired_coins:  set[str] = set()
+_fired_expiry: dict[str, float] = {}
+_FIRED_TTL     = 60   # секунд до снятия блокировки монеты
 
 seen_ids: set[int] = set()
 seen_lock = threading.Lock()
@@ -189,9 +189,11 @@ _poller_threads: dict[int, threading.Thread] = {}   # FIX: учёт активн
 # FIX-batch-8: per-poller адаптивный интервал — каждый поллер имеет свой
 # текущий интервал. После 429/ошибки он растёт в POLL_BACKOFF_MULT раз
 # (до POLL_BACKOFF_MAX), через POLL_BACKOFF_RECOVERY секунд после
-# последнего успешного запроса возвращается к POLL_INTERVAL_BASE.
+# последнего bump'а (а не успеха!) возвращается к POLL_INTERVAL_BASE.
+# FIX: трекаем last_bump_ts, а не last_ok_ts — иначе reset никогда не
+# срабатывал, потому что _mark_ok обновлял last_ok_ts перед проверкой.
 _poller_intervals: dict[int, float] = {}
-_poller_last_ok_ts: dict[int, float] = {}
+_poller_last_bump_ts: dict[int, float] = {}
 _poller_intervals_lock = threading.Lock()
 
 # Создаём отдельную сессию для каждого прокси
@@ -207,7 +209,8 @@ for proxy in PROXIES:
 for _i in range(len(_sessions)):
     _poller_last_ts[_i] = time.monotonic()
     _poller_intervals[_i] = POLL_INTERVAL_BASE
-    _poller_last_ok_ts[_i] = time.monotonic()
+    # 0 = ни одного bump'а ещё не было → нет смысла ресетить
+    _poller_last_bump_ts[_i] = 0.0
 
 # Циклический итератор по сессиям
 _session_cycle = itertools.cycle(enumerate(_sessions))
@@ -230,13 +233,13 @@ def _build_binance_url() -> str:
     Что делаем:
       1. pageSize крутим из whitelist BINANCE_PAGE_SIZES — все эти значения
          валидны для API. Меняя его, попадаем на разные cache key.
-      2. Добавляем 2 random query params (имя+значение) — гарантированный
-         miss для CloudFront, но Binance их игнорирует.
+      2. _t=<ms-timestamp> — гарантированный uniqueness каждого запроса.
       3. Перемешиваем порядок параметров — у некоторых CDN порядок учитывается.
+
+    FIX: убран дополнительный rnd_name=rnd_val — _t уже даёт уникальный
+    cache key, второй random был избыточен (не вреден, но шум).
     """
-    rnd_name = "".join(random.choice(string.ascii_lowercase) for _ in range(8))
-    rnd_val  = random.randint(1, 99_999_999)
-    page_sz  = random.choice(BINANCE_PAGE_SIZES)
+    page_sz = random.choice(BINANCE_PAGE_SIZES)
 
     params = [
         ("type", "1"),
@@ -244,7 +247,6 @@ def _build_binance_url() -> str:
         ("pageSize", str(page_sz)),
         ("catalogId", str(CATEGORY_ID)),
         ("_t", str(int(time.time() * 1000))),  # ms timestamp — гарантированный uniqueness
-        (rnd_name, str(rnd_val)),
     ]
     random.shuffle(params)
     qs = "&".join(f"{k}={v}" for k, v in params)
@@ -282,19 +284,28 @@ def _try_claim(coin: str) -> bool:
     """
     Возвращает True если монета ещё не в работе и блокирует её на _FIRED_TTL секунд.
     Защищает от двойного открытия одной монеты.
+    FIX-PERF: было — на каждый claim спавнили sleep-thread для TTL-cleanup.
+    threading.Thread.start() ≈ 3-5мс на coin (для 5 монет = 15-25мс в hot-path).
+    Теперь один фоновый sweeper (_fired_sweeper) подметает по таймстампу.
     """
     with _fired_lock:
         if coin in _fired_coins:
             return False
         _fired_coins.add(coin)
-
-    def _release():
-        time.sleep(_FIRED_TTL)
-        with _fired_lock:
-            _fired_coins.discard(coin)
-
-    threading.Thread(target=_release, daemon=True).start()
+        _fired_expiry[coin] = time.monotonic() + _FIRED_TTL
     return True
+
+
+def _fired_sweeper() -> None:
+    """FIX-PERF: единый поток для TTL-cleanup _fired_coins."""
+    while True:
+        time.sleep(5)
+        now = time.monotonic()
+        with _fired_lock:
+            expired = [c for c, ts in _fired_expiry.items() if ts <= now]
+            for c in expired:
+                _fired_coins.discard(c)
+                _fired_expiry.pop(c, None)
 
 
 # ── Fetch ────────────────────────────────────────────────────────
@@ -346,7 +357,11 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
     """
     for attempt in range(1, retries + 1):
         try:
-            log_info("WORKER", f"[{source}] Старт → {coin} | margin={margin} USDT | попытка {attempt}/{retries}")
+            # FIX-PERF: "Старт"-print только на retry'ях — на attempt 1
+            # форматированный print → stdout = ~1-3мс перед market_open_short
+            # в hot-path. Открытие позиции важнее, чем factual лог.
+            if attempt > 1:
+                log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
             amount, entry_price = market_open_short(coin, margin)
             if not amount:
                 log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
@@ -396,6 +411,12 @@ def _on_toa_delist(full_text: str, t_start: float) -> None:
 
 # ── Общая обработка сигнала ───────────────────────────────────────
 
+# FIX-PERF: модульный long-lived pool для worker'ов делистинга. Раньше
+# `with ThreadPoolExecutor(...)` создавал новый пул на каждый сигнал, а
+# __exit__ блокировал до завершения всех worker'ов — +5-15мс overhead.
+_signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="delist-signal")
+
+
 def process_signal(pairs: list[str], source: str, t_start: float) -> None:
     """
     Общая функция обработки сигнала делистинга.
@@ -408,16 +429,15 @@ def process_signal(pairs: list[str], source: str, t_start: float) -> None:
 
     margin = calculate_margin_for_delist()
 
+    # FIX-PERF: submit ДО логирования — открытие ордера в hot-path,
+    # print/log идут параллельно с уже запущенным market_open_short.
+    for coin in new_pairs:
+        _signal_executor.submit(worker, coin, margin, t_start, source)
+
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("DELIST", f"[{source}] Новый делистинг!")
     log_info("DELIST", f"Монеты : {new_pairs}")
     log_info("TRADE",  f"Маржа={margin} USDT | открываем {len(new_pairs)} шорт(ов)...")
-    print(f"{BOLD}{'─' * 60}{RESET}")
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for coin in new_pairs:
-            executor.submit(worker, coin, margin, t_start, source)
-
     print(f"{BOLD}{'═' * 60}{RESET}\n")
 
 
@@ -518,24 +538,37 @@ def _bump_interval(session_idx: int) -> None:
     with _poller_intervals_lock:
         cur = _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
         _poller_intervals[session_idx] = min(cur * POLL_BACKOFF_MULT, POLL_BACKOFF_MAX)
+        _poller_last_bump_ts[session_idx] = time.monotonic()
 
 
 def _reset_interval_if_recovered(session_idx: int) -> None:
-    """FIX-batch-8: если последний успех был давно — вернуть базовый интервал."""
+    """
+    Если с момента последнего bump'а прошло POLL_BACKOFF_RECOVERY секунд —
+    возвращаем базовый интервал.
+
+    FIX: раньше reset смотрел на last_ok_ts, который только что обновил _mark_ok.
+    Условие (now - last_ok) < POLL_BACKOFF_RECOVERY всегда было True → reset
+    никогда не срабатывал → один 429 поднимал интервал до POLL_BACKOFF_MAX
+    навсегда. Теперь трекаем last_bump_ts — это единственный осмысленный
+    timestamp для recovery-логики.
+    """
     now = time.monotonic()
     with _poller_intervals_lock:
-        last_ok = _poller_last_ok_ts.get(session_idx, 0)
-        if (now - last_ok) < POLL_BACKOFF_RECOVERY:
+        cur_interval = _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
+        if cur_interval <= POLL_INTERVAL_BASE:
             return
-        if _poller_intervals.get(session_idx, POLL_INTERVAL_BASE) > POLL_INTERVAL_BASE:
-            _poller_intervals[session_idx] = POLL_INTERVAL_BASE
-            _poller_last_ok_ts[session_idx] = now
+        last_bump = _poller_last_bump_ts.get(session_idx, 0.0)
+        if last_bump == 0.0:
+            # bump'ов не было — нечего сбрасывать
+            return
+        if (now - last_bump) < POLL_BACKOFF_RECOVERY:
+            return
+        _poller_intervals[session_idx] = POLL_INTERVAL_BASE
+        _poller_last_bump_ts[session_idx] = 0.0
 
 
-def _mark_ok(session_idx: int) -> None:
-    """FIX-batch-8: успех — обновить last_ok timestamp."""
-    with _poller_intervals_lock:
-        _poller_last_ok_ts[session_idx] = time.monotonic()
+# FIX-3: _mark_ok был no-op после реструктуризации (FIX-batch-8) — удалён,
+# его вызов в poller() тоже снят. Watchdog timestamp обновляется напрямую.
 
 
 def _get_interval(session_idx: int) -> float:
@@ -550,6 +583,11 @@ def poller(session_idx: int) -> None:
     log_ok("POLLER", f"[{label}] запущен (interval={POLL_INTERVAL_BASE}с base)")
 
     first_run = True
+    # FIX-4: счётчик циклов с повышенным интервалом — раз в N циклов
+    # логируем варн, иначе деградация невидима (флапающий прокси →
+    # interval застрянет на POLL_BACKOFF_MAX, recovery никогда не сработает).
+    elevated_cycles = 0
+    _ELEVATED_WARN_EVERY = 60
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         while True:
@@ -573,12 +611,14 @@ def poller(session_idx: int) -> None:
 
                 # FIX-batch-1: orjson вместо resp.json() (3-5x быстрее на Binance ответах ~5-20KB).
                 data     = _json_loads(resp.content).get("data", {})
-                articles = data.get("articles") or (data.get("catalogs", [{}])[0].get("articles", []))
+                # FIX: catalogs может вернуться как [] — старый код data.get("catalogs", [{}])[0]
+                # падал с IndexError, потому что default срабатывал только при отсутствии ключа.
+                catalogs = data.get("catalogs") or [{}]
+                articles = data.get("articles") or (catalogs[0].get("articles", []) if isinstance(catalogs[0], dict) else [])
 
-                # Обновляем watchdog timestamp + успешный ответ — сбросить backoff
+                # Обновляем watchdog timestamp + успешный ответ — пробуем сбросить backoff
                 with _poller_ts_lock:
                     _poller_last_ts[session_idx] = time.monotonic()
-                _mark_ok(session_idx)
                 _reset_interval_if_recovered(session_idx)
 
                 if articles:
@@ -600,9 +640,16 @@ def poller(session_idx: int) -> None:
                                     new_count += 1
                         if new_count > 0:
                             log_info("POLLER", f"[{label}] получено {len(articles)} статей (новых: {new_count})")
-                        # FIX: executor.submit вместо ленивого .map — исключения логируются
+                        # FIX: executor.submit вместо ленивого .map. add_done_callback —
+                        # чтобы исключения внутри process_article не тонули в Future
+                        # (раньше падал тихо при schema-change у Binance API).
+                        def _log_future_exc(fut, _label=label):
+                            exc = fut.exception()
+                            if exc is not None:
+                                log_err("POLLER", f"[{_label}] process_article упал: {exc!r}")
                         for a in articles:
-                            executor.submit(process_article, a)
+                            fut = executor.submit(process_article, a)
+                            fut.add_done_callback(_log_future_exc)
                 else:
                     log_warn("POLLER", f"[{label}] статей нет или пустой ответ")
 
@@ -610,10 +657,27 @@ def poller(session_idx: int) -> None:
                 log_err("POLLER", f"[{label}] ошибка: {e}")
                 _bump_interval(session_idx)
 
-            time.sleep(_get_interval(session_idx))
+            cur_interval = _get_interval(session_idx)
+            # FIX-4: видимость деградации — если интервал давно не сбрасывался,
+            # значит ошибки случаются чаще чем POLL_BACKOFF_RECOVERY.
+            if cur_interval > POLL_INTERVAL_BASE:
+                elevated_cycles += 1
+                if elevated_cycles % _ELEVATED_WARN_EVERY == 0:
+                    log_warn("POLLER", f"[{label}] интервал {cur_interval:.1f}с уже {elevated_cycles} циклов — нестабильное соединение?")
+            else:
+                elevated_cycles = 0
+            time.sleep(cur_interval)
 
 
 # ── Watchdog ──────────────────────────────────────────────────────
+
+# FIX-10: трекаем подряд "alive but stuck" циклы — Python не может убить
+# поток, зависший в TLS handshake / requests.get(), поэтому хотя бы
+# сообщаем юзеру в TG, чтобы он рестартанул контейнер.
+# FIX-13: single-writer (только _watchdog thread читает/пишет) — lock не нужен.
+_WATCHDOG_STUCK_ALERT_AFTER = 3   # 3 цикла × 30с = 90с тишины — точно zombie
+_poller_stuck_counts: dict[int, int] = {}
+
 
 def _watchdog() -> None:
     """
@@ -638,19 +702,31 @@ def _watchdog() -> None:
 
         for idx, age in ages.items():
             if age <= WATCHDOG_TIMEOUT:
+                # Поллер ожил — сбрасываем счётчик stuck
+                _poller_stuck_counts[idx] = 0
                 continue
 
             # FIX: проверяем, что старый поток уже мёртв (или мы не знаем о нём)
             old = _poller_threads.get(idx)
             if old is not None and old.is_alive():
-                log_warn("WATCHDOG", f"poller[{idx}] завис {age:.0f}с но поток жив — пропускаем рестарт")
-                # Сбрасываем timestamp чтобы не спамить
+                # FIX-10: поток жив, но не пишет timestamp — TLS handshake / socket stuck.
+                # Считаем циклы — после N подряд алертим в TG (Python не может убить поток).
+                stuck = _poller_stuck_counts.get(idx, 0) + 1
+                _poller_stuck_counts[idx] = stuck
+                log_warn("WATCHDOG", f"poller[{idx}] завис {age:.0f}с но поток жив — пропускаем рестарт (stuck cycle {stuck})")
+                if stuck == _WATCHDOG_STUCK_ALERT_AFTER:
+                    tg_log(
+                        f"⚠️ <b>WATCHDOG</b>: poller[{idx}] zombie {stuck * 30}с "
+                        f"(поток жив, не отвечает). Рекомендуем рестарт контейнера."
+                    )
+                # Сбрасываем timestamp чтобы не спамить логи каждые 30с
                 with _poller_ts_lock:
                     _poller_last_ts[idx] = now
                 continue
 
             log_err("WATCHDOG", f"poller[{idx}] завис ({age:.0f}с без ответа) — перезапускаем")
             tg_log(f"⚠️ <b>WATCHDOG</b>: poller[{idx}] завис {age:.0f}с, перезапуск")
+            _poller_stuck_counts[idx] = 0
 
             with _poller_ts_lock:
                 _poller_last_ts[idx] = now
@@ -668,19 +744,13 @@ def run_telegram_delist_listener() -> None:
     TG_DELIST_KEYWORDS: делистинги Binance, Upbit, Bithumb.
     FIX-batch-3: подписываемся сразу на несколько каналов.
     Кто из каналов опередил — тот и победил (дедуп через _fired_coins, TTL 60с).
+
+    FIX: TelegramClient создаётся ВНУТРИ _run, иначе при reconnect-loop
+    (asyncio.run в while True) клиент привязан к закрытому event-loop'у и падает.
     """
     from telethon import TelegramClient, events
 
     session_path = str(Path(SESSION_DIR) / "delist_session")
-    client = TelegramClient(
-        session_path,
-        api_id=int(TG_API_ID) if TG_API_ID else 0,
-        api_hash=TG_API_HASH or "",
-        auto_reconnect=True,
-        retry_delay=5,
-        connection_retries=None,   # бесконечные попытки переподключения
-        request_retries=5,
-    )
 
     # FIX-batch-3: собираем список всех каналов для подписки.
     # Основной + extras из .env. Дубликаты убираем.
@@ -689,47 +759,67 @@ def run_telegram_delist_listener() -> None:
         if c not in channels:
             channels.append(c)
 
-    @client.on(events.NewMessage(chats=channels))
-    async def handler(event):
-        try:
-            text = event.message.message or ""
-        except Exception:
-            return
-
-        if not text:
-            return
-
-        tl = text.lower()
-        if not any(kw in tl for kw in TG_DELIST_KEYWORDS):
-            return
-
-        # FIX-batch-6: negative filter — отсекаем Binance Alpha removals и т.п.
-        if any(neg in tl for neg in TG_DELIST_NEG):
-            return
-
-        t_start = time.perf_counter()
-
-        try:
-            chat    = await event.get_chat()
-            chat_id = getattr(chat, "id", 0)
-            uname   = getattr(chat, "username", "") or ""
-        except Exception:
-            chat_id, uname = 0, ""
-
-        log_ok("TG-DELIST", f"Делистинг-сигнал! [{chat_id} @{uname}]: {text[:100]}")
-
-        pairs = find_pairs(text)
-        if not pairs:
-            log_warn("TG-DELIST", f"Тикер не найден: {text[:80]}")
-            return
-
-        threading.Thread(
-            target=process_signal,
-            args=(pairs, f"TG:@{uname}" if uname else "TG", t_start),
-            daemon=True,
-        ).start()
-
     async def _run():
+        client = TelegramClient(
+            session_path,
+            api_id=int(TG_API_ID) if TG_API_ID else 0,
+            api_hash=TG_API_HASH or "",
+            auto_reconnect=True,
+            retry_delay=5,
+            connection_retries=None,   # бесконечные попытки переподключения
+            request_retries=5,
+        )
+
+        @client.on(events.NewMessage(chats=channels))
+        async def handler(event):
+            # FIX-9: t_start первой строкой — унифицируем с parser_listing.py.
+            t_start = time.perf_counter()
+            try:
+                text = event.message.message or ""
+            except Exception:
+                return
+
+            if not text:
+                return
+
+            tl = text.lower()
+            if not any(kw in tl for kw in TG_DELIST_KEYWORDS):
+                return
+
+            # FIX-batch-6: negative filter — отсекаем Binance Alpha removals и т.п.
+            if any(neg in tl for neg in TG_DELIST_NEG):
+                return
+
+            # FIX-PERF: НЕ дёргаем await event.get_chat() здесь — это network
+            # round-trip к Telegram, 50–200мс на холодном кеше. Берём
+            # event.chat_id (sync). Username нужен только для лога — fetch'им
+            # ПОСЛЕ запуска worker'а (см. ниже).
+            chat_id = getattr(event, "chat_id", 0) or 0
+
+            pairs = find_pairs(text)
+            if not pairs:
+                log_warn("TG-DELIST", f"Тикер не найден: {text[:80]}")
+                return
+
+            source = f"TG:{chat_id}"
+
+            # FIX-PERF: process_signal НАПРЯМУЮ вместо threading.Thread —
+            # экономия ~3-5мс на спавн доп. потока. Submit'ы внутри
+            # process_signal уже идут до print'ов (см. process_signal).
+            try:
+                process_signal(pairs, source, t_start)
+            except Exception as exc:  # noqa: BLE001
+                log_err("TG-DELIST", f"process_signal упал: {exc!r}")
+
+            # FIX-PERF: get_chat() ПОСЛЕ spawn'а — больше не блокирует
+            # открытие шорта.
+            try:
+                chat  = await event.get_chat()
+                uname = getattr(chat, "username", "") or ""
+            except Exception:
+                uname = ""
+            log_ok("TG-DELIST", f"Делистинг-сигнал! [{chat_id} @{uname}]: {text[:100]}")
+
         await client.start()
         log_ok("TG-DELIST", "Telethon подключён | сессия: delist_session")
 
@@ -758,6 +848,13 @@ if __name__ == "__main__":
         print("[BOOT] uvloop активирован")
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
+
+    # FIX-PERF: дефолтный switchinterval = 5мс — это до 5мс jitter на
+    # каждом cross-thread context switch'е (handler → executor → bybit-ws).
+    # 1мс — компромисс между latency и CPU-нагрузкой для I/O-bound кода.
+    import sys
+    sys.setswitchinterval(0.001)
+    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
 
     # ── Прогрев бирж ─────────────────────────────────────────────
     threading.Thread(target=price_updater,      daemon=True).start()
@@ -803,6 +900,16 @@ if __name__ == "__main__":
     # Watchdog
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
+
+    # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
+    threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
+
+    # FIX-PERF: pre-warm executor — иначе первый submit платит ~3-5мс
+    # на создание worker-thread'а.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor pre-warmed")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:

@@ -113,9 +113,10 @@ POLL_ERROR_BACKOFF  = 3.0
 WATCHDOG_TIMEOUT    = 60   # секунд
 
 # Защита от дублей
-_fired_lock    = threading.Lock()
-_fired_coins:  set[str] = set()
-_FIRED_TTL     = 60
+_fired_lock     = threading.Lock()
+_fired_coins:   set[str] = set()
+_fired_expiry:  dict[str, float] = {}
+_FIRED_TTL      = 60
 
 # ── Watchdog: время последнего успешного запроса ───────────────────
 _upbit_last_ts   = time.monotonic()
@@ -153,18 +154,28 @@ def log_err(tag: str, msg: str):  _log(tag, RED,    msg)
 # ── дедупликация сигналов ─────────────────────────────────────────
 
 def _try_claim(coin: str) -> bool:
+    # FIX-PERF: было — на каждый claim спавнили отдельный sleep-thread
+    # для TTL-cleanup. threading.Thread.start() ≈ 3-5мс на coin, для
+    # 5 монет это 15-25мс в hot-path процесса сигнала. Теперь один
+    # фоновый sweeper (_fired_sweeper) подметает по таймстампу.
     with _fired_lock:
         if coin in _fired_coins:
             return False
         _fired_coins.add(coin)
-
-    def _release():
-        time.sleep(_FIRED_TTL)
-        with _fired_lock:
-            _fired_coins.discard(coin)
-
-    threading.Thread(target=_release, daemon=True).start()
+        _fired_expiry[coin] = time.monotonic() + _FIRED_TTL
     return True
+
+
+def _fired_sweeper() -> None:
+    """FIX-PERF: единый поток для очистки _fired_coins по TTL."""
+    while True:
+        time.sleep(5)
+        now = time.monotonic()
+        with _fired_lock:
+            expired = [c for c, ts in _fired_expiry.items() if ts <= now]
+            for c in expired:
+                _fired_coins.discard(c)
+                _fired_expiry.pop(c, None)
 
 
 # ── воркер (открытие лонга) ───────────────────────────────────────
@@ -173,7 +184,12 @@ def worker(coin: str, margin: float, t_start: float,
            source: str, retries: int = 3) -> None:
     for attempt in range(1, retries + 1):
         try:
-            log_info("WORKER", f"[{source}] Старт → {coin} | margin={margin} USDT | попытка {attempt}/{retries}")
+            # FIX-PERF: пропускаем "Старт"-print на attempt 1. Это
+            # форматированный print → stdout = ~1-3мс перед market_open_long
+            # в hot-path. Открытие позиции важнее, чем factual лог "сейчас открываем".
+            # На retry'ях лог остаётся — там диагностика нужна.
+            if attempt > 1:
+                log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
             amount, entry_price = market_open_long(coin, margin)
             if not amount:
                 log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
@@ -228,6 +244,12 @@ def _on_toa_listing(full_text: str, t_start: float) -> None:
 
 # ── общая обработка сигнала ───────────────────────────────────────
 
+# FIX-PERF: модульный long-lived pool вместо `with ThreadPoolExecutor(...)`
+# на каждый сигнал. Создание пула + блокировка __exit__ до завершения всех
+# worker'ов съедали ~5-15мс из hot-path. Pool живёт всё время работы парсера.
+_signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="listing-signal")
+
+
 def process_signal(pairs: list[str], source: str, t_start: float | None = None) -> None:
     """
     FIX-batch-8: t_start теперь параметр. Если None — замеряем сами (бэк-совместимость).
@@ -244,16 +266,16 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None) 
 
     margin = calculate_margin_for_listing()
 
+    # FIX-PERF: submit ДО логирования. Открытие ордера — это hot-path,
+    # 4 print'а перед market_open_long добавляли ~2мс. Workers стартуют
+    # сразу, print'ы идут параллельно с уже запущенным market_open_long.
+    for coin in new_pairs:
+        _signal_executor.submit(worker, coin, margin, t_start, source)
+
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("LISTING", f"[{source}] Новый листинг!")
     log_info("LISTING", f"Монеты : {new_pairs}")
     log_info("TRADE",   f"Маржа={margin} USDT | открываем {len(new_pairs)} лонг(ов)...")
-    print(f"{BOLD}{'─' * 60}{RESET}")
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for coin in new_pairs:
-            executor.submit(worker, coin, margin, t_start, source)
-
     print(f"{BOLD}{'═' * 60}{RESET}\n")
 
 
@@ -265,17 +287,12 @@ def run_telegram_listener() -> None:
     """
     TG listener на Telethon (основной + EXTRA_LISTING_CHANNELS).
     FIX-batch-3: multi-channel first-wins. Дедуп через _fired_coins (TTL 60с).
+
+    FIX: TelegramClient создаётся ВНУТРИ _run, а не снаружи. Telethon хранит
+    привязку к event-loop'у; при reconnect-loop (asyncio.run в while True)
+    второй цикл получал бы клиента из предыдущего закрытого loop'а и падал.
     """
     session_path = str(Path(SESSION_DIR) / "listing_session")
-    client = TelegramClient(
-        session_path,
-        api_id=int(TG_API_ID) if TG_API_ID else 0,
-        api_hash=TG_API_HASH or "",
-        auto_reconnect=True,
-        retry_delay=5,
-        connection_retries=None,
-        request_retries=5,
-    )
 
     # FIX-batch-3: основной + extra. TG_CHANNEL — это int (-100...).
     channels: list[str | int] = []
@@ -287,48 +304,71 @@ def run_telegram_listener() -> None:
         if c not in channels:
             channels.append(c)
 
-    @client.on(events.NewMessage(chats=channels))
-    async def handler(event):
-        # FIX-batch-8: замеряем t_start как можно раньше, до фильтрации и
-        # get_chat() — это правильный момент "сигнал получен".
-        t_start = time.perf_counter()
-        try:
-            text = event.message.message or ""
-        except Exception:
-            return
-
-        if not text:
-            return
-
-        # FIX-batch-6: расширенный фильтр под форматы каналов пользователя
-        # (BWEnews, binance_announcements, coin_listing, и т.д.).
-        tl = text.lower()
-        if not any(p in tl for p in TG_LISTING_PHRASES):
-            return
-        if any(neg in tl for neg in TG_LISTING_NEG):
-            return
-
-        try:
-            chat    = await event.get_chat()
-            chat_id = getattr(chat, "id", 0)
-            uname   = getattr(chat, "username", "") or ""
-        except Exception:
-            chat_id, uname = 0, ""
-
-        log_ok("TG", f"Листинг-сигнал! [{chat_id} @{uname}]: {text[:120]}")
-
-        pairs = find_listing_pairs(text)
-        if not pairs:
-            log_warn("TG", f"Тикер не найден (фильтр пропустил): {text[:80]}")
-            return
-
-        threading.Thread(
-            target=process_signal,
-            args=(pairs, f"TG:@{uname}" if uname else "TG", t_start),
-            daemon=True,
-        ).start()
-
     async def _run():
+        client = TelegramClient(
+            session_path,
+            api_id=int(TG_API_ID) if TG_API_ID else 0,
+            api_hash=TG_API_HASH or "",
+            auto_reconnect=True,
+            retry_delay=5,
+            connection_retries=None,
+            request_retries=5,
+        )
+
+        @client.on(events.NewMessage(chats=channels))
+        async def handler(event):
+            # FIX-batch-8: замеряем t_start как можно раньше, до фильтрации и
+            # get_chat() — это правильный момент "сигнал получен".
+            t_start = time.perf_counter()
+            try:
+                text = event.message.message or ""
+            except Exception:
+                return
+
+            if not text:
+                return
+
+            # FIX-batch-6: расширенный фильтр под форматы каналов пользователя
+            # (BWEnews, binance_announcements, coin_listing, и т.д.).
+            tl = text.lower()
+            if not any(p in tl for p in TG_LISTING_PHRASES):
+                return
+            if any(neg in tl for neg in TG_LISTING_NEG):
+                return
+
+            # FIX-PERF: НЕ дёргаем await event.get_chat() здесь — это network
+            # round-trip к Telegram, 50–200мс на холодном кеше Telethon. Берём
+            # event.chat_id (sync, ~0мс). Username нужен только для лога —
+            # подтягиваем уже ПОСЛЕ запуска воркера (см. ниже). Это даёт
+            # −50…−150мс на самом первом сигнале из канала.
+            chat_id = getattr(event, "chat_id", 0) or 0
+
+            pairs = find_listing_pairs(text)
+            if not pairs:
+                log_warn("TG", f"Тикер не найден (фильтр пропустил): {text[:80]}")
+                return
+
+            source = f"TG:{chat_id}"
+
+            # FIX-PERF: вызываем process_signal НАПРЯМУЮ вместо
+            # threading.Thread(target=_safe_signal).start() — экономия ~3-5мс
+            # на спавн дополнительного потока. process_signal сам делает
+            # executor.submit (уже не блокирует), а оставшиеся print'ы идут
+            # ПОСЛЕ submit'а, так что задержка до OPEN не растёт.
+            try:
+                process_signal(pairs, source, t_start)
+            except Exception as exc:  # noqa: BLE001
+                log_err("TG", f"process_signal упал: {exc!r}")
+
+            # FIX-PERF: get_chat() теперь ПОСЛЕ spawn'а worker'а. Сетевой
+            # round-trip к Telegram больше не блокирует открытие ордера.
+            try:
+                chat  = await event.get_chat()
+                uname = getattr(chat, "username", "") or ""
+            except Exception:
+                uname = ""
+            log_ok("TG", f"Листинг-сигнал! [{chat_id} @{uname}]: {text[:120]}")
+
         await client.start()
         log_ok("TG", "Telethon подключён | сессия: listing_session")
 
@@ -357,11 +397,17 @@ def _load_upbit_tickers(session: requests.Session) -> set[str]:
             resp = session.get(UPBIT_MARKETS_URL, params={"isDetails": "false"}, timeout=timeout)
             resp.raise_for_status()
             # FIX-batch-1: orjson — список Upbit может быть 50KB+, orjson в 3-5x быстрее.
-            return {
-                m["market"].split("-")[1]
-                for m in _json_loads(resp.content)
-                if m["market"].startswith("KRW-")
-            }
+            # FIX: явный guard на malformed market — раньше split("-")[1] кидал
+            # IndexError для невалидной записи и убивал весь tick.
+            tickers: set[str] = set()
+            for m in _json_loads(resp.content):
+                market = (m or {}).get("market", "")
+                if not isinstance(market, str) or not market.startswith("KRW-"):
+                    continue
+                parts = market.split("-", 1)
+                if len(parts) == 2 and parts[1]:
+                    tickers.add(parts[1])
+            return tickers
         except Exception:
             if attempt == 3:
                 raise
@@ -389,10 +435,13 @@ def run_upbit_poller() -> None:
     while True:
         try:
             time.sleep(POLL_INTERVAL)
-            # FIX-batch-8: t_start фиксируем СРАЗУ после получения ответа,
-            # чтобы метрика OPEN/LONG отражала путь "сетевой ответ → ордер".
+            # FIX: засекаем t_send ДО HTTP-запроса и t_recv ПОСЛЕ. t_send
+            # передаём в process_signal как "момент начала запроса к Upbit"
+            # — это полная latency сигнала, включая сеть. t_recv − t_send
+            # логируем как fetch_ms для диагностики.
+            t_send = time.perf_counter()
             current = _load_upbit_tickers(session)
-            t_start = time.perf_counter()
+            t_recv = time.perf_counter()
 
             with _ts_lock:
                 _upbit_last_ts = time.monotonic()
@@ -400,9 +449,11 @@ def run_upbit_poller() -> None:
             new_tickers = current - ever_seen
 
             if new_tickers:
-                log_ok("UPBIT", f"Новые тикеры: {new_tickers}")
+                fetch_ms = (t_recv - t_send) * 1000
+                log_ok("UPBIT", f"Новые тикеры: {new_tickers} (fetch={fetch_ms:.0f}мс)")
                 ever_seen |= new_tickers
-                process_signal(list(new_tickers), "UPBIT", t_start=t_start)
+                # t_start = t_send → метрика включает сетевую задержку до Upbit.
+                process_signal(list(new_tickers), "UPBIT", t_start=t_send)
 
         except Exception as e:
             log_err("UPBIT", f"Ошибка поллера: {e}")
@@ -456,24 +507,28 @@ def run_bithumb_poller() -> None:
     while True:
         try:
             time.sleep(POLL_INTERVAL)
+            # FIX: t_send до HTTP, t_recv после — см. комментарий в run_upbit_poller.
+            t_send = time.perf_counter()
             current = _load_bithumb_tickers(session)
-            # FIX-batch-8: t_start фиксируем после получения ответа.
-            t_start = time.perf_counter()
+            t_recv = time.perf_counter()
 
             with _ts_lock:
                 _bithumb_last_ts = time.monotonic()
 
             new_tickers = current - ever_seen
 
-            if len(new_tickers) > 3:
+            # FIX: порог 3 → 10. После maintenance Bithumb может разово отдать
+            # 5-8 новых тикеров — мы их пропускали все, теряя реальный листинг.
+            if len(new_tickers) > 10:
                 log_warn("BITHUMB", f"Подозрительно много новых тикеров ({len(new_tickers)}), пропускаем")
                 ever_seen |= current
                 continue
 
             if new_tickers:
-                log_ok("BITHUMB", f"Новые тикеры: {new_tickers}")
+                fetch_ms = (t_recv - t_send) * 1000
+                log_ok("BITHUMB", f"Новые тикеры: {new_tickers} (fetch={fetch_ms:.0f}мс)")
                 ever_seen |= new_tickers
-                process_signal(list(new_tickers), "BITHUMB", t_start=t_start)
+                process_signal(list(new_tickers), "BITHUMB", t_start=t_send)
 
         except Exception as e:
             log_err("BITHUMB", f"Ошибка поллера: {e}")
@@ -552,6 +607,14 @@ if __name__ == "__main__":
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
 
+    # FIX-PERF: дефолтный switchinterval = 5мс. Hot-path пересекает 3
+    # потока (handler → executor-worker → bybit-ws loop → executor-worker),
+    # каждая GIL-передача до 5мс = до 15мс лишних. 1мс уменьшает оверхед
+    # до ~3мс при той же CPU-нагрузке (не критично для I/O-bound сервиса).
+    import sys
+    sys.setswitchinterval(0.001)
+    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
+
     threading.Thread(target=price_updater,      daemon=True).start()
     threading.Thread(target=gate_price_updater, daemon=True).start()
     log_ok("CACHE", "price_updater (Bybit + Gate.io) запущен в фоне")
@@ -587,6 +650,17 @@ if __name__ == "__main__":
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
+
+    # FIX-PERF: глобальный sweeper вместо thread-per-claim (см. _try_claim).
+    threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
+
+    # FIX-PERF: pre-warm executor — ThreadPoolExecutor создаёт worker-thread
+    # лениво на первый submit (~3-5мс). На первом листинге не хотим платить
+    # этот налог. Сабмитим N=max_workers no-op задач, ждём их завершения.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor pre-warmed (5 worker'ов готовы)")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:

@@ -10,6 +10,8 @@ import threading
 
 from api.delist_api import (
     _post,
+    post_order,            # FIX-10: публичный алиас вместо _post_order
+    new_order_link_id,     # FIX-10: публичный алиас вместо _new_order_link_id
     _get_qty_step,
     _round_qty,
     get_price,
@@ -31,12 +33,18 @@ from api.gate_api import (
 )
 
 # FIX: вынесли импорт из хот-функции market_open_long на модульный уровень.
+# FIX-PERF: используем fire-and-forget вариант (place_order_ws_fast) — не
+# ждём 70-100мс RTT до Bybit на ack. Send возвращает за ~1-5мс, reject
+# логируется в фоне через _watch_ack в bybit_ws_trade.
 try:
-    from api.bybit_ws_trade import place_order_ws as _ws_place_order
+    from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
         return None
+    class WSOrderRejected(Exception):  # type: ignore[no-redef]
+        """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
+        pass
 
 __all__ = [
     "market_open_long",
@@ -98,30 +106,51 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
             if amount_tokens <= 0:
                 print(f"[QTY ZERO BYBIT] {symbol}")
             else:
+                qty_str = str(amount_tokens)
+                # FIX: один orderLinkId на WS и REST fallback — Bybit отвергнет
+                # дубль с retCode 30050, защита от double-position при WS
+                # ack timeout (см. post_order в delist_api).
+                order_link_id = new_order_link_id()
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
                     "side":        "Buy",
                     "orderType":   "Market",
-                    "qty":         str(amount_tokens),
+                    "qty":         qty_str,
                     "positionIdx": 1,
+                    "orderLinkId": order_link_id,
                 }
-                # FIX-batch-5: WS Trade API → fallback REST.
+                # FIX-PERF: WS Trade fire-and-forget (place_order_ws_fast).
+                # Возврат не-None означает «frame ушёл на провод»; ack от
+                # Bybit ждётся в фоне (см. _watch_ack). Reject логируется
+                # как [BYBIT-WS-FAST] REJECTED в stdout.
                 placed_via = "REST"
                 try:
                     ws_ack = _ws_place_order(order_args)
-                except Exception as e:
+                except WSOrderRejected as e:
+                    # Защитный путь: fast-вариант не должен бросать reject
+                    # (он логирует асинхронно). Но если bybit_ws_trade не
+                    # подгрузился и упал на старую sync-обёртку — обрабатываем.
+                    print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
+                    return 0, 0
+                except Exception as e:  # noqa: BLE001
                     print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
                     ws_ack = None
 
                 if ws_ack is None:
-                    _post("/v5/order/create", order_args)
+                    # FIX-batch-8 #5: fast-path post_order вместо _post (f-string,
+                    # -2..-5мс) + тот же orderLinkId — idempotency.
+                    post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id)
                 else:
-                    placed_via = "WS"
+                    placed_via = "WS-FAST"
 
                 with _last_exchange_lock:
                     _last_exchange[ticker_name] = "bybit"
-                print(f"[BYBIT LONG/{placed_via}] {symbol} | tokens={amount_tokens} | price≈{bybit_price}")
+                # FIX-PERF: удалён print "[BYBIT LONG/{placed_via}] ..." — он
+                # стоял ПЕРЕД return и добавлял ~1мс к open_ms (PYTHONUNBUFFERED=1).
+                # WS-vs-REST на success-пути не информативен; на failure-пути
+                # bybit_ws_trade уже логирует "[BYBIT-WS-FAST] send failed/timeout".
+                # Worker сразу после return пишет [OPEN] с timing.
                 return amount_tokens, bybit_price
 
     # ── Gate.io fallback ─────────────────────────────────────────
@@ -201,7 +230,10 @@ def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
 #   [BITHUMB] $PRL listed on Bithumb
 _RE_LISTING_TG   = re.compile(r"\$([A-Z0-9]{2,10})\s+listed\s+on\s+(Upbit|Bithumb|Binance|Bybit)", re.IGNORECASE)
 # FIX-batch-6: тикеры в скобках после coin-name: "Genius Terminal (GENIUS) and OpenGradient (OPG)"
-_RE_TICKER_PAREN = re.compile(r"\(([A-Z][A-Z0-9]{1,9})\)")
+# FIX: первый символ может быть цифрой — тикеры 1INCH, 1000PEPE, 1000BONK
+# раньше пропускались. Чисто цифровые `(123)` всё ещё отсекаются `_filter_tokens`
+# (isdigit() check) ниже.
+_RE_TICKER_PAREN = re.compile(r"\(([A-Z0-9][A-Z0-9]{1,9})\)")
 # FIX-batch-6: $TICKER маркер (используется в coin_listing, ListingCryptoCoinChat)
 # FIX: добавлен IGNORECASE — каналы изредка шлют "$alcx" вместо "$ALCX".
 _RE_TICKER_DOLLAR = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,9})\b")
@@ -223,66 +255,53 @@ def find_listing_pairs(text: str) -> list[str]:
     :param text: str - текст сообщения.
     :return: list[str] - список тикеров.
     """
+    # FIX-PERF: убраны print'ы "[FIND LISTING] метод=..." из тела функции.
+    # find_listing_pairs вызывается в hot-path TG handler'а ДО submit'а,
+    # каждый print с PYTHONUNBUFFERED=1 = ~0.5-1мс. Метод теперь известен
+    # только через counters, но "Монеты : [...]" в LISTING-блоке всё равно
+    # показывает результат. Для диагностики — раскомментировать print'ы.
     # Метод 1: прямой паттерн TG-канала
     matches = _RE_LISTING_TG.findall(text)
     if matches:
-        tickers = list(dict.fromkeys(t.upper() for t, _ in matches))
-        print(f"[FIND LISTING] метод=TG-паттерн → {tickers}")
-        return tickers
+        return list(dict.fromkeys(t.upper() for t, _ in matches))
 
-    # FIX-batch-6: Метод 2 — тикеры в скобках (Binance "Will List X (TICKER)" формат)
-    paren_matches = _RE_TICKER_PAREN.findall(text)
-    paren_tickers = [
-        t for t in paren_matches
+    # FIX-batch-6: Метод 2 — тикеры в скобках (Binance "Will List X (TICKER)")
+    paren_tickers = list(dict.fromkeys(
+        t for t in _RE_TICKER_PAREN.findall(text)
         if t not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 10
         and not t.isdigit()
-    ]
-    paren_tickers = list(dict.fromkeys(paren_tickers))
+    ))
     if paren_tickers:
-        print(f"[FIND LISTING] метод=скобки → {paren_tickers}")
         return paren_tickers
 
-    # FIX-batch-6: Метод 3 — $TICKER маркеры
+    # FIX-batch-6: Метод 3 — $TICKER маркеры.
     # FIX: нормализуем в uppercase (каналы изредка пишут "$alcx").
-    dollar_matches = [t.upper() for t in _RE_TICKER_DOLLAR.findall(text)]
-    dollar_tickers = [
-        t for t in dollar_matches
-        if t not in EXCLUDED_TOKENS
+    dollar_tickers = list(dict.fromkeys(
+        t.upper() for t in _RE_TICKER_DOLLAR.findall(text)
+        if t.upper() not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 10
         and not t.isdigit()
-    ]
-    dollar_tickers = list(dict.fromkeys(dollar_tickers))
+    ))
     if dollar_tickers:
-        print(f"[FIND LISTING] метод=$ticker → {dollar_tickers}")
         return dollar_tickers
 
     # FIX-batch-6: Метод 4 — явные USDT-пары
     text_upper = text.upper()
-    usdt_matches = _RE_USDT_PAIR.findall(text_upper)
-    usdt_tickers = [
-        t for t in usdt_matches
+    usdt_tickers = list(dict.fromkeys(
+        t for t in _RE_USDT_PAIR.findall(text_upper)
         if t not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 10
         and not t.isdigit()
-    ]
-    usdt_tickers = list(dict.fromkeys(usdt_tickers))
+    ))
     if usdt_tickers:
-        print(f"[FIND LISTING] метод=USDT-пары → {usdt_tickers}")
         return usdt_tickers
 
     # Метод 5: fallback по known_coins
-    candidates = _RE_TICKER_PLAIN.findall(text_upper)
-    found = [
-        t for t in candidates
+    return list(dict.fromkeys(
+        t for t in _RE_TICKER_PLAIN.findall(text_upper)
         if t not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 8
         and not t.isdigit()
         and t in known_coins
-    ]
-    found = list(dict.fromkeys(found))
-    if found:
-        print(f"[FIND LISTING] метод=fallback(known_coins) → {found}")
-    else:
-        print(f"[FIND LISTING] ничего не найдено: {text[:80]}")
-    return found
+    ))

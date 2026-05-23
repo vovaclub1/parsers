@@ -1,0 +1,36 @@
+# Никогда не коммить эти файлы в git — они дают полный доступ к аккаунту.
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*.session-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Логи
+*.log
+pyrogram_errors.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Heartbeat файлы (создаются на runtime)
+/tmp/delist_heartbeat
+/tmp/listing_heartbeat
+
+# OS
+.DS_Store
+Thumbs.db
