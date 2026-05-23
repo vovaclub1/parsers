@@ -4,7 +4,6 @@ import asyncio
 import os
 import random
 import re
-import string
 import threading
 import time
 import itertools
@@ -189,9 +188,11 @@ _poller_threads: dict[int, threading.Thread] = {}   # FIX: учёт активн
 # FIX-batch-8: per-poller адаптивный интервал — каждый поллер имеет свой
 # текущий интервал. После 429/ошибки он растёт в POLL_BACKOFF_MULT раз
 # (до POLL_BACKOFF_MAX), через POLL_BACKOFF_RECOVERY секунд после
-# последнего успешного запроса возвращается к POLL_INTERVAL_BASE.
+# последнего bump'а (а не успеха!) возвращается к POLL_INTERVAL_BASE.
+# FIX: трекаем last_bump_ts, а не last_ok_ts — иначе reset никогда не
+# срабатывал, потому что _mark_ok обновлял last_ok_ts перед проверкой.
 _poller_intervals: dict[int, float] = {}
-_poller_last_ok_ts: dict[int, float] = {}
+_poller_last_bump_ts: dict[int, float] = {}
 _poller_intervals_lock = threading.Lock()
 
 # Создаём отдельную сессию для каждого прокси
@@ -207,7 +208,8 @@ for proxy in PROXIES:
 for _i in range(len(_sessions)):
     _poller_last_ts[_i] = time.monotonic()
     _poller_intervals[_i] = POLL_INTERVAL_BASE
-    _poller_last_ok_ts[_i] = time.monotonic()
+    # 0 = ни одного bump'а ещё не было → нет смысла ресетить
+    _poller_last_bump_ts[_i] = 0.0
 
 # Циклический итератор по сессиям
 _session_cycle = itertools.cycle(enumerate(_sessions))
@@ -230,13 +232,13 @@ def _build_binance_url() -> str:
     Что делаем:
       1. pageSize крутим из whitelist BINANCE_PAGE_SIZES — все эти значения
          валидны для API. Меняя его, попадаем на разные cache key.
-      2. Добавляем 2 random query params (имя+значение) — гарантированный
-         miss для CloudFront, но Binance их игнорирует.
+      2. _t=<ms-timestamp> — гарантированный uniqueness каждого запроса.
       3. Перемешиваем порядок параметров — у некоторых CDN порядок учитывается.
+
+    FIX: убран дополнительный rnd_name=rnd_val — _t уже даёт уникальный
+    cache key, второй random был избыточен (не вреден, но шум).
     """
-    rnd_name = "".join(random.choice(string.ascii_lowercase) for _ in range(8))
-    rnd_val  = random.randint(1, 99_999_999)
-    page_sz  = random.choice(BINANCE_PAGE_SIZES)
+    page_sz = random.choice(BINANCE_PAGE_SIZES)
 
     params = [
         ("type", "1"),
@@ -244,7 +246,6 @@ def _build_binance_url() -> str:
         ("pageSize", str(page_sz)),
         ("catalogId", str(CATEGORY_ID)),
         ("_t", str(int(time.time() * 1000))),  # ms timestamp — гарантированный uniqueness
-        (rnd_name, str(rnd_val)),
     ]
     random.shuffle(params)
     qs = "&".join(f"{k}={v}" for k, v in params)
@@ -518,24 +519,39 @@ def _bump_interval(session_idx: int) -> None:
     with _poller_intervals_lock:
         cur = _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
         _poller_intervals[session_idx] = min(cur * POLL_BACKOFF_MULT, POLL_BACKOFF_MAX)
+        _poller_last_bump_ts[session_idx] = time.monotonic()
 
 
 def _reset_interval_if_recovered(session_idx: int) -> None:
-    """FIX-batch-8: если последний успех был давно — вернуть базовый интервал."""
+    """
+    Если с момента последнего bump'а прошло POLL_BACKOFF_RECOVERY секунд —
+    возвращаем базовый интервал.
+
+    FIX: раньше reset смотрел на last_ok_ts, который только что обновил _mark_ok.
+    Условие (now - last_ok) < POLL_BACKOFF_RECOVERY всегда было True → reset
+    никогда не срабатывал → один 429 поднимал интервал до POLL_BACKOFF_MAX
+    навсегда. Теперь трекаем last_bump_ts — это единственный осмысленный
+    timestamp для recovery-логики.
+    """
     now = time.monotonic()
     with _poller_intervals_lock:
-        last_ok = _poller_last_ok_ts.get(session_idx, 0)
-        if (now - last_ok) < POLL_BACKOFF_RECOVERY:
+        cur_interval = _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
+        if cur_interval <= POLL_INTERVAL_BASE:
             return
-        if _poller_intervals.get(session_idx, POLL_INTERVAL_BASE) > POLL_INTERVAL_BASE:
-            _poller_intervals[session_idx] = POLL_INTERVAL_BASE
-            _poller_last_ok_ts[session_idx] = now
+        last_bump = _poller_last_bump_ts.get(session_idx, 0.0)
+        if last_bump == 0.0:
+            # bump'ов не было — нечего сбрасывать
+            return
+        if (now - last_bump) < POLL_BACKOFF_RECOVERY:
+            return
+        _poller_intervals[session_idx] = POLL_INTERVAL_BASE
+        _poller_last_bump_ts[session_idx] = 0.0
 
 
 def _mark_ok(session_idx: int) -> None:
-    """FIX-batch-8: успех — обновить last_ok timestamp."""
-    with _poller_intervals_lock:
-        _poller_last_ok_ts[session_idx] = time.monotonic()
+    """Успех. Сам по себе ничего не делает (кроме watchdog ts ниже)."""
+    # Watchdog timestamp обновляется отдельно в poller()
+    pass
 
 
 def _get_interval(session_idx: int) -> float:
@@ -615,6 +631,13 @@ def poller(session_idx: int) -> None:
 
 # ── Watchdog ──────────────────────────────────────────────────────
 
+# FIX-10: трекаем подряд "alive but stuck" циклы — Python не может убить
+# поток, зависший в TLS handshake / requests.get(), поэтому хотя бы
+# сообщаем юзеру в TG, чтобы он рестартанул контейнер.
+_WATCHDOG_STUCK_ALERT_AFTER = 3   # 3 цикла × 30с = 90с тишины — точно zombie
+_poller_stuck_counts: dict[int, int] = {}
+
+
 def _watchdog() -> None:
     """
     Каждые 30 секунд проверяет что все поллеры живы.
@@ -638,19 +661,31 @@ def _watchdog() -> None:
 
         for idx, age in ages.items():
             if age <= WATCHDOG_TIMEOUT:
+                # Поллер ожил — сбрасываем счётчик stuck
+                _poller_stuck_counts[idx] = 0
                 continue
 
             # FIX: проверяем, что старый поток уже мёртв (или мы не знаем о нём)
             old = _poller_threads.get(idx)
             if old is not None and old.is_alive():
-                log_warn("WATCHDOG", f"poller[{idx}] завис {age:.0f}с но поток жив — пропускаем рестарт")
-                # Сбрасываем timestamp чтобы не спамить
+                # FIX-10: поток жив, но не пишет timestamp — TLS handshake / socket stuck.
+                # Считаем циклы — после N подряд алертим в TG (Python не может убить поток).
+                stuck = _poller_stuck_counts.get(idx, 0) + 1
+                _poller_stuck_counts[idx] = stuck
+                log_warn("WATCHDOG", f"poller[{idx}] завис {age:.0f}с но поток жив — пропускаем рестарт (stuck cycle {stuck})")
+                if stuck == _WATCHDOG_STUCK_ALERT_AFTER:
+                    tg_log(
+                        f"⚠️ <b>WATCHDOG</b>: poller[{idx}] zombie {stuck * 30}с "
+                        f"(поток жив, не отвечает). Рекомендуем рестарт контейнера."
+                    )
+                # Сбрасываем timestamp чтобы не спамить логи каждые 30с
                 with _poller_ts_lock:
                     _poller_last_ts[idx] = now
                 continue
 
             log_err("WATCHDOG", f"poller[{idx}] завис ({age:.0f}с без ответа) — перезапускаем")
             tg_log(f"⚠️ <b>WATCHDOG</b>: poller[{idx}] завис {age:.0f}с, перезапуск")
+            _poller_stuck_counts[idx] = 0
 
             with _poller_ts_lock:
                 _poller_last_ts[idx] = now

@@ -389,10 +389,13 @@ def run_upbit_poller() -> None:
     while True:
         try:
             time.sleep(POLL_INTERVAL)
-            # FIX-batch-8: t_start фиксируем СРАЗУ после получения ответа,
-            # чтобы метрика OPEN/LONG отражала путь "сетевой ответ → ордер".
+            # FIX: засекаем t_send ДО HTTP-запроса и t_recv ПОСЛЕ. t_send
+            # передаём в process_signal как "момент начала запроса к Upbit"
+            # — это полная latency сигнала, включая сеть. t_recv − t_send
+            # логируем как fetch_ms для диагностики.
+            t_send = time.perf_counter()
             current = _load_upbit_tickers(session)
-            t_start = time.perf_counter()
+            t_recv = time.perf_counter()
 
             with _ts_lock:
                 _upbit_last_ts = time.monotonic()
@@ -400,9 +403,11 @@ def run_upbit_poller() -> None:
             new_tickers = current - ever_seen
 
             if new_tickers:
-                log_ok("UPBIT", f"Новые тикеры: {new_tickers}")
+                fetch_ms = (t_recv - t_send) * 1000
+                log_ok("UPBIT", f"Новые тикеры: {new_tickers} (fetch={fetch_ms:.0f}мс)")
                 ever_seen |= new_tickers
-                process_signal(list(new_tickers), "UPBIT", t_start=t_start)
+                # t_start = t_send → метрика включает сетевую задержку до Upbit.
+                process_signal(list(new_tickers), "UPBIT", t_start=t_send)
 
         except Exception as e:
             log_err("UPBIT", f"Ошибка поллера: {e}")
@@ -456,24 +461,28 @@ def run_bithumb_poller() -> None:
     while True:
         try:
             time.sleep(POLL_INTERVAL)
+            # FIX: t_send до HTTP, t_recv после — см. комментарий в run_upbit_poller.
+            t_send = time.perf_counter()
             current = _load_bithumb_tickers(session)
-            # FIX-batch-8: t_start фиксируем после получения ответа.
-            t_start = time.perf_counter()
+            t_recv = time.perf_counter()
 
             with _ts_lock:
                 _bithumb_last_ts = time.monotonic()
 
             new_tickers = current - ever_seen
 
-            if len(new_tickers) > 3:
+            # FIX: порог 3 → 10. После maintenance Bithumb может разово отдать
+            # 5-8 новых тикеров — мы их пропускали все, теряя реальный листинг.
+            if len(new_tickers) > 10:
                 log_warn("BITHUMB", f"Подозрительно много новых тикеров ({len(new_tickers)}), пропускаем")
                 ever_seen |= current
                 continue
 
             if new_tickers:
-                log_ok("BITHUMB", f"Новые тикеры: {new_tickers}")
+                fetch_ms = (t_recv - t_send) * 1000
+                log_ok("BITHUMB", f"Новые тикеры: {new_tickers} (fetch={fetch_ms:.0f}мс)")
                 ever_seen |= new_tickers
-                process_signal(list(new_tickers), "BITHUMB", t_start=t_start)
+                process_signal(list(new_tickers), "BITHUMB", t_start=t_send)
 
         except Exception as e:
             log_err("BITHUMB", f"Ошибка поллера: {e}")
