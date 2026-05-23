@@ -10,8 +10,9 @@ import threading
 
 from api.delist_api import (
     _post,
-    post_order,            # FIX-10: публичный алиас вместо _post_order
-    new_order_link_id,     # FIX-10: публичный алиас вместо _new_order_link_id
+    _post_http2,             # FIX: HTTP/2 client для background TP/SL
+    post_order,              # FIX-10: публичный алиас вместо _post_order
+    new_order_link_id,       # FIX-10: публичный алиас вместо _new_order_link_id
     _get_qty_step,
     _round_qty,
     get_price,
@@ -19,6 +20,8 @@ from api.delist_api import (
     EXCLUDED_TOKENS,
     price_updater,
     warmup_bybit_connection,
+    warmup_bybit_http2,      # FIX-PERF: прогрев httpx HTTP/2 до первого TP/SL
+    start_bybit_heartbeat,   # FIX: TLS pool heartbeat
     preload_lot_steps,
     QtyStepUnavailable,
     LEVERAGE,
@@ -54,6 +57,8 @@ __all__ = [
     "price_updater",
     "gate_price_updater",
     "warmup_bybit_connection",
+    "warmup_bybit_http2",
+    "start_bybit_heartbeat",
     "preload_lot_steps",
     "gate_preload_lot_steps",
     "warmup_gate_connection",
@@ -111,6 +116,12 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 # дубль с retCode 30050, защита от double-position при WS
                 # ack timeout (см. post_order в delist_api).
                 order_link_id = new_order_link_id()
+                # FIX-PERF: order.create несёт ТОЛЬКО market-открытие. SL/TP/
+                # trailing идут отдельным /v5/position/trading-stop в фоновом
+                # потоке (HTTP/2-multiplexed, ~30-50мс). Bundle SL+TP в
+                # order.create экономил ~30мс на постановке SL, но платил
+                # ~3-5мс в hot-path (extra compute + larger TLS frame), что
+                # критичнее на signal-to-fill метрике.
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
@@ -170,11 +181,17 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
 
 def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет TP1 +5.5% на 30% + трейлинг 5.5% на 70% на Bybit.
-    :param ticker_name: str - тикер монеты.
-    :param entry_price: float - цена входа.
-    :param amount: float - количество токенов в позиции.
-    :return: str - результат.
+    Выставляет SL (-8%) + TP1 (+4.5% на 30%) + trailing stop 3.5% на 70% на
+    Bybit через /v5/position/trading-stop. Идёт по HTTP/2-multiplexed
+    клиенту (_post_http2) — несколько параллельных постановок шарят один
+    TLS-stream.
+
+    FIX-PERF: ранее в batch-7 SL+TP1 бандлились в order.create вместе с
+    открытием, чтобы failsafe-SL уехал на сервер в одном фрейме с открытием.
+    Откатили: bundle добавлял ~3-5мс в hot-path market_open_long (extra
+    compute + larger TLS frame), а выигрыш в SL latency (~30мс) не стоил
+    деградации signal-to-fill. Сейчас полный TP/SL пакет уходит из фонового
+    потока worker'а сразу после OPEN-метки.
     """
     symbol = f"{ticker_name}USDT"
 
@@ -184,17 +201,16 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
         print(f"[TP/SL SKIP] {e}")
         return "skip"
 
-    sl  = round(entry_price * 0.92, 8)   # -8%
-    tp1 = round(entry_price * 1.055, 8)  # +5.5%
+    sl  = round(entry_price * 0.92, 8)    # -8%
+    tp1 = round(entry_price * 1.045, 8)   # +4.5%
 
-    # FIX: убрал неиспользуемую sl_size — Bybit /position/trading-stop ставит SL
-    # на ВСЮ позицию автоматически (без slSize), а TP1 на 30%, остальное под трейлинг.
     tp1_size = str(_round_qty(amount * 0.30, step))  # 30% на TP1
 
     # trailingStop = абсолютное расстояние в USDT от максимума до стопа.
-    trailing_distance = round(entry_price * 0.055, 8)
+    # 3.5% — потуже чем было (5.5%), чтобы меньше отдавать с пика.
+    trailing_distance = round(entry_price * 0.035, 8)
 
-    _post("/v5/position/trading-stop", {
+    _post_http2("/v5/position/trading-stop", {
         "category":     "linear",
         "symbol":       symbol,
         "stopLoss":     str(sl),
@@ -207,7 +223,7 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
         "positionIdx":  1,
     })
 
-    print(f"[TP/SL SET LONG] {ticker_name} | SL={sl}(-8%) | TP1={tp1}(+5.5%/30%) | Trailing=5.5%(70%)")
+    print(f"[TP/SL SET LONG] {ticker_name} | SL={sl}(-8%) | TP1={tp1}(+4.5%/30%) | Trailing=3.5%(70%)")
     return "Выставил цели (лонг)"
 
 

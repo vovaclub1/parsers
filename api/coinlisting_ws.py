@@ -229,6 +229,38 @@ async def _parse_tokens_from_article_fast(url: str) -> list[str]:
         return []
 
 
+# ── External signal sink ─────────────────────────────────────────
+# Если задан — _handle делегирует сигнал ему ВМЕСТО прямого _trade.
+# Сигнатура: (tickers: list[str], source: str, t_signal: float) -> None.
+# Используется parser_listing.run_coinlisting(..., signal_callback=...) для
+# того, чтобы CoinListing-сигналы попадали в общий L1+L2 дедуп процесса
+# (announcement → global fired). Cooldown _in_cooldown/_set_cooldown
+# остаётся локальным фильтром этого модуля.
+_signal_callback = None  # type: ignore[var-annotated]
+
+
+def set_signal_callback(cb) -> None:
+    """Регистрирует внешний обработчик сигналов. См. _signal_callback выше."""
+    global _signal_callback
+    _signal_callback = cb
+
+
+def _emit_signal(tickers: list[str], source: str, t_signal: float) -> None:
+    """Безопасный диспатч во внешний callback или в локальный _trade."""
+    if _signal_callback is not None:
+        try:
+            _signal_callback(tickers, source, t_signal)
+            return
+        except Exception as e:  # noqa: BLE001
+            log_err("CL", f"external callback failed ({e!r}) — fallback to local _trade")
+    for t in tickers:
+        threading.Thread(
+            target=_trade,
+            args=(t, source, "", t_signal),
+            daemon=True,
+        ).start()
+
+
 # ── Trading ──────────────────────────────────────────────────────
 def _trade(
     ticker: str,
@@ -317,12 +349,7 @@ async def _handle(msg: dict) -> None:
 
     if real:
         log_ok("CL", f"REAL {real}")
-        for ticker in real:
-            threading.Thread(
-                target=_trade,
-                args=(ticker, source, title, t_signal),
-                daemon=True,
-            ).start()
+        _emit_signal(real, f"COINLISTING-{source}", t_signal)
         return
 
     # ── MASKED → ARTICLE PARSE ──────────────────
@@ -335,12 +362,7 @@ async def _handle(msg: dict) -> None:
 
     if parsed:
         log_ok("CL", f"ARTICLE TOKENS {parsed}")
-        for ticker in parsed:
-            threading.Thread(
-                target=_trade,
-                args=(ticker, source, title, t_signal),
-                daemon=True,
-            ).start()
+        _emit_signal(parsed, f"COINLISTING-{source}", t_signal)
         return
 
     # ── FALLBACK ────────────────────────────────
@@ -348,12 +370,7 @@ async def _handle(msg: dict) -> None:
 
     if tickers:
         log_warn("CL", f"FALLBACK {tickers}")
-        for ticker in tickers:
-            threading.Thread(
-                target=_trade,
-                args=(ticker, source, title, t_signal),
-                daemon=True,
-            ).start()
+        _emit_signal(tickers, f"COINLISTING-{source}", t_signal)
 
 
 # ── Websocket ────────────────────────────────────────────────────
