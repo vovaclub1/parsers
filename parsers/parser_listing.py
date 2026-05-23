@@ -3,7 +3,7 @@ from __future__ import annotations
 # ── parser_listing.py ─────────────────────────────────────────────
 # Три параллельных источника сигналов:
 #   1. Telegram (Telethon) — канал coin_listing, личный аккаунт
-#   2. Upbit + Bithumb REST API — polling каждые 300мс (новые тикеры)
+#   2. Upbit + Bithumb REST API — polling каждые 100мс (новые тикеры)
 #   3. CoinListing WS — wss://*.coinlisting.pro
 #
 # При сигнале: market_open_long → set_tp_sl_long (в фоне)
@@ -101,7 +101,14 @@ TG_LISTING_NEG = [
 
 UPBIT_MARKETS_URL   = "https://api.upbit.com/v1/market/all"
 BITHUMB_ASSETS_URL  = "https://api.bithumb.com/public/assetsstatus/all"
-POLL_INTERVAL       = 0.3
+
+# FIX-batch-8: интервал опроса 300мс → 100мс.
+# Upbit rate limit = 10 req/sec на IP — 100мс лимит выдерживает с запасом.
+# Win: −200мс медианной детекции Korean листингов.
+# Хардкод (не env) — это публичный лимит биржи, не персональные данные.
+POLL_INTERVAL       = 0.1
+# При ошибке/429 — отдельный (более длинный) sleep, чтобы не флудить.
+POLL_ERROR_BACKOFF  = 3.0
 
 WATCHDOG_TIMEOUT    = 60   # секунд
 
@@ -198,7 +205,13 @@ def worker(coin: str, margin: float, t_start: float,
     tg_log(f"⚠️Listing {coin}: все попытки провалились")
 
 
-# ── FIX-batch-4: callback для Tree of Alpha WS ───────────────────
+# ── FIX-batch-8: callback для Tree of Alpha WS ───────────────────
+# Раньше функция была сломана:
+#   (process_signal(pairs, "TOA-WS", t_start=t_start))   ← TypeError (нет t_start в сигнатуре)
+#   process_signal(pairs, "TOA-WS", t_start=t_start)     ← unreachable
+#   process_signal(pairs, "TOA-WS")                       ← unreachable
+# Результат: TOA листинги вообще не открывались, в логах был ловимый TypeError.
+# Сейчас: process_signal принимает t_start (опц.), один корректный вызов.
 
 def _on_toa_listing(full_text: str, t_start: float) -> None:
     """Callback из treeofalpha_ws — листинг."""
@@ -207,18 +220,22 @@ def _on_toa_listing(full_text: str, t_start: float) -> None:
         log_warn("TOA-LIST", f"тикеры не найдены: {full_text[:120]}")
         return
     log_ok("TOA-LIST", f"Листинг-сигнал из TOA WS: {pairs}")
-    # FIX: пробрасываем t_start из WS-loop (раньше perf_counter() перезаписывался
-    # в process_signal — латентность от прихода сообщения до ордера терялась).
-    (process_signal(pairs, "TOA-WS", t_start=t_start))
-    # в process_signal — латентность от прихода сообщения до ордера терялась).
+    # FIX-batch-8: пробрасываем t_start из WS-loop. Раньше perf_counter()
+    # перезаписывался в process_signal и латентность от прихода сообщения
+    # до ордера терялась.
     process_signal(pairs, "TOA-WS", t_start=t_start)
-    process_signal(pairs, "TOA-WS")
 
 
 # ── общая обработка сигнала ───────────────────────────────────────
 
-def process_signal(pairs: list[str], source: str) -> None:
-    t_start = time.perf_counter()
+def process_signal(pairs: list[str], source: str, t_start: float | None = None) -> None:
+    """
+    FIX-batch-8: t_start теперь параметр. Если None — замеряем сами (бэк-совместимость).
+    Если передан (из TOA WS / TG handler / Upbit-Bithumb) — используем точный момент
+    прихода сигнала, чтобы метрики OPEN/LONG в логах отражали полный путь.
+    """
+    if t_start is None:
+        t_start = time.perf_counter()
 
     new_pairs = [c for c in pairs if _try_claim(c)]
     if not new_pairs:
@@ -272,6 +289,9 @@ def run_telegram_listener() -> None:
 
     @client.on(events.NewMessage(chats=channels))
     async def handler(event):
+        # FIX-batch-8: замеряем t_start как можно раньше, до фильтрации и
+        # get_chat() — это правильный момент "сигнал получен".
+        t_start = time.perf_counter()
         try:
             text = event.message.message or ""
         except Exception:
@@ -304,7 +324,7 @@ def run_telegram_listener() -> None:
 
         threading.Thread(
             target=process_signal,
-            args=(pairs, f"TG:@{uname}" if uname else "TG"),
+            args=(pairs, f"TG:@{uname}" if uname else "TG", t_start),
             daemon=True,
         ).start()
 
@@ -357,7 +377,7 @@ def run_upbit_poller() -> None:
     log_ok("UPBIT", "Загружаем начальный список тикеров...")
     try:
         known: set[str] = _load_upbit_tickers(session)
-        log_ok("UPBIT", f"Загружено {len(known)} тикеров, жду новые...")
+        log_ok("UPBIT", f"Загружено {len(known)} тикеров, жду новые (poll {POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
             _upbit_last_ts = time.monotonic()
     except Exception as e:
@@ -369,7 +389,10 @@ def run_upbit_poller() -> None:
     while True:
         try:
             time.sleep(POLL_INTERVAL)
+            # FIX-batch-8: t_start фиксируем СРАЗУ после получения ответа,
+            # чтобы метрика OPEN/LONG отражала путь "сетевой ответ → ордер".
             current = _load_upbit_tickers(session)
+            t_start = time.perf_counter()
 
             with _ts_lock:
                 _upbit_last_ts = time.monotonic()
@@ -379,11 +402,13 @@ def run_upbit_poller() -> None:
             if new_tickers:
                 log_ok("UPBIT", f"Новые тикеры: {new_tickers}")
                 ever_seen |= new_tickers
-                process_signal(list(new_tickers), "UPBIT")
+                process_signal(list(new_tickers), "UPBIT", t_start=t_start)
 
         except Exception as e:
             log_err("UPBIT", f"Ошибка поллера: {e}")
-            time.sleep(3)
+            # FIX-batch-8: backoff на 3с при ошибке (был 3с — оставляем),
+            # чтобы не флудить упавший Upbit с интервалом 100мс.
+            time.sleep(POLL_ERROR_BACKOFF)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -419,7 +444,7 @@ def run_bithumb_poller() -> None:
     log_ok("BITHUMB", "Загружаем начальный список тикеров...")
     try:
         known: set[str] = _load_bithumb_tickers(session)
-        log_ok("BITHUMB", f"Загружено {len(known)} тикеров, жду новые...")
+        log_ok("BITHUMB", f"Загружено {len(known)} тикеров, жду новые (poll {POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
             _bithumb_last_ts = time.monotonic()
     except Exception as e:
@@ -432,6 +457,8 @@ def run_bithumb_poller() -> None:
         try:
             time.sleep(POLL_INTERVAL)
             current = _load_bithumb_tickers(session)
+            # FIX-batch-8: t_start фиксируем после получения ответа.
+            t_start = time.perf_counter()
 
             with _ts_lock:
                 _bithumb_last_ts = time.monotonic()
@@ -446,11 +473,11 @@ def run_bithumb_poller() -> None:
             if new_tickers:
                 log_ok("BITHUMB", f"Новые тикеры: {new_tickers}")
                 ever_seen |= new_tickers
-                process_signal(list(new_tickers), "BITHUMB")
+                process_signal(list(new_tickers), "BITHUMB", t_start=t_start)
 
         except Exception as e:
             log_err("BITHUMB", f"Ошибка поллера: {e}")
-            time.sleep(3)
+            time.sleep(POLL_ERROR_BACKOFF)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -556,7 +583,7 @@ if __name__ == "__main__":
     _upbit_thread.start()
     _bithumb_thread.start()
     threading.Thread(target=run_coinlisting, daemon=True, name="coinlisting-ws").start()
-    log_ok("PARSER", f"Upbit + Bithumb поллеры + CoinListing WS запущены (интервал {POLL_INTERVAL}с)")
+    log_ok("PARSER", f"Upbit + Bithumb поллеры + CoinListing WS запущены (интервал {POLL_INTERVAL*1000:.0f}мс)")
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
