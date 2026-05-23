@@ -17,8 +17,7 @@ orjson>=3.9,<4
 
 # Telegram clients
 telethon>=1.36,<2
-pyrogram>=2.0,<3
-tgcrypto>=1.2,<2
+cryptg>=0.4,<1
 pyTelegramBotAPI>=4.14,<5
 
 # Crypto
