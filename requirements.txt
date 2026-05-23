@@ -12,8 +12,12 @@ python-dotenv>=1.0,<2
 # uvloop      — asyncio event loop в 2-4x быстрее (Cython + libuv)
 # orjson      — JSON парсинг в 3-5x быстрее std json (Rust)
 # tgcrypto    — C-расширение AES для Telethon/Pyrogram, x10 быстрее decode
+# msgspec     — schema-based JSON: orjson + dict→struct в один проход
+# httpx[http2]— HTTP/2 клиент с мультиплексированием (для background TP/SL)
 uvloop>=0.19,<1
 orjson>=3.9,<4
+msgspec>=0.18,<1
+httpx[http2]>=0.27,<1
 
 # Telegram clients
 telethon>=1.36,<2
