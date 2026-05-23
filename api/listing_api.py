@@ -33,8 +33,11 @@ from api.gate_api import (
 )
 
 # FIX: вынесли импорт из хот-функции market_open_long на модульный уровень.
+# FIX-PERF: используем fire-and-forget вариант (place_order_ws_fast) — не
+# ждём 70-100мс RTT до Bybit на ack. Send возвращает за ~1-5мс, reject
+# логируется в фоне через _watch_ack в bybit_ws_trade.
 try:
-    from api.bybit_ws_trade import place_order_ws as _ws_place_order, WSOrderRejected
+    from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
@@ -117,16 +120,20 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                     "positionIdx": 1,
                     "orderLinkId": order_link_id,
                 }
-                # FIX-batch-5: WS Trade API → fallback REST.
+                # FIX-PERF: WS Trade fire-and-forget (place_order_ws_fast).
+                # Возврат не-None означает «frame ушёл на провод»; ack от
+                # Bybit ждётся в фоне (см. _watch_ack). Reject логируется
+                # как [BYBIT-WS-FAST] REJECTED в stdout.
                 placed_via = "REST"
                 try:
                     ws_ack = _ws_place_order(order_args)
                 except WSOrderRejected as e:
-                    # FIX-2: WS работает, Bybit ОТВЕРГ ордер логически.
-                    # REST повтор бесполезен → сразу сдаёмся.
+                    # Защитный путь: fast-вариант не должен бросать reject
+                    # (он логирует асинхронно). Но если bybit_ws_trade не
+                    # подгрузился и упал на старую sync-обёртку — обрабатываем.
                     print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
                     return 0, 0
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
                     ws_ack = None
 
@@ -135,7 +142,7 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                     # -2..-5мс) + тот же orderLinkId — idempotency.
                     post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id)
                 else:
-                    placed_via = "WS"
+                    placed_via = "WS-FAST"
 
                 with _last_exchange_lock:
                     _last_exchange[ticker_name] = "bybit"

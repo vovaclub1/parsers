@@ -904,6 +904,13 @@ if __name__ == "__main__":
     # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
 
+    # FIX-PERF: pre-warm executor — иначе первый submit платит ~3-5мс
+    # на создание worker-thread'а.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor pre-warmed")
+
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:
         try:
