@@ -592,7 +592,10 @@ def poller(session_idx: int) -> None:
 
                 # FIX-batch-1: orjson вместо resp.json() (3-5x быстрее на Binance ответах ~5-20KB).
                 data     = _json_loads(resp.content).get("data", {})
-                articles = data.get("articles") or (data.get("catalogs", [{}])[0].get("articles", []))
+                # FIX: catalogs может вернуться как [] — старый код data.get("catalogs", [{}])[0]
+                # падал с IndexError, потому что default срабатывал только при отсутствии ключа.
+                catalogs = data.get("catalogs") or [{}]
+                articles = data.get("articles") or (catalogs[0].get("articles", []) if isinstance(catalogs[0], dict) else [])
 
                 # Обновляем watchdog timestamp + успешный ответ — пробуем сбросить backoff
                 with _poller_ts_lock:
@@ -618,9 +621,16 @@ def poller(session_idx: int) -> None:
                                     new_count += 1
                         if new_count > 0:
                             log_info("POLLER", f"[{label}] получено {len(articles)} статей (новых: {new_count})")
-                        # FIX: executor.submit вместо ленивого .map — исключения логируются
+                        # FIX: executor.submit вместо ленивого .map. add_done_callback —
+                        # чтобы исключения внутри process_article не тонули в Future
+                        # (раньше падал тихо при schema-change у Binance API).
+                        def _log_future_exc(fut, _label=label):
+                            exc = fut.exception()
+                            if exc is not None:
+                                log_err("POLLER", f"[{_label}] process_article упал: {exc!r}")
                         for a in articles:
-                            executor.submit(process_article, a)
+                            fut = executor.submit(process_article, a)
+                            fut.add_done_callback(_log_future_exc)
                 else:
                     log_warn("POLLER", f"[{label}] статей нет или пустой ответ")
 
@@ -715,19 +725,13 @@ def run_telegram_delist_listener() -> None:
     TG_DELIST_KEYWORDS: делистинги Binance, Upbit, Bithumb.
     FIX-batch-3: подписываемся сразу на несколько каналов.
     Кто из каналов опередил — тот и победил (дедуп через _fired_coins, TTL 60с).
+
+    FIX: TelegramClient создаётся ВНУТРИ _run, иначе при reconnect-loop
+    (asyncio.run в while True) клиент привязан к закрытому event-loop'у и падает.
     """
     from telethon import TelegramClient, events
 
     session_path = str(Path(SESSION_DIR) / "delist_session")
-    client = TelegramClient(
-        session_path,
-        api_id=int(TG_API_ID) if TG_API_ID else 0,
-        api_hash=TG_API_HASH or "",
-        auto_reconnect=True,
-        retry_delay=5,
-        connection_retries=None,   # бесконечные попытки переподключения
-        request_retries=5,
-    )
 
     # FIX-batch-3: собираем список всех каналов для подписки.
     # Основной + extras из .env. Дубликаты убираем.
@@ -736,49 +740,61 @@ def run_telegram_delist_listener() -> None:
         if c not in channels:
             channels.append(c)
 
-    @client.on(events.NewMessage(chats=channels))
-    async def handler(event):
-        # FIX-9: t_start первой строкой — унифицируем с parser_listing.py.
-        # Раньше засекалось после фильтрации; теперь метрика включает CPU
-        # на keyword scan (~0.1мс на текст ~200 символов — мелочь, но честно).
-        t_start = time.perf_counter()
-        try:
-            text = event.message.message or ""
-        except Exception:
-            return
-
-        if not text:
-            return
-
-        tl = text.lower()
-        if not any(kw in tl for kw in TG_DELIST_KEYWORDS):
-            return
-
-        # FIX-batch-6: negative filter — отсекаем Binance Alpha removals и т.п.
-        if any(neg in tl for neg in TG_DELIST_NEG):
-            return
-
-        try:
-            chat    = await event.get_chat()
-            chat_id = getattr(chat, "id", 0)
-            uname   = getattr(chat, "username", "") or ""
-        except Exception:
-            chat_id, uname = 0, ""
-
-        log_ok("TG-DELIST", f"Делистинг-сигнал! [{chat_id} @{uname}]: {text[:100]}")
-
-        pairs = find_pairs(text)
-        if not pairs:
-            log_warn("TG-DELIST", f"Тикер не найден: {text[:80]}")
-            return
-
-        threading.Thread(
-            target=process_signal,
-            args=(pairs, f"TG:@{uname}" if uname else "TG", t_start),
-            daemon=True,
-        ).start()
-
     async def _run():
+        client = TelegramClient(
+            session_path,
+            api_id=int(TG_API_ID) if TG_API_ID else 0,
+            api_hash=TG_API_HASH or "",
+            auto_reconnect=True,
+            retry_delay=5,
+            connection_retries=None,   # бесконечные попытки переподключения
+            request_retries=5,
+        )
+
+        @client.on(events.NewMessage(chats=channels))
+        async def handler(event):
+            # FIX-9: t_start первой строкой — унифицируем с parser_listing.py.
+            t_start = time.perf_counter()
+            try:
+                text = event.message.message or ""
+            except Exception:
+                return
+
+            if not text:
+                return
+
+            tl = text.lower()
+            if not any(kw in tl for kw in TG_DELIST_KEYWORDS):
+                return
+
+            # FIX-batch-6: negative filter — отсекаем Binance Alpha removals и т.п.
+            if any(neg in tl for neg in TG_DELIST_NEG):
+                return
+
+            try:
+                chat    = await event.get_chat()
+                chat_id = getattr(chat, "id", 0)
+                uname   = getattr(chat, "username", "") or ""
+            except Exception:
+                chat_id, uname = 0, ""
+
+            log_ok("TG-DELIST", f"Делистинг-сигнал! [{chat_id} @{uname}]: {text[:100]}")
+
+            pairs = find_pairs(text)
+            if not pairs:
+                log_warn("TG-DELIST", f"Тикер не найден: {text[:80]}")
+                return
+
+            # FIX: оборачиваем target в try/except — иначе исключение
+            # в process_signal/worker молча теряется.
+            def _safe_signal():
+                try:
+                    process_signal(pairs, f"TG:@{uname}" if uname else "TG", t_start)
+                except Exception as exc:  # noqa: BLE001
+                    log_err("TG-DELIST", f"process_signal упал: {exc!r}")
+
+            threading.Thread(target=_safe_signal, daemon=True).start()
+
         await client.start()
         log_ok("TG-DELIST", "Telethon подключён | сессия: delist_session")
 

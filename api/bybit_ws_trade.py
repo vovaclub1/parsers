@@ -56,8 +56,12 @@ WS_TRADE_URL = "wss://stream.bybit.com/v5/trade"
 _RECONNECT_DELAY_MIN = 1.0
 _RECONNECT_DELAY_MAX = 30.0
 
-# Auth подпись действует 10с — обновляем заранее
-_AUTH_EXPIRES_SEC = 10
+# Auth подпись — окно валидности.
+# FIX: 10с было слишком мало. При системном clock-skew клиента ≥10с (NTP
+# дрифт, контейнер с нестабильным временем) Bybit отвергал auth, мы шли в
+# `continue` и сразу повторяли — получался hot-loop. 60с даёт запас для
+# нормального дрифта.
+_AUTH_EXPIRES_SEC = 60
 
 # Таймаут для ack ответа.
 # FIX: 0.5с был слишком агрессивным — на любой сетевой glitch (jitter >500мс)
@@ -109,6 +113,11 @@ class BybitWsTrade:
         self._connected = threading.Event()
         self._pending:  dict[str, asyncio.Future] = {}
         self._pending_lock = threading.Lock()
+        # FIX: asyncio.Lock защищает от concurrent ws.send из разных корутин.
+        # Без него современные `websockets` бросают ConcurrencyError, а старые
+        # перемешивают кадры. Создаётся лениво в loop-потоке (asyncio.Lock
+        # привязан к event-loop'у, иначе ругается).
+        self._send_lock: asyncio.Lock | None = None
 
         self._thread: threading.Thread | None = None
         self._stop = False
@@ -139,6 +148,10 @@ class BybitWsTrade:
 
     # ── основной listener ──────────────────────────────────────────
     async def _listener(self) -> None:
+        # FIX: создаём send-lock в loop-потоке (asyncio.Lock привязан к
+        # текущему running loop при создании).
+        if self._send_lock is None:
+            self._send_lock = asyncio.Lock()
         delay = _RECONNECT_DELAY_MIN
         while not self._stop:
             try:
@@ -171,8 +184,14 @@ class BybitWsTrade:
                     ret_code = auth_resp.get("retCode")
                     auth_ok = (ret_code == 0)
                     if not auth_ok:
-                        print(f"[BYBIT-WS] auth failed: {auth_resp}", flush=True)
+                        # FIX: до этого фикса `continue` перепрыгивал блок
+                        # delay-incrementation в конце цикла — каждая
+                        # неудачная auth получала минимальный delay → hot-loop.
+                        # Теперь явно поднимаем backoff здесь.
+                        print(f"[BYBIT-WS] auth failed: {auth_resp} — reconnect через {delay:.0f}с", flush=True)
+                        self._ws = None
                         await asyncio.sleep(delay)
+                        delay = min(delay * 2, _RECONNECT_DELAY_MAX)
                         continue
 
                     print("[BYBIT-WS] auth OK ✓", flush=True)
@@ -263,10 +282,23 @@ class BybitWsTrade:
             with self._pending_lock:
                 self._pending[req_id] = fut
             try:
-                if self._ws is None:
+                # FIX: фиксируем локальную ссылку на ws — иначе self._ws может
+                # стать None между check и send из-за гонки с _listener'ом
+                # (тот выставляет self._ws = None при disconnect).
+                ws = self._ws
+                if ws is None:
                     result_box["error"] = "ws_none"
                     return
-                await self._ws.send(_json_dumps(payload))
+                # FIX: send-lock — без него несколько одновременных place_order
+                # могли вызвать ConcurrencyError (websockets >=11) или
+                # interleaved frames (старые версии).
+                send_lock = self._send_lock
+                payload_str = _json_dumps(payload)
+                if send_lock is not None:
+                    async with send_lock:
+                        await ws.send(payload_str)
+                else:
+                    await ws.send(payload_str)
                 ack = await asyncio.wait_for(fut, timeout=timeout)
                 result_box["ack"] = ack
             except asyncio.TimeoutError:

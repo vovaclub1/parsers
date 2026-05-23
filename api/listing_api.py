@@ -219,7 +219,10 @@ def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
 #   [BITHUMB] $PRL listed on Bithumb
 _RE_LISTING_TG   = re.compile(r"\$([A-Z0-9]{2,10})\s+listed\s+on\s+(Upbit|Bithumb|Binance|Bybit)", re.IGNORECASE)
 # FIX-batch-6: тикеры в скобках после coin-name: "Genius Terminal (GENIUS) and OpenGradient (OPG)"
-_RE_TICKER_PAREN = re.compile(r"\(([A-Z][A-Z0-9]{1,9})\)")
+# FIX: первый символ может быть цифрой — тикеры 1INCH, 1000PEPE, 1000BONK
+# раньше пропускались. Чисто цифровые `(123)` всё ещё отсекаются `_filter_tokens`
+# (isdigit() check) ниже.
+_RE_TICKER_PAREN = re.compile(r"\(([A-Z0-9][A-Z0-9]{1,9})\)")
 # FIX-batch-6: $TICKER маркер (используется в coin_listing, ListingCryptoCoinChat)
 # FIX: добавлен IGNORECASE — каналы изредка шлют "$alcx" вместо "$ALCX".
 _RE_TICKER_DOLLAR = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,9})\b")
