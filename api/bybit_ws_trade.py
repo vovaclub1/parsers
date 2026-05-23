@@ -153,8 +153,6 @@ class BybitWsTrade:
                     auth_resp_raw = await asyncio.wait_for(ws.recv(), timeout=5)
                     auth_resp = _json_loads(auth_resp_raw)
                     # V5 Trade auth ответ: содержит retCode (0 = OK)
-                    # FIX: используем defensive check на оба поля — если Bybit когда-нибудь
-                    # выкатит формат без retCode, всё равно не упадём с KeyError.
                     ret_code = auth_resp.get("retCode")
                     auth_ok = (ret_code == 0)
                     if not auth_ok:
