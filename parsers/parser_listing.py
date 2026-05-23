@@ -207,8 +207,11 @@ def _on_toa_listing(full_text: str, t_start: float) -> None:
         log_warn("TOA-LIST", f"тикеры не найдены: {full_text[:120]}")
         return
     log_ok("TOA-LIST", f"Листинг-сигнал из TOA WS: {pairs}")
-    # NB: process_signal в listing-парсере вычисляет свой t_start; передавать
-    # извне не нужно (различие в 1-3мс некритично).
+    # FIX: пробрасываем t_start из WS-loop (раньше perf_counter() перезаписывался
+    # в process_signal — латентность от прихода сообщения до ордера терялась).
+    (process_signal(pairs, "TOA-WS", t_start=t_start))
+    # в process_signal — латентность от прихода сообщения до ордера терялась).
+    process_signal(pairs, "TOA-WS", t_start=t_start)
     process_signal(pairs, "TOA-WS")
 
 
@@ -513,10 +516,11 @@ def _watchdog() -> None:
 # ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # FIX-batch-1: uvloop — asyncio event loop в 2-4x быстрее. Drop-in.
+    # FIX-batch-1: uvloop — asyncio event loop в 2-4x быстрее.
+    # FIX: install() deprecated с 0.18+, используем set_event_loop_policy.
     try:
         import uvloop  # type: ignore[import-not-found]
-        uvloop.install()
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         print("[BOOT] uvloop активирован")
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")

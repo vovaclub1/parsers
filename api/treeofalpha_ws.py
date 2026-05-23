@@ -49,31 +49,56 @@ _PING_INTERVAL       = 20.0
 _PING_TIMEOUT        = 10.0
 
 
-# Keywords для классификации сообщений
+# Keywords для классификации сообщений.
+# FIX: убрал общий "remove" — он матчился на "remove your funds", "remove API key"
+# и т.п. шум. Оставлены только конкретные фразы делистинга.
 DELIST_KEYWORDS = [
     "will delist", "delisting notice", "binance will delist",
+    "will be delisted", "delisting of",
     "delisted from upbit", "upbit will delist",
     "delisted from bithumb", "bithumb will delist",
-    "remove",  # часто Bithumb/Upbit
+    "remove from spot", "removed from spot",
+    "removal of",
 ]
 
 LISTING_KEYWORDS = [
     "will list", "listing notice", "binance will list",
     "listed on upbit", "upbit will list",
     "listed on bithumb", "bithumb will list",
-    "new market", "new listing",
+    "new market", "new listing", "will add to spot",
 ]
 
-
-# Сохраняем references на background tasks (FIX из batch 0)
-_pending_tasks: set[asyncio.Task] = set()
+# FIX: negative-filter — те же фразы, что в parser_delist.TG_DELIST_NEG /
+# parser_listing.TG_LISTING_NEG. Без них TOA пробивает фильтры
+# пользовательских каналов (Binance Alpha removals, postponements,
+# HODLer Airdrop и т.п. — это НЕ листинг/делистинг для нашей стратегии).
+DELIST_NEG = [
+    "alpha will remove",
+    "removed from the featuring list",
+    "alpha removal",
+    "from alpha",
+    "delisting postponed",
+]
+LISTING_NEG = [
+    "delist", "delisted", "delisting", "delists",
+    "monitoring tag", "extend the monitoring",
+    "postponed", "cancelled", "canceled",
+    "alpha will remove", "from the featuring list",
+    "hodler airdrop",
+]
 
 
 def _classify(text: str) -> str | None:
     tl = text.lower()
+    # Делистинг: должны быть delist-фразы И отсутствовать negative-маркеры.
     if any(kw in tl for kw in DELIST_KEYWORDS):
+        if any(neg in tl for neg in DELIST_NEG):
+            return None
         return "delist"
+    # Листинг: должны быть list-фразы И отсутствовать delist/postponed/airdrop.
     if any(kw in tl for kw in LISTING_KEYWORDS):
+        if any(neg in tl for neg in LISTING_NEG):
+            return None
         return "listing"
     return None
 

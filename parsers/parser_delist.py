@@ -637,10 +637,11 @@ def run_telegram_delist_listener() -> None:
 
 
 if __name__ == "__main__":
-    # FIX-batch-1: uvloop — asyncio event loop в 2-4x быстрее. Drop-in.
+    # FIX-batch-1: uvloop — asyncio event loop в 2-4x быстрее.
+    # FIX: install() deprecated с 0.18+, используем set_event_loop_policy.
     try:
         import uvloop  # type: ignore[import-not-found]
-        uvloop.install()
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         print("[BOOT] uvloop активирован")
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")

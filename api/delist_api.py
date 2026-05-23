@@ -50,6 +50,16 @@ from api.gate_api import (   # noqa: E402  (импорт после monkey-patch
     warmup_gate_connection,     # noqa: F401  — реэкспорт для parser_delist
 )
 
+# FIX: вынесли импорт из хот-функции market_open_short на модульный уровень.
+# Если модуль не подгружается (например, отсутствует websockets) — place_order_ws
+# становится no-op возвращающий None, и market_open_short падает в REST fallback.
+try:
+    from api.bybit_ws_trade import place_order_ws as _ws_place_order
+except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
+    print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
+    def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
+        return None
+
 # ── Конфиг Bybit ─────────────────────────────────────────────────
 BYBIT_BASE_URL = "https://api.bybit.com"
 RECV_WINDOW    = "5000"
@@ -90,7 +100,8 @@ EXCLUDED_TOKENS = {
     "OPEN", "OPENED", "OPENS", "ADD", "ADDED", "ADDS",
     "NEW", "TOKEN", "TOKENS", "POOL", "POOLS", "PAIRS", "PAIR",
     "BORROW", "LOAN", "LOANS", "SIMPLE", "BUYBACK",
-    "USDⓈ", "USDS",  # Binance liquid staking
+    # FIX: убрана "USDⓈ" — regex [A-Z0-9] её никогда не вернёт (Ⓢ U+24C8 не ASCII).
+    "USDS",  # Binance liquid staking
     "ANNOUNCEMENT", "ANNOUNCEMENTS",
 }
 
@@ -348,12 +359,11 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 }
                 # FIX-batch-5: пробуем WS Trade API (−30...−80мс), при ошибке/None — REST.
                 placed_via = "REST"
-                ws_ack = None
                 try:
-                    from api.bybit_ws_trade import place_order_ws
-                    ws_ack = place_order_ws(order_args)
+                    ws_ack = _ws_place_order(order_args)
                 except Exception as e:
-                    print(f"[BYBIT-WS] не доступен ({e}) — используем REST")
+                    print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
+                    ws_ack = None
 
                 if ws_ack is None:
                     _post("/v5/order/create", order_args)
@@ -466,7 +476,8 @@ _RE_PAIR_TOKENS = re.compile(r"\b([A-Z0-9]{2,10})\b")
 # FIX-batch-6: ловим "Monitoring Tag to Include X, Y, Z on ..." (BWEnews/binance_announcements).
 _RE_MONITORING  = re.compile(r"MONITORING\s+TAG\s+TO\s+INCLUDE\s+(.*?)(?:\s+ON\b|\.|\n)")
 # FIX-batch-7: $TICKER маркеры (cryptolistingwebsocket: "Monitoring Tag Added – $ALCX, $COOKIE")
-_RE_DOLLAR_TKN  = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
+# FIX: добавлен IGNORECASE — иногда каналы шлют "$alcx" вместо "$ALCX".
+_RE_DOLLAR_TKN  = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,9})\b")
 
 
 def find_pairs(text: str) -> list[str]:
@@ -490,8 +501,8 @@ def find_pairs(text: str) -> list[str]:
             return found
 
     # FIX-batch-7: $TICKER маркеры (CLW: "Monitoring Tag Added – $ALCX, $COOKIE...")
-    # Используем оригинальный регистр для $ паттерна — там точно uppercase.
-    dollar_pairs = _RE_DOLLAR_TKN.findall(text)
+    # FIX: нормализуем в uppercase — каналы изредка пишут "$alcx".
+    dollar_pairs = [t.upper() for t in _RE_DOLLAR_TKN.findall(text)]
     if dollar_pairs:
         found = _filter_tokens(dollar_pairs)
         if found:

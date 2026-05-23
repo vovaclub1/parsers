@@ -30,6 +30,14 @@ from api.gate_api import (
     warmup_gate_connection,  # noqa: F401  — реэкспорт
 )
 
+# FIX: вынесли импорт из хот-функции market_open_long на модульный уровень.
+try:
+    from api.bybit_ws_trade import place_order_ws as _ws_place_order
+except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
+    print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
+    def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
+        return None
+
 __all__ = [
     "market_open_long",
     "set_tp_sl_long",
@@ -100,12 +108,11 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 }
                 # FIX-batch-5: WS Trade API → fallback REST.
                 placed_via = "REST"
-                ws_ack = None
                 try:
-                    from api.bybit_ws_trade import place_order_ws
-                    ws_ack = place_order_ws(order_args)
+                    ws_ack = _ws_place_order(order_args)
                 except Exception as e:
-                    print(f"[BYBIT-WS] не доступен ({e}) — используем REST")
+                    print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
+                    ws_ack = None
 
                 if ws_ack is None:
                     _post("/v5/order/create", order_args)
@@ -196,7 +203,8 @@ _RE_LISTING_TG   = re.compile(r"\$([A-Z0-9]{2,10})\s+listed\s+on\s+(Upbit|Bithum
 # FIX-batch-6: тикеры в скобках после coin-name: "Genius Terminal (GENIUS) and OpenGradient (OPG)"
 _RE_TICKER_PAREN = re.compile(r"\(([A-Z][A-Z0-9]{1,9})\)")
 # FIX-batch-6: $TICKER маркер (используется в coin_listing, ListingCryptoCoinChat)
-_RE_TICKER_DOLLAR = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
+# FIX: добавлен IGNORECASE — каналы изредка шлют "$alcx" вместо "$ALCX".
+_RE_TICKER_DOLLAR = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,9})\b")
 # FIX-batch-6: явные пары "ABCUSDT", "ABC/USDT", "ABC-USDT"
 _RE_USDT_PAIR    = re.compile(r"\b([A-Z0-9]{2,10})(?:/|-|_)?USDT\b")
 # FIX: поддержка тикеров с цифрами (1INCH, 1000PEPE)
@@ -236,7 +244,8 @@ def find_listing_pairs(text: str) -> list[str]:
         return paren_tickers
 
     # FIX-batch-6: Метод 3 — $TICKER маркеры
-    dollar_matches = _RE_TICKER_DOLLAR.findall(text)
+    # FIX: нормализуем в uppercase (каналы изредка пишут "$alcx").
+    dollar_matches = [t.upper() for t in _RE_TICKER_DOLLAR.findall(text)]
     dollar_tickers = [
         t for t in dollar_matches
         if t not in EXCLUDED_TOKENS
