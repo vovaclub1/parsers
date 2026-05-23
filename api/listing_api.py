@@ -192,7 +192,13 @@ def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
 # Форматы:
 #   [UPBIT] $PRL listed on Upbit (KRW, BTC, USDT)
 #   [BITHUMB] $PRL listed on Bithumb
-_RE_LISTING_TG   = re.compile(r"\$([A-Z0-9]{2,10})\s+listed\s+on\s+(Upbit|Bithumb)", re.IGNORECASE)
+_RE_LISTING_TG   = re.compile(r"\$([A-Z0-9]{2,10})\s+listed\s+on\s+(Upbit|Bithumb|Binance|Bybit)", re.IGNORECASE)
+# FIX-batch-6: тикеры в скобках после coin-name: "Genius Terminal (GENIUS) and OpenGradient (OPG)"
+_RE_TICKER_PAREN = re.compile(r"\(([A-Z][A-Z0-9]{1,9})\)")
+# FIX-batch-6: $TICKER маркер (используется в coin_listing, ListingCryptoCoinChat)
+_RE_TICKER_DOLLAR = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
+# FIX-batch-6: явные пары "ABCUSDT", "ABC/USDT", "ABC-USDT"
+_RE_USDT_PAIR    = re.compile(r"\b([A-Z0-9]{2,10})(?:/|-|_)?USDT\b")
 # FIX: поддержка тикеров с цифрами (1INCH, 1000PEPE)
 _RE_TICKER_PLAIN = re.compile(r"\b([A-Z0-9]{2,8})\b")
 
@@ -200,9 +206,12 @@ _RE_TICKER_PLAIN = re.compile(r"\b([A-Z0-9]{2,8})\b")
 def find_listing_pairs(text: str) -> list[str]:
     """
     Извлекает тикеры из сообщения о листинге.
-    Порядок поиска:
-      1. Явный формат "$TICKER listed on Upbit/Bithumb"
-      2. Fallback: заглавные слова, которые есть в known_coins (Bybit)
+    Порядок поиска (FIX-batch-6, от точного к общему):
+      1. Явный $TICKER listed on Upbit/Bithumb/Binance/Bybit
+      2. Тикеры в скобках после coin-name: "Genius Terminal (GENIUS)"
+      3. $TICKER маркеры (coin_listing, ListingCryptoCoinChat)
+      4. Явные USDT-пары: ABCUSDT / ABC/USDT
+      5. Fallback по known_coins
     :param text: str - текст сообщения.
     :return: list[str] - список тикеров.
     """
@@ -213,8 +222,47 @@ def find_listing_pairs(text: str) -> list[str]:
         print(f"[FIND LISTING] метод=TG-паттерн → {tickers}")
         return tickers
 
-    # Метод 2: fallback по known_coins
+    # FIX-batch-6: Метод 2 — тикеры в скобках (Binance "Will List X (TICKER)" формат)
+    paren_matches = _RE_TICKER_PAREN.findall(text)
+    paren_tickers = [
+        t for t in paren_matches
+        if t not in EXCLUDED_TOKENS
+        and 2 <= len(t) <= 10
+        and not t.isdigit()
+    ]
+    paren_tickers = list(dict.fromkeys(paren_tickers))
+    if paren_tickers:
+        print(f"[FIND LISTING] метод=скобки → {paren_tickers}")
+        return paren_tickers
+
+    # FIX-batch-6: Метод 3 — $TICKER маркеры
+    dollar_matches = _RE_TICKER_DOLLAR.findall(text)
+    dollar_tickers = [
+        t for t in dollar_matches
+        if t not in EXCLUDED_TOKENS
+        and 2 <= len(t) <= 10
+        and not t.isdigit()
+    ]
+    dollar_tickers = list(dict.fromkeys(dollar_tickers))
+    if dollar_tickers:
+        print(f"[FIND LISTING] метод=$ticker → {dollar_tickers}")
+        return dollar_tickers
+
+    # FIX-batch-6: Метод 4 — явные USDT-пары
     text_upper = text.upper()
+    usdt_matches = _RE_USDT_PAIR.findall(text_upper)
+    usdt_tickers = [
+        t for t in usdt_matches
+        if t not in EXCLUDED_TOKENS
+        and 2 <= len(t) <= 10
+        and not t.isdigit()
+    ]
+    usdt_tickers = list(dict.fromkeys(usdt_tickers))
+    if usdt_tickers:
+        print(f"[FIND LISTING] метод=USDT-пары → {usdt_tickers}")
+        return usdt_tickers
+
+    # Метод 5: fallback по known_coins
     candidates = _RE_TICKER_PLAIN.findall(text_upper)
     found = [
         t for t in candidates

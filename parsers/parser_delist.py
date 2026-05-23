@@ -63,10 +63,32 @@ DELIST_KEYWORDS    = ["Will Delist", "Delisting Notice", "Binance Will Delist"]
 
 # Telegram listener
 TG_CHANNEL        = "coin_listing"
+# FIX-batch-6/7: расширено под реальные форматы каналов пользователя.
 TG_DELIST_KEYWORDS = [
-    "will delist", "delisting notice", "binance will delist",  # Binance
-    "delisted from upbit", "upbit will delist",                 # Upbit
-    "delisted from bithumb", "bithumb will delist",             # Bithumb
+    # Binance EN
+    "will delist", "delisting notice", "binance will delist",
+    "will be delisted", "remove from spot", "removed from spot",
+    "removing from spot",
+    # FIX-batch-7: структурированные форматы каналов
+    # (listing_binance_mids: "🆘 BINANCE | Delisting"; CLW: "BINANCE Delisting")
+    "| delisting", "binance delisting", "bybit delisting",
+    "upbit delisting", "bithumb delisting",
+    # Monitoring Tag — pre-delist warning (часто −10..−30% сразу)
+    "monitoring tag", "extend the monitoring",
+    # Korean exchanges
+    "delisted from upbit", "upbit will delist",
+    "delisted from bithumb", "bithumb will delist",
+    # Russian (@delistingscreener и т.п.)
+    "делисты", "делистинг", "делист ",
+    "будет делист", "удаление с",
+]
+# Negative phrases — даже если есть delist keyword, эти сигналы шум:
+TG_DELIST_NEG = [
+    "alpha will remove",    # Binance Alpha (low-cap meme tokens)
+    "removed from the featuring list",
+    "alpha removal",
+    "from alpha",
+    "delisting postponed",  # отменили
 ]
 
 # Watchdog
@@ -566,6 +588,10 @@ def run_telegram_delist_listener() -> None:
 
         tl = text.lower()
         if not any(kw in tl for kw in TG_DELIST_KEYWORDS):
+            return
+
+        # FIX-batch-6: negative filter — отсекаем Binance Alpha removals и т.п.
+        if any(neg in tl for neg in TG_DELIST_NEG):
             return
 
         t_start = time.perf_counter()

@@ -70,7 +70,7 @@ _bybit_session.headers.update({
 # ── Слова-исключения ──────────────────────────────────────────────
 EXCLUDED_TOKENS = {
     "USDT", "BUSD", "USDC", "TUSD", "DAI",
-    "BINANCE", "SPOT", "MARGIN", "FUTURES",
+    "BINANCE", "SPOT", "MARGIN", "FUTURES", "EARN",
     "WILL", "AND", "ON", "FOR", "THE", "ALL",
     "USD", "UTC", "API", "VIP", "KYC", "AML",
     "FAQ", "TBA", "TBD", "NFT", "DEFI",
@@ -79,6 +79,19 @@ EXCLUDED_TOKENS = {
     "REFERRED", "TO", "HERE", "MAY", "NOT", "BE", "IN", "YOUR", "REGION",
     "FELLOW", "CLOSE", "CONDUCT", "AN", "SUPPORT", "AIRDROP", "PLAN",
     "COIN", "MULTIPLE", "WITH", "FROM", "THAT", "ALSO", "HAVE",
+    # FIX-batch-6: расширение под форматы каналов пользователя
+    # (Monitoring Tag, removed from spot, alpha removals и т.п.)
+    "MONITORING", "TAG", "EXTEND", "EXTENDED", "INCLUDE", "INCLUDED",
+    "DELIST", "DELISTS", "DELISTED", "DELISTING", "DELISTINGS",
+    "REMOVE", "REMOVED", "REMOVING", "REMOVAL", "REMOVES",
+    "LIST", "LISTED", "LISTING", "LISTINGS",
+    "ALPHA", "BUY", "SELL", "TRADE", "TRADING",
+    "POSTPONED", "PERPETUAL", "PERPETUALS", "LAUNCH", "LAUNCHED",
+    "OPEN", "OPENED", "OPENS", "ADD", "ADDED", "ADDS",
+    "NEW", "TOKEN", "TOKENS", "POOL", "POOLS", "PAIRS", "PAIR",
+    "BORROW", "LOAN", "LOANS", "SIMPLE", "BUYBACK",
+    "USDⓈ", "USDS",  # Binance liquid staking
+    "ANNOUNCEMENT", "ANNOUNCEMENTS",
 }
 
 # ── Кэш цен ──────────────────────────────────────────────────────
@@ -450,6 +463,10 @@ _RE_WILL_DELIST = re.compile(r"WILL\s+DELIST\s+(.*?)\s+ON\b")
 _RE_DELIST_BLOCK = re.compile(r"(?:DELIST|REMOVE|DELISTING\s+OF)\s{0,5}(.{10,200}?)(?:\.|ON\s|\n)")
 _RE_ALL_TOKENS  = re.compile(r"\b([A-Z0-9]{2,8})\b")
 _RE_PAIR_TOKENS = re.compile(r"\b([A-Z0-9]{2,10})\b")
+# FIX-batch-6: ловим "Monitoring Tag to Include X, Y, Z on ..." (BWEnews/binance_announcements).
+_RE_MONITORING  = re.compile(r"MONITORING\s+TAG\s+TO\s+INCLUDE\s+(.*?)(?:\s+ON\b|\.|\n)")
+# FIX-batch-7: $TICKER маркеры (cryptolistingwebsocket: "Monitoring Tag Added – $ALCX, $COOKIE")
+_RE_DOLLAR_TKN  = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
 
 
 def find_pairs(text: str) -> list[str]:
@@ -472,12 +489,30 @@ def find_pairs(text: str) -> list[str]:
             print(f"[FIND PAIRS] метод=USDT-пары → {found}")
             return found
 
+    # FIX-batch-7: $TICKER маркеры (CLW: "Monitoring Tag Added – $ALCX, $COOKIE...")
+    # Используем оригинальный регистр для $ паттерна — там точно uppercase.
+    dollar_pairs = _RE_DOLLAR_TKN.findall(text)
+    if dollar_pairs:
+        found = _filter_tokens(dollar_pairs)
+        if found:
+            print(f"[FIND PAIRS] метод=$ticker → {found}")
+            return found
+
     m = _RE_WILL_DELIST.search(text_upper)
     if m:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
         found  = _filter_tokens(tokens)
         if found:
             print(f"[FIND PAIRS] метод=Will-Delist → {found}")
+            return found
+
+    # FIX-batch-6: "Will Extend the Monitoring Tag to Include ALCX, COOKIE, DODO..."
+    m = _RE_MONITORING.search(text_upper)
+    if m:
+        tokens = _RE_PAIR_TOKENS.findall(m.group(1))
+        found  = _filter_tokens(tokens)
+        if found:
+            print(f"[FIND PAIRS] метод=Monitoring-Tag → {found}")
             return found
 
     m = _RE_DELIST_BLOCK.search(text_upper)
