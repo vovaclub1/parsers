@@ -10,8 +10,8 @@ import threading
 
 from api.delist_api import (
     _post,
-    _post_order,
-    _new_order_link_id,
+    post_order,            # FIX-10: публичный алиас вместо _post_order
+    new_order_link_id,     # FIX-10: публичный алиас вместо _new_order_link_id
     _get_qty_step,
     _round_qty,
     get_price,
@@ -34,11 +34,14 @@ from api.gate_api import (
 
 # FIX: вынесли импорт из хот-функции market_open_long на модульный уровень.
 try:
-    from api.bybit_ws_trade import place_order_ws as _ws_place_order
+    from api.bybit_ws_trade import place_order_ws as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
         return None
+    class WSOrderRejected(Exception):  # type: ignore[no-redef]
+        """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
+        pass
 
 __all__ = [
     "market_open_long",
@@ -103,8 +106,8 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 qty_str = str(amount_tokens)
                 # FIX: один orderLinkId на WS и REST fallback — Bybit отвергнет
                 # дубль с retCode 30050, защита от double-position при WS
-                # ack timeout (см. _post_order в delist_api).
-                order_link_id = _new_order_link_id()
+                # ack timeout (см. post_order в delist_api).
+                order_link_id = new_order_link_id()
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
@@ -118,14 +121,19 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 placed_via = "REST"
                 try:
                     ws_ack = _ws_place_order(order_args)
+                except WSOrderRejected as e:
+                    # FIX-2: WS работает, Bybit ОТВЕРГ ордер логически.
+                    # REST повтор бесполезен → сразу сдаёмся.
+                    print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
+                    return 0, 0
                 except Exception as e:
                     print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
                     ws_ack = None
 
                 if ws_ack is None:
-                    # FIX-batch-8 #5: fast-path _post_order вместо _post (f-string,
+                    # FIX-batch-8 #5: fast-path post_order вместо _post (f-string,
                     # -2..-5мс) + тот же orderLinkId — idempotency.
-                    _post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id)
+                    post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id)
                 else:
                     placed_via = "WS"
 
