@@ -67,6 +67,38 @@ RESET  = "\033[0m"
 # ── конфиг ────────────────────────────────────────────────────────
 TG_CHANNEL  = "-1001124574831"
 
+# FIX-batch-6/7: реальные форматы из BWEnews, binance_announcements, coin_listing,
+# listing_binance_mids, cryptolistingwebsocket. Подобраны под примеры юзера.
+TG_LISTING_PHRASES = [
+    # Английские (Binance / international)
+    "will list", "will add", "will launch", "will open trading",
+    "listing notice", "listing announcement", "new listing",
+    "added to spot", "added to binance", "new market",
+    "will add to spot", "will be listed",
+    # FIX-batch-7: структурированные форматы
+    # listing_binance_mids: "✅ BINANCE | Listing"
+    # cryptolistingwebsocket: "BINANCE Listing Announcement"
+    "| listing", "binance listing", "bybit listing",
+    # Корейские биржи (Upbit / Bithumb)
+    "listed on upbit", "listed on bithumb",
+    "listed on binance", "listed on bybit",
+    "upbit will list", "bithumb will list",
+    "upbit listing", "bithumb listing",
+    "news listing",  # listing_binance_mids: "News listing: UP2/USDT"
+    # Русские
+    "новый листинг", "будет лист", "добавит",
+]
+# Если в тексте есть что-то из этого — это НЕ листинг, отсечь.
+TG_LISTING_NEG = [
+    "delist", "delisted", "delisting", "delists",
+    "will be removed", "will remove", "removal of", "removed from",
+    "monitoring tag", "extend the monitoring",
+    "postponed", "delay", "delayed", "cancelled", "canceled",
+    "alpha will remove", "from the featuring list",
+    "hodler airdrop",  # FIX-batch-7: Binance HODLer Airdrop — не листинг
+    "делист", "делисты",
+]
+
 UPBIT_MARKETS_URL   = "https://api.upbit.com/v1/market/all"
 BITHUMB_ASSETS_URL  = "https://api.bithumb.com/public/assetsstatus/all"
 POLL_INTERVAL       = 0.3
@@ -245,8 +277,12 @@ def run_telegram_listener() -> None:
         if not text:
             return
 
+        # FIX-batch-6: расширенный фильтр под форматы каналов пользователя
+        # (BWEnews, binance_announcements, coin_listing, и т.д.).
         tl = text.lower()
-        if "listed on upbit" not in tl and "listed on bithumb" not in tl:
+        if not any(p in tl for p in TG_LISTING_PHRASES):
+            return
+        if any(neg in tl for neg in TG_LISTING_NEG):
             return
 
         try:
@@ -260,7 +296,7 @@ def run_telegram_listener() -> None:
 
         pairs = find_listing_pairs(text)
         if not pairs:
-            log_warn("TG", f"Тикер не найден: {text[:80]}")
+            log_warn("TG", f"Тикер не найден (фильтр пропустил): {text[:80]}")
             return
 
         threading.Thread(
