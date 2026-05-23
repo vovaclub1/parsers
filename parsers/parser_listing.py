@@ -265,17 +265,12 @@ def run_telegram_listener() -> None:
     """
     TG listener на Telethon (основной + EXTRA_LISTING_CHANNELS).
     FIX-batch-3: multi-channel first-wins. Дедуп через _fired_coins (TTL 60с).
+
+    FIX: TelegramClient создаётся ВНУТРИ _run, а не снаружи. Telethon хранит
+    привязку к event-loop'у; при reconnect-loop (asyncio.run в while True)
+    второй цикл получал бы клиента из предыдущего закрытого loop'а и падал.
     """
     session_path = str(Path(SESSION_DIR) / "listing_session")
-    client = TelegramClient(
-        session_path,
-        api_id=int(TG_API_ID) if TG_API_ID else 0,
-        api_hash=TG_API_HASH or "",
-        auto_reconnect=True,
-        retry_delay=5,
-        connection_retries=None,
-        request_retries=5,
-    )
 
     # FIX-batch-3: основной + extra. TG_CHANNEL — это int (-100...).
     channels: list[str | int] = []
@@ -287,48 +282,63 @@ def run_telegram_listener() -> None:
         if c not in channels:
             channels.append(c)
 
-    @client.on(events.NewMessage(chats=channels))
-    async def handler(event):
-        # FIX-batch-8: замеряем t_start как можно раньше, до фильтрации и
-        # get_chat() — это правильный момент "сигнал получен".
-        t_start = time.perf_counter()
-        try:
-            text = event.message.message or ""
-        except Exception:
-            return
-
-        if not text:
-            return
-
-        # FIX-batch-6: расширенный фильтр под форматы каналов пользователя
-        # (BWEnews, binance_announcements, coin_listing, и т.д.).
-        tl = text.lower()
-        if not any(p in tl for p in TG_LISTING_PHRASES):
-            return
-        if any(neg in tl for neg in TG_LISTING_NEG):
-            return
-
-        try:
-            chat    = await event.get_chat()
-            chat_id = getattr(chat, "id", 0)
-            uname   = getattr(chat, "username", "") or ""
-        except Exception:
-            chat_id, uname = 0, ""
-
-        log_ok("TG", f"Листинг-сигнал! [{chat_id} @{uname}]: {text[:120]}")
-
-        pairs = find_listing_pairs(text)
-        if not pairs:
-            log_warn("TG", f"Тикер не найден (фильтр пропустил): {text[:80]}")
-            return
-
-        threading.Thread(
-            target=process_signal,
-            args=(pairs, f"TG:@{uname}" if uname else "TG", t_start),
-            daemon=True,
-        ).start()
-
     async def _run():
+        client = TelegramClient(
+            session_path,
+            api_id=int(TG_API_ID) if TG_API_ID else 0,
+            api_hash=TG_API_HASH or "",
+            auto_reconnect=True,
+            retry_delay=5,
+            connection_retries=None,
+            request_retries=5,
+        )
+
+        @client.on(events.NewMessage(chats=channels))
+        async def handler(event):
+            # FIX-batch-8: замеряем t_start как можно раньше, до фильтрации и
+            # get_chat() — это правильный момент "сигнал получен".
+            t_start = time.perf_counter()
+            try:
+                text = event.message.message or ""
+            except Exception:
+                return
+
+            if not text:
+                return
+
+            # FIX-batch-6: расширенный фильтр под форматы каналов пользователя
+            # (BWEnews, binance_announcements, coin_listing, и т.д.).
+            tl = text.lower()
+            if not any(p in tl for p in TG_LISTING_PHRASES):
+                return
+            if any(neg in tl for neg in TG_LISTING_NEG):
+                return
+
+            try:
+                chat    = await event.get_chat()
+                chat_id = getattr(chat, "id", 0)
+                uname   = getattr(chat, "username", "") or ""
+            except Exception:
+                chat_id, uname = 0, ""
+
+            log_ok("TG", f"Листинг-сигнал! [{chat_id} @{uname}]: {text[:120]}")
+
+            pairs = find_listing_pairs(text)
+            if not pairs:
+                log_warn("TG", f"Тикер не найден (фильтр пропустил): {text[:80]}")
+                return
+
+            # FIX: оборачиваем target в try/except, иначе исключение в
+            # process_signal (например, calculate_margin_for_listing → API ошибка)
+            # молча теряется и сигнал не обрабатывается.
+            def _safe_signal():
+                try:
+                    process_signal(pairs, f"TG:@{uname}" if uname else "TG", t_start)
+                except Exception as exc:  # noqa: BLE001
+                    log_err("TG", f"process_signal упал: {exc!r}")
+
+            threading.Thread(target=_safe_signal, daemon=True).start()
+
         await client.start()
         log_ok("TG", "Telethon подключён | сессия: listing_session")
 
@@ -357,11 +367,17 @@ def _load_upbit_tickers(session: requests.Session) -> set[str]:
             resp = session.get(UPBIT_MARKETS_URL, params={"isDetails": "false"}, timeout=timeout)
             resp.raise_for_status()
             # FIX-batch-1: orjson — список Upbit может быть 50KB+, orjson в 3-5x быстрее.
-            return {
-                m["market"].split("-")[1]
-                for m in _json_loads(resp.content)
-                if m["market"].startswith("KRW-")
-            }
+            # FIX: явный guard на malformed market — раньше split("-")[1] кидал
+            # IndexError для невалидной записи и убивал весь tick.
+            tickers: set[str] = set()
+            for m in _json_loads(resp.content):
+                market = (m or {}).get("market", "")
+                if not isinstance(market, str) or not market.startswith("KRW-"):
+                    continue
+                parts = market.split("-", 1)
+                if len(parts) == 2 and parts[1]:
+                    tickers.add(parts[1])
+            return tickers
         except Exception:
             if attempt == 3:
                 raise

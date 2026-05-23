@@ -76,6 +76,16 @@ COOLDOWN_SEC = 120
 _cooldown: dict[str, float] = {}
 _cooldown_lock = threading.Lock()
 
+# FIX: _cooldown рос бесконечно — каждый тикер, который когда-либо стрелял,
+# оставался в словаре. На длинной дистанции — утечка памяти. Чистим
+# протухшие записи на каждой проверке/вставке (это дёшево, dict небольшой).
+def _purge_expired_cooldown(now: float | None = None) -> None:
+    if now is None:
+        now = time.time()
+    expired = [t for t, until in _cooldown.items() if until <= now]
+    for t in expired:
+        _cooldown.pop(t, None)
+
 # FIX: держим ссылки на async-таски, чтобы GC их не убил
 # ("Task was destroyed but it is pending").
 _pending_tasks: set[asyncio.Task] = set()
@@ -83,12 +93,25 @@ _pending_tasks: set[asyncio.Task] = set()
 
 # ── HTTP Session ─────────────────────────────────────────────────
 _http_session: aiohttp.ClientSession | None = None
+# FIX: без локa два listener'а (SEOUL/TOKYO) могли одновременно увидеть
+# None и создать ДВЕ сессии — первая утекала. Lock ленивая инициализация
+# асинхронного singleton'а.
+_http_session_lock: asyncio.Lock | None = None
 
 
 async def get_http_session() -> aiohttp.ClientSession:
-    global _http_session
+    global _http_session, _http_session_lock
 
-    if _http_session is None or _http_session.closed:
+    if _http_session is not None and not _http_session.closed:
+        return _http_session
+
+    if _http_session_lock is None:
+        _http_session_lock = asyncio.Lock()
+
+    async with _http_session_lock:
+        if _http_session is not None and not _http_session.closed:
+            return _http_session
+
         timeout = aiohttp.ClientTimeout(
             total=2,
             connect=1,
@@ -115,7 +138,9 @@ async def get_http_session() -> aiohttp.ClientSession:
 
 
 # ── Regex ultra-fast ─────────────────────────────────────────────
-TOKEN_REGEX = re.compile(rb'\(([A-Z0-9]{2,10})\)')
+# FIX: первый символ — буква. Старый паттерн `[A-Z0-9]{2,10}` ловил чисто
+# цифровые `(123)` (цены, годы) как «тикер» и потом BANNED их не отсекало.
+TOKEN_REGEX = re.compile(rb'\(([A-Z][A-Z0-9]{1,9})\)')
 
 # FIX: убрал дубли (раньше "KRW"/"BTC"/"USDT" повторялись)
 BANNED = {
@@ -131,13 +156,19 @@ BANNED = {
 
 # ── Cooldown ─────────────────────────────────────────────────────
 def _in_cooldown(ticker: str) -> bool:
+    now = time.time()
     with _cooldown_lock:
+        # FIX: попутно подчищаем протухшие записи — иначе _cooldown
+        # растёт неограниченно.
+        _purge_expired_cooldown(now)
         until = _cooldown.get(ticker)
-        return bool(until and time.time() < until)
+        return bool(until and now < until)
 
 def _set_cooldown(ticker: str) -> None:
+    now = time.time()
     with _cooldown_lock:
-        _cooldown[ticker] = time.time() + COOLDOWN_SEC
+        _purge_expired_cooldown(now)
+        _cooldown[ticker] = now + COOLDOWN_SEC
 
 
 # ── ULTRA FAST ARTICLE PARSER ────────────────────────────────────
@@ -179,6 +210,11 @@ async def _parse_tokens_from_article_fast(url: str) -> list[str]:
                     return found
 
                 if len(buffer) > 15000:
+                    # FIX: оставляем больший хвост (5000 был мало для длинных
+                    # HTML-блоков с тикерами в конце; токены до 12 байт включая
+                    # скобки — 5000 безопасно для разделения, но мало для
+                    # переменных-длины структур). Главное — сохраняем последние
+                    # 64 байта точно, чтобы `(SOMETOKEN)` на границе не терялся.
                     buffer = buffer[-5000:]
 
             elapsed = (time.perf_counter() - started) * 1000
@@ -257,22 +293,26 @@ async def _handle(msg: dict) -> None:
     if msg_type == "pong":
         return
 
-    source = msg.get("source", "").upper()
+    # FIX: если поле явно `null`, ".upper()" падал на NoneType.
+    # Универсально: (msg.get(...) or "") как защита от None.
+    source = (msg.get("source") or "").upper()
 
     if source not in TRADE_SOURCES:
         return
 
-    title = msg.get("title", "")
-    url   = msg.get("url", "")
+    title = msg.get("title") or ""
+    url   = msg.get("url") or ""
     coins = msg.get("coins") or []
 
     t_signal = time.perf_counter()
 
     # ── REAL TICKERS ─────────────────────────────
+    # FIX: isinstance-guard — в coins бывают не только строки (например, dict
+    # с метаданными), и .upper() ронял весь handler.
     real = [
         c.upper()
         for c in coins
-        if c and "█" not in c
+        if isinstance(c, str) and c and "█" not in c
     ]
 
     if real:
@@ -317,8 +357,20 @@ async def _handle(msg: dict) -> None:
 
 
 # ── Websocket ────────────────────────────────────────────────────
-async def _listen(url: str, label: str) -> None:
+# FIX: backoff параметры — раньше был плоский sleep(1), при недоступности
+# сервера долбили 1 RPS бесконечно. Теперь экспоненциальный backoff.
+_WS_BACKOFF_MIN = 1.0
+_WS_BACKOFF_MAX = 30.0
 
+
+async def _listen(url: str, label: str) -> None:
+    # FIX: ранний выход если API_KEY не задан — иначе URL получает
+    # `?key=None` и мы дёргаем сервер бесконечно с заведомо невалидной auth.
+    if not COINLISTING_API_KEY:
+        log_warn("WS", f"{label} отключён: COINLISTING_API_KEY не задан")
+        return
+
+    delay = _WS_BACKOFF_MIN
     while True:
 
         try:
@@ -330,6 +382,7 @@ async def _listen(url: str, label: str) -> None:
             ) as ws:
 
                 log_ok("WS", f"{label} connected")
+                delay = _WS_BACKOFF_MIN  # сбрасываем backoff после успешного коннекта
 
                 async for raw in ws:
 
@@ -344,12 +397,13 @@ async def _listen(url: str, label: str) -> None:
                     task.add_done_callback(_pending_tasks.discard)
 
         except ConnectionClosedError as e:
-            log_warn("WS", f"{label} disconnected {e.code}")
+            log_warn("WS", f"{label} disconnected {e.code} — reconnect через {delay:.0f}с")
 
         except Exception as e:
-            log_err("WS", f"{label} error: {e}")
+            log_err("WS", f"{label} error: {e} — reconnect через {delay:.0f}с")
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _WS_BACKOFF_MAX)
 
 
 # ── Run ──────────────────────────────────────────────────────────

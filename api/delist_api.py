@@ -33,11 +33,15 @@ _DNS_TTL = 300  # 5 минут — Bybit IP редко меняется, но н
 
 def _cached_getaddrinfo(*args, **kwargs):
     now = time.monotonic()
-    cached = _dns_cache.get(args)
+    # FIX: kwargs тоже должны быть частью ключа. Раньше два вызова с разным
+    # `proto`/`flags` могли получить одинаковый кешированный результат и
+    # некоторые asyncio/aiohttp пути ломались на неправильном flag-наборе.
+    key = (args, tuple(sorted(kwargs.items())))
+    cached = _dns_cache.get(key)
     if cached and (now - cached[0]) < _DNS_TTL:
         return cached[1]
     result = _original_getaddrinfo(*args, **kwargs)
-    _dns_cache[args] = (now, result)
+    _dns_cache[key] = (now, result)
     return result
 
 socket.getaddrinfo = _cached_getaddrinfo  # патч до любых сетевых импортов
@@ -457,9 +461,19 @@ def _round_qty(qty: float, step: float) -> float:
     :param qty: float - исходное количество.
     :param step: float - шаг лота от биржи.
     :return: float - округлённое количество.
+
+    FIX: считаем precision через Decimal, потому что str(1e-05) == '1e-05'
+    и старый код возвращал precision=0 (нет точки → ветка else), а потом
+    round(..., 0) обнулял дробную часть → qty=0 → ордер не размещался либо
+    падал на минимальный 1 контракт.
     """
-    precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-    rounded   = (qty // step) * step
+    from decimal import Decimal
+
+    step_d = Decimal(str(step))
+    # exponent = -precision (для шагов <1). Для шага 1.0 exponent=0 → precision=0.
+    exponent = step_d.as_tuple().exponent
+    precision = max(0, -int(exponent))
+    rounded = (qty // step) * step
     return round(rounded, precision)
 
 
