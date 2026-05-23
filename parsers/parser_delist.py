@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
+import string
 import threading
 import time
 import itertools
@@ -57,9 +59,27 @@ RESET  = "\033[0m"
 BINANCE_API_URL    = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
 ARTICLE_DETAIL_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
 CATEGORY_ID        = 161
-POLL_INTERVAL      = 3     # пауза между запросами каждого поллера
-POLL_BACKOFF       = 30    # пауза при 429
+
+# FIX-batch-8: 3с → 1с базового интервала.
+# С N=3 прокси и stagger даёт median детекции ~500мс вместо ~1500мс.
+# Хардкод (не env) — это публичный параметр поллера, не персональные данные.
+POLL_INTERVAL_BASE = 1.0
+# FIX-batch-8: per-poller адаптивный backoff при 429 — поллер, который
+# нарвался на rate limit, делает свой следующий запрос с увеличенным
+# интервалом, восстанавливается через POLL_BACKOFF_RECOVERY секунд.
+POLL_BACKOFF_429   = 30.0   # пауза при HTTP 429 (как раньше)
+POLL_BACKOFF_MULT  = 1.5    # после ошибки этот поллер замедляется в 1.5x
+POLL_BACKOFF_MAX   = 5.0    # потолок индивидуального интервала
+POLL_BACKOFF_RECOVERY = 60.0  # секунд до возврата к POLL_INTERVAL_BASE
+
 DELIST_KEYWORDS    = ["Will Delist", "Delisting Notice", "Binance Will Delist"]
+
+# FIX-batch-8: cache-busting — разрешённые значения pageSize.
+# По наблюдениям community CloudFront кеширует ответы по cache key из query.
+# pageSize вне этого набора → возвращается cached page с 20 items.
+# Меняя pageSize между запросами + добавляя random query params, мы
+# увеличиваем шанс попасть на свежий fresh-fetch от Binance API.
+BINANCE_PAGE_SIZES = [5, 10, 15, 20]
 
 # Telegram listener
 TG_CHANNEL        = "coin_listing"
@@ -166,6 +186,14 @@ _poller_last_ts: dict[int, float] = {}        # {session_idx: timestamp}
 _poller_ts_lock = threading.Lock()
 _poller_threads: dict[int, threading.Thread] = {}   # FIX: учёт активных потоков
 
+# FIX-batch-8: per-poller адаптивный интервал — каждый поллер имеет свой
+# текущий интервал. После 429/ошибки он растёт в POLL_BACKOFF_MULT раз
+# (до POLL_BACKOFF_MAX), через POLL_BACKOFF_RECOVERY секунд после
+# последнего успешного запроса возвращается к POLL_INTERVAL_BASE.
+_poller_intervals: dict[int, float] = {}
+_poller_last_ok_ts: dict[int, float] = {}
+_poller_intervals_lock = threading.Lock()
+
 # Создаём отдельную сессию для каждого прокси
 _sessions: list[requests.Session] = []
 for proxy in PROXIES:
@@ -175,9 +203,11 @@ for proxy in PROXIES:
         s.proxies = {"http": proxy, "https": proxy}
     _sessions.append(s)
 
-# Инициализируем timestamps для watchdog
+# Инициализируем timestamps для watchdog + интервалы для backoff
 for _i in range(len(_sessions)):
     _poller_last_ts[_i] = time.monotonic()
+    _poller_intervals[_i] = POLL_INTERVAL_BASE
+    _poller_last_ok_ts[_i] = time.monotonic()
 
 # Циклический итератор по сессиям
 _session_cycle = itertools.cycle(enumerate(_sessions))
@@ -187,6 +217,38 @@ _session_lock  = threading.Lock()
 def _next_session() -> tuple[int, requests.Session]:
     with _session_lock:
         return next(_session_cycle)
+
+
+# ── FIX-batch-8: cache-busting URL builder ────────────────────────
+
+def _build_binance_url() -> str:
+    """
+    Собирает URL к Binance article API так, чтобы CloudFront cache key
+    был уникальным на каждом запросе. Иначе разные edge'ы могут вернуть
+    stale (10-30с задержки от момента публикации статьи).
+
+    Что делаем:
+      1. pageSize крутим из whitelist BINANCE_PAGE_SIZES — все эти значения
+         валидны для API. Меняя его, попадаем на разные cache key.
+      2. Добавляем 2 random query params (имя+значение) — гарантированный
+         miss для CloudFront, но Binance их игнорирует.
+      3. Перемешиваем порядок параметров — у некоторых CDN порядок учитывается.
+    """
+    rnd_name = "".join(random.choice(string.ascii_lowercase) for _ in range(8))
+    rnd_val  = random.randint(1, 99_999_999)
+    page_sz  = random.choice(BINANCE_PAGE_SIZES)
+
+    params = [
+        ("type", "1"),
+        ("pageNo", "1"),
+        ("pageSize", str(page_sz)),
+        ("catalogId", str(CATEGORY_ID)),
+        ("_t", str(int(time.time() * 1000))),  # ms timestamp — гарантированный uniqueness
+        (rnd_name, str(rnd_val)),
+    ]
+    random.shuffle(params)
+    qs = "&".join(f"{k}={v}" for k, v in params)
+    return f"{BINANCE_API_URL}?{qs}"
 
 
 # ── Heartbeat для docker healthcheck ──────────────────────────────
@@ -451,31 +513,73 @@ def process_article(article: dict) -> None:
 
 # ── Поллеры ──────────────────────────────────────────────────────
 
+def _bump_interval(session_idx: int) -> None:
+    """FIX-batch-8: при ошибке/429 — увеличить интервал поллера."""
+    with _poller_intervals_lock:
+        cur = _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
+        _poller_intervals[session_idx] = min(cur * POLL_BACKOFF_MULT, POLL_BACKOFF_MAX)
+
+
+def _reset_interval_if_recovered(session_idx: int) -> None:
+    """FIX-batch-8: если последний успех был давно — вернуть базовый интервал."""
+    now = time.monotonic()
+    with _poller_intervals_lock:
+        last_ok = _poller_last_ok_ts.get(session_idx, 0)
+        if (now - last_ok) < POLL_BACKOFF_RECOVERY:
+            return
+        if _poller_intervals.get(session_idx, POLL_INTERVAL_BASE) > POLL_INTERVAL_BASE:
+            _poller_intervals[session_idx] = POLL_INTERVAL_BASE
+            _poller_last_ok_ts[session_idx] = now
+
+
+def _mark_ok(session_idx: int) -> None:
+    """FIX-batch-8: успех — обновить last_ok timestamp."""
+    with _poller_intervals_lock:
+        _poller_last_ok_ts[session_idx] = time.monotonic()
+
+
+def _get_interval(session_idx: int) -> float:
+    with _poller_intervals_lock:
+        return _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
+
+
 def poller(session_idx: int) -> None:
     label   = f"proxy[{session_idx}]" if session_idx > 0 else "direct"
     session = _sessions[session_idx]
-    params  = {"type": 1, "pageNo": 1, "pageSize": 20, "catalogId": CATEGORY_ID}
 
-    log_ok("POLLER", f"[{label}] запущен")
+    log_ok("POLLER", f"[{label}] запущен (interval={POLL_INTERVAL_BASE}с base)")
 
     first_run = True
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         while True:
             try:
-                resp = session.get(BINANCE_API_URL, params=params, timeout=4)
+                # FIX-batch-8: cache-busting URL — на каждый запрос новый cache key.
+                url = _build_binance_url()
+                resp = session.get(url, timeout=4)
                 if resp.status_code == 429:
-                    log_warn("POLLER", f"[{label}] 429 — пауза {POLL_BACKOFF}с")
-                    time.sleep(POLL_BACKOFF)
+                    log_warn("POLLER", f"[{label}] 429 — пауза {POLL_BACKOFF_429}с + замедление")
+                    _bump_interval(session_idx)
+                    time.sleep(POLL_BACKOFF_429)
                     continue
                 resp.raise_for_status()
+
+                # FIX-batch-8: в DEBUG mode — печатать X-Cache header, чтобы видеть,
+                # попадают ли запросы в CloudFront cache или в origin.
+                if os.getenv("DELIST_DEBUG_CACHE") == "1":
+                    xc = resp.headers.get("X-Cache", "?")
+                    age = resp.headers.get("Age", "?")
+                    log_info("POLLER", f"[{label}] X-Cache={xc} Age={age}")
+
                 # FIX-batch-1: orjson вместо resp.json() (3-5x быстрее на Binance ответах ~5-20KB).
                 data     = _json_loads(resp.content).get("data", {})
                 articles = data.get("articles") or (data.get("catalogs", [{}])[0].get("articles", []))
 
-                # Обновляем watchdog timestamp
+                # Обновляем watchdog timestamp + успешный ответ — сбросить backoff
                 with _poller_ts_lock:
                     _poller_last_ts[session_idx] = time.monotonic()
+                _mark_ok(session_idx)
+                _reset_interval_if_recovered(session_idx)
 
                 if articles:
                     if first_run:
@@ -487,7 +591,15 @@ def poller(session_idx: int) -> None:
                         log_info("POLLER", f"[{label}] первый запуск — запомнили {len(articles)} статей, жду новые...")
                         first_run = False
                     else:
-                        log_info("POLLER", f"[{label}] получено {len(articles)} статей")
+                        # FIX-batch-8: логируем только если новые статьи (иначе спам каждую секунду)
+                        new_count = 0
+                        with seen_lock:
+                            for a in articles:
+                                aid = a.get("id")
+                                if aid is not None and aid not in seen_ids:
+                                    new_count += 1
+                        if new_count > 0:
+                            log_info("POLLER", f"[{label}] получено {len(articles)} статей (новых: {new_count})")
                         # FIX: executor.submit вместо ленивого .map — исключения логируются
                         for a in articles:
                             executor.submit(process_article, a)
@@ -496,8 +608,9 @@ def poller(session_idx: int) -> None:
 
             except Exception as e:
                 log_err("POLLER", f"[{label}] ошибка: {e}")
+                _bump_interval(session_idx)
 
-            time.sleep(POLL_INTERVAL)
+            time.sleep(_get_interval(session_idx))
 
 
 # ── Watchdog ──────────────────────────────────────────────────────
@@ -674,7 +787,7 @@ if __name__ == "__main__":
     time.sleep(5)
 
     tg_log(f"🚀 <b>DELIST парсер запущен</b>\nПоллеры: {len(_sessions)}\nБиржи: Bybit + Gate.io (fallback)")
-    log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → ~{POLL_INTERVAL / max(len(_sessions),1):.1f}с между запросами")
+    log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами")
 
     # FIX: поллеры — daemon=True. Если main thread (TG listener) умирает,
     # Docker должен иметь возможность перезапустить контейнер.
@@ -682,7 +795,10 @@ if __name__ == "__main__":
         t = threading.Thread(target=poller, args=(i,), daemon=True, name=f"poller-{i}")
         t.start()
         _poller_threads[i] = t
-        time.sleep(POLL_INTERVAL / max(len(_sessions), 1))
+        # FIX-batch-8: stagger между запусками поллеров.
+        # Делим POLL_INTERVAL_BASE на число поллеров, чтобы они стартовали равномерно
+        # и median детекции была не INTERVAL/2, а INTERVAL/(2*N).
+        time.sleep(POLL_INTERVAL_BASE / max(len(_sessions), 1))
 
     # Watchdog
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()

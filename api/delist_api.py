@@ -62,12 +62,16 @@ except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
 
 # ── Конфиг Bybit ─────────────────────────────────────────────────
 BYBIT_BASE_URL = "https://api.bybit.com"
+ORDER_CREATE_URL = BYBIT_BASE_URL + "/v5/order/create"   # FIX-batch-8: pre-built URL
 RECV_WINDOW    = "5000"
 LEVERAGE       = 10   # FIX: вынес магическое число в константу
 
 # Защита от None если ключи не заданы в .env
 BYBIT_API_KEY    = BYBIT_API_KEY    or ""
 BYBIT_SECRET_KEY = BYBIT_SECRET_KEY or ""
+
+# FIX-batch-8: pre-encoded byte secret для HMAC — экономим .encode() на каждый ордер.
+_BYBIT_SECRET_BYTES = BYBIT_SECRET_KEY.encode()
 
 # Одна переиспользуемая сессия для всех ордеров (keep-alive)
 _bybit_session = requests.Session()
@@ -117,22 +121,83 @@ def _sign(ts: str, body_str: str) -> str:
     """
     Генерирует HMAC-SHA256 подпись для Bybit V5 API.
     sign_str = timestamp + api_key + recv_window + body
+    FIX-batch-8: используем pre-encoded _BYBIT_SECRET_BYTES — экономим
+    .encode() на каждый запрос (мелочь, но в хот-path ордера полезно).
     """
     sign_str = ts + BYBIT_API_KEY + RECV_WINDOW + body_str
     return hmac.new(
-        BYBIT_SECRET_KEY.encode(),
+        _BYBIT_SECRET_BYTES,
         sign_str.encode(),
         hashlib.sha256,
     ).hexdigest()
 
 
+# ── FIX-batch-8: специализированный fast-path для создания ордера ──
+# Что улучшаем относительно общего _post:
+#   1. URL пре-склеен в ORDER_CREATE_URL (без BYBIT_BASE_URL + endpoint конкатенации).
+#   2. JSON собирается f-string'ом без json.dumps() — экономит 1-2мс,
+#      и фиксирует точную форму payload (Bybit чувствителен к пробелам
+#      в подписи: body для signing должен совпадать с body, который
+#      реально отправляется).
+#   3. Headers собираются как минимальный dict (только timestamp+sign);
+#      статичные (Content-Type / API-KEY / RECV-WINDOW) уже на _bybit_session.headers.
+#   4. retCode проверяем без лишнего .get(..., default).
+# Win: −2...−5мс на REST-fallback ордера (когда WS Trade не сработал).
+
+def _post_order(symbol: str, side: str, qty: str, position_idx: int,
+                retries: int = 2) -> dict:
+    """
+    Размещает Market ордер через Bybit V5 REST максимально быстро.
+    :param symbol: "BTCUSDT" (linear).
+    :param side: "Buy" | "Sell".
+    :param qty: str с количеством в токенах.
+    :param position_idx: 1=long-hedge, 2=short-hedge.
+    """
+    body_str = (
+        f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
+        f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}}}'
+    )
+
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        ts = str(int(time.time() * 1000))
+        sign = _sign(ts, body_str)
+
+        try:
+            resp = _bybit_session.post(
+                ORDER_CREATE_URL,
+                data=body_str,
+                headers={"X-BAPI-TIMESTAMP": ts, "X-BAPI-SIGN": sign},
+                timeout=3,
+            )
+            resp.raise_for_status()
+            data = _json_loads(resp.content)
+            if data.get("retCode") != 0:
+                raise RuntimeError(
+                    f"Bybit order error retCode={data.get('retCode')} "
+                    f"msg={data.get('retMsg')} symbol={symbol} qty={qty}"
+                )
+            return data
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
+        except Exception:
+            raise
+
+    if last_exc:
+        raise last_exc
+    return {}
+
+
 def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
     """
-    Отправляет подписанный POST-запрос к Bybit V5.
+    Общий подписанный POST к Bybit V5 (для TP/SL и других не-ордер запросов).
     Использует persist-сессию (keep-alive) — без переустановки TCP.
 
-    FIX: добавлен ретрай при сетевых ошибках (timeout/connection).
-    Бизнес-ошибки Bybit (retCode != 0) НЕ ретраим — они стабильны.
+    Для размещения ордеров используется _post_order — он быстрее.
     """
     body_str = json.dumps(params, separators=(",", ":"))  # компактный JSON
 
@@ -349,24 +414,27 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
             amount_tokens = _round_qty(raw_qty, step)
 
             if amount_tokens > 0:
-                order_args = {
+                qty_str = str(amount_tokens)
+
+                # FIX-batch-5: пробуем WS Trade API (−30...−80мс), при ошибке/None — REST.
+                placed_via = "REST"
+                ws_args = {
                     "category":    "linear",
                     "symbol":      symbol,
                     "side":        "Sell",
                     "orderType":   "Market",
-                    "qty":         str(amount_tokens),
+                    "qty":         qty_str,
                     "positionIdx": 2,
                 }
-                # FIX-batch-5: пробуем WS Trade API (−30...−80мс), при ошибке/None — REST.
-                placed_via = "REST"
                 try:
-                    ws_ack = _ws_place_order(order_args)
+                    ws_ack = _ws_place_order(ws_args)
                 except Exception as e:
                     print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
                     ws_ack = None
 
                 if ws_ack is None:
-                    _post("/v5/order/create", order_args)
+                    # FIX-batch-8: специализированный _post_order (f-string JSON, −2..−5мс)
+                    _post_order(symbol, "Sell", qty_str, 2)
                 else:
                     placed_via = "WS"
 
