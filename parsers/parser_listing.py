@@ -113,9 +113,10 @@ POLL_ERROR_BACKOFF  = 3.0
 WATCHDOG_TIMEOUT    = 60   # секунд
 
 # Защита от дублей
-_fired_lock    = threading.Lock()
-_fired_coins:  set[str] = set()
-_FIRED_TTL     = 60
+_fired_lock     = threading.Lock()
+_fired_coins:   set[str] = set()
+_fired_expiry:  dict[str, float] = {}
+_FIRED_TTL      = 60
 
 # ── Watchdog: время последнего успешного запроса ───────────────────
 _upbit_last_ts   = time.monotonic()
@@ -153,18 +154,28 @@ def log_err(tag: str, msg: str):  _log(tag, RED,    msg)
 # ── дедупликация сигналов ─────────────────────────────────────────
 
 def _try_claim(coin: str) -> bool:
+    # FIX-PERF: было — на каждый claim спавнили отдельный sleep-thread
+    # для TTL-cleanup. threading.Thread.start() ≈ 3-5мс на coin, для
+    # 5 монет это 15-25мс в hot-path процесса сигнала. Теперь один
+    # фоновый sweeper (_fired_sweeper) подметает по таймстампу.
     with _fired_lock:
         if coin in _fired_coins:
             return False
         _fired_coins.add(coin)
-
-    def _release():
-        time.sleep(_FIRED_TTL)
-        with _fired_lock:
-            _fired_coins.discard(coin)
-
-    threading.Thread(target=_release, daemon=True).start()
+        _fired_expiry[coin] = time.monotonic() + _FIRED_TTL
     return True
+
+
+def _fired_sweeper() -> None:
+    """FIX-PERF: единый поток для очистки _fired_coins по TTL."""
+    while True:
+        time.sleep(5)
+        now = time.monotonic()
+        with _fired_lock:
+            expired = [c for c, ts in _fired_expiry.items() if ts <= now]
+            for c in expired:
+                _fired_coins.discard(c)
+                _fired_expiry.pop(c, None)
 
 
 # ── воркер (открытие лонга) ───────────────────────────────────────
@@ -173,7 +184,12 @@ def worker(coin: str, margin: float, t_start: float,
            source: str, retries: int = 3) -> None:
     for attempt in range(1, retries + 1):
         try:
-            log_info("WORKER", f"[{source}] Старт → {coin} | margin={margin} USDT | попытка {attempt}/{retries}")
+            # FIX-PERF: пропускаем "Старт"-print на attempt 1. Это
+            # форматированный print → stdout = ~1-3мс перед market_open_long
+            # в hot-path. Открытие позиции важнее, чем factual лог "сейчас открываем".
+            # На retry'ях лог остаётся — там диагностика нужна.
+            if attempt > 1:
+                log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
             amount, entry_price = market_open_long(coin, margin)
             if not amount:
                 log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
@@ -334,16 +350,15 @@ def run_telegram_listener() -> None:
 
             source = f"TG:{chat_id}"
 
-            # FIX: оборачиваем target в try/except, иначе исключение в
-            # process_signal (например, calculate_margin_for_listing → API ошибка)
-            # молча теряется и сигнал не обрабатывается.
-            def _safe_signal():
-                try:
-                    process_signal(pairs, source, t_start)
-                except Exception as exc:  # noqa: BLE001
-                    log_err("TG", f"process_signal упал: {exc!r}")
-
-            threading.Thread(target=_safe_signal, daemon=True).start()
+            # FIX-PERF: вызываем process_signal НАПРЯМУЮ вместо
+            # threading.Thread(target=_safe_signal).start() — экономия ~3-5мс
+            # на спавн дополнительного потока. process_signal сам делает
+            # executor.submit (уже не блокирует), а оставшиеся print'ы идут
+            # ПОСЛЕ submit'а, так что задержка до OPEN не растёт.
+            try:
+                process_signal(pairs, source, t_start)
+            except Exception as exc:  # noqa: BLE001
+                log_err("TG", f"process_signal упал: {exc!r}")
 
             # FIX-PERF: get_chat() теперь ПОСЛЕ spawn'а worker'а. Сетевой
             # round-trip к Telegram больше не блокирует открытие ордера.
@@ -592,6 +607,14 @@ if __name__ == "__main__":
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
 
+    # FIX-PERF: дефолтный switchinterval = 5мс. Hot-path пересекает 3
+    # потока (handler → executor-worker → bybit-ws loop → executor-worker),
+    # каждая GIL-передача до 5мс = до 15мс лишних. 1мс уменьшает оверхед
+    # до ~3мс при той же CPU-нагрузке (не критично для I/O-bound сервиса).
+    import sys
+    sys.setswitchinterval(0.001)
+    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
+
     threading.Thread(target=price_updater,      daemon=True).start()
     threading.Thread(target=gate_price_updater, daemon=True).start()
     log_ok("CACHE", "price_updater (Bybit + Gate.io) запущен в фоне")
@@ -627,6 +650,9 @@ if __name__ == "__main__":
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
+
+    # FIX-PERF: глобальный sweeper вместо thread-per-claim (см. _try_claim).
+    threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:

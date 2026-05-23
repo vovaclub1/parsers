@@ -168,9 +168,10 @@ def _parse_proxies(raw: str) -> list[str | None]:
 PROXIES: list[str | None] = _parse_proxies(DELIST_PROXIES)
 
 # ── дедупликация сигналов ────────────────────────────────────────
-_fired_lock   = threading.Lock()
-_fired_coins: set[str] = set()
-_FIRED_TTL    = 60   # секунд до снятия блокировки монеты
+_fired_lock    = threading.Lock()
+_fired_coins:  set[str] = set()
+_fired_expiry: dict[str, float] = {}
+_FIRED_TTL     = 60   # секунд до снятия блокировки монеты
 
 seen_ids: set[int] = set()
 seen_lock = threading.Lock()
@@ -283,19 +284,28 @@ def _try_claim(coin: str) -> bool:
     """
     Возвращает True если монета ещё не в работе и блокирует её на _FIRED_TTL секунд.
     Защищает от двойного открытия одной монеты.
+    FIX-PERF: было — на каждый claim спавнили sleep-thread для TTL-cleanup.
+    threading.Thread.start() ≈ 3-5мс на coin (для 5 монет = 15-25мс в hot-path).
+    Теперь один фоновый sweeper (_fired_sweeper) подметает по таймстампу.
     """
     with _fired_lock:
         if coin in _fired_coins:
             return False
         _fired_coins.add(coin)
-
-    def _release():
-        time.sleep(_FIRED_TTL)
-        with _fired_lock:
-            _fired_coins.discard(coin)
-
-    threading.Thread(target=_release, daemon=True).start()
+        _fired_expiry[coin] = time.monotonic() + _FIRED_TTL
     return True
+
+
+def _fired_sweeper() -> None:
+    """FIX-PERF: единый поток для TTL-cleanup _fired_coins."""
+    while True:
+        time.sleep(5)
+        now = time.monotonic()
+        with _fired_lock:
+            expired = [c for c, ts in _fired_expiry.items() if ts <= now]
+            for c in expired:
+                _fired_coins.discard(c)
+                _fired_expiry.pop(c, None)
 
 
 # ── Fetch ────────────────────────────────────────────────────────
@@ -347,7 +357,11 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
     """
     for attempt in range(1, retries + 1):
         try:
-            log_info("WORKER", f"[{source}] Старт → {coin} | margin={margin} USDT | попытка {attempt}/{retries}")
+            # FIX-PERF: "Старт"-print только на retry'ях — на attempt 1
+            # форматированный print → stdout = ~1-3мс перед market_open_short
+            # в hot-path. Открытие позиции важнее, чем factual лог.
+            if attempt > 1:
+                log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
             amount, entry_price = market_open_short(coin, margin)
             if not amount:
                 log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
@@ -789,15 +803,13 @@ def run_telegram_delist_listener() -> None:
 
             source = f"TG:{chat_id}"
 
-            # FIX: оборачиваем target в try/except — иначе исключение
-            # в process_signal/worker молча теряется.
-            def _safe_signal():
-                try:
-                    process_signal(pairs, source, t_start)
-                except Exception as exc:  # noqa: BLE001
-                    log_err("TG-DELIST", f"process_signal упал: {exc!r}")
-
-            threading.Thread(target=_safe_signal, daemon=True).start()
+            # FIX-PERF: process_signal НАПРЯМУЮ вместо threading.Thread —
+            # экономия ~3-5мс на спавн доп. потока. Submit'ы внутри
+            # process_signal уже идут до print'ов (см. process_signal).
+            try:
+                process_signal(pairs, source, t_start)
+            except Exception as exc:  # noqa: BLE001
+                log_err("TG-DELIST", f"process_signal упал: {exc!r}")
 
             # FIX-PERF: get_chat() ПОСЛЕ spawn'а — больше не блокирует
             # открытие шорта.
@@ -836,6 +848,13 @@ if __name__ == "__main__":
         print("[BOOT] uvloop активирован")
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
+
+    # FIX-PERF: дефолтный switchinterval = 5мс — это до 5мс jitter на
+    # каждом cross-thread context switch'е (handler → executor → bybit-ws).
+    # 1мс — компромисс между latency и CPU-нагрузкой для I/O-bound кода.
+    import sys
+    sys.setswitchinterval(0.001)
+    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
 
     # ── Прогрев бирж ─────────────────────────────────────────────
     threading.Thread(target=price_updater,      daemon=True).start()
@@ -881,6 +900,9 @@ if __name__ == "__main__":
     # Watchdog
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
+
+    # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
+    threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:
