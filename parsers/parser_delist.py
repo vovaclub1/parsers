@@ -397,6 +397,12 @@ def _on_toa_delist(full_text: str, t_start: float) -> None:
 
 # ── Общая обработка сигнала ───────────────────────────────────────
 
+# FIX-PERF: модульный long-lived pool для worker'ов делистинга. Раньше
+# `with ThreadPoolExecutor(...)` создавал новый пул на каждый сигнал, а
+# __exit__ блокировал до завершения всех worker'ов — +5-15мс overhead.
+_signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="delist-signal")
+
+
 def process_signal(pairs: list[str], source: str, t_start: float) -> None:
     """
     Общая функция обработки сигнала делистинга.
@@ -409,16 +415,15 @@ def process_signal(pairs: list[str], source: str, t_start: float) -> None:
 
     margin = calculate_margin_for_delist()
 
+    # FIX-PERF: submit ДО логирования — открытие ордера в hot-path,
+    # print/log идут параллельно с уже запущенным market_open_short.
+    for coin in new_pairs:
+        _signal_executor.submit(worker, coin, margin, t_start, source)
+
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("DELIST", f"[{source}] Новый делистинг!")
     log_info("DELIST", f"Монеты : {new_pairs}")
     log_info("TRADE",  f"Маржа={margin} USDT | открываем {len(new_pairs)} шорт(ов)...")
-    print(f"{BOLD}{'─' * 60}{RESET}")
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for coin in new_pairs:
-            executor.submit(worker, coin, margin, t_start, source)
-
     print(f"{BOLD}{'═' * 60}{RESET}\n")
 
 
@@ -771,29 +776,37 @@ def run_telegram_delist_listener() -> None:
             if any(neg in tl for neg in TG_DELIST_NEG):
                 return
 
-            try:
-                chat    = await event.get_chat()
-                chat_id = getattr(chat, "id", 0)
-                uname   = getattr(chat, "username", "") or ""
-            except Exception:
-                chat_id, uname = 0, ""
-
-            log_ok("TG-DELIST", f"Делистинг-сигнал! [{chat_id} @{uname}]: {text[:100]}")
+            # FIX-PERF: НЕ дёргаем await event.get_chat() здесь — это network
+            # round-trip к Telegram, 50–200мс на холодном кеше. Берём
+            # event.chat_id (sync). Username нужен только для лога — fetch'им
+            # ПОСЛЕ запуска worker'а (см. ниже).
+            chat_id = getattr(event, "chat_id", 0) or 0
 
             pairs = find_pairs(text)
             if not pairs:
                 log_warn("TG-DELIST", f"Тикер не найден: {text[:80]}")
                 return
 
+            source = f"TG:{chat_id}"
+
             # FIX: оборачиваем target в try/except — иначе исключение
             # в process_signal/worker молча теряется.
             def _safe_signal():
                 try:
-                    process_signal(pairs, f"TG:@{uname}" if uname else "TG", t_start)
+                    process_signal(pairs, source, t_start)
                 except Exception as exc:  # noqa: BLE001
                     log_err("TG-DELIST", f"process_signal упал: {exc!r}")
 
             threading.Thread(target=_safe_signal, daemon=True).start()
+
+            # FIX-PERF: get_chat() ПОСЛЕ spawn'а — больше не блокирует
+            # открытие шорта.
+            try:
+                chat  = await event.get_chat()
+                uname = getattr(chat, "username", "") or ""
+            except Exception:
+                uname = ""
+            log_ok("TG-DELIST", f"Делистинг-сигнал! [{chat_id} @{uname}]: {text[:100]}")
 
         await client.start()
         log_ok("TG-DELIST", "Telethon подключён | сессия: delist_session")

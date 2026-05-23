@@ -228,6 +228,12 @@ def _on_toa_listing(full_text: str, t_start: float) -> None:
 
 # ── общая обработка сигнала ───────────────────────────────────────
 
+# FIX-PERF: модульный long-lived pool вместо `with ThreadPoolExecutor(...)`
+# на каждый сигнал. Создание пула + блокировка __exit__ до завершения всех
+# worker'ов съедали ~5-15мс из hot-path. Pool живёт всё время работы парсера.
+_signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="listing-signal")
+
+
 def process_signal(pairs: list[str], source: str, t_start: float | None = None) -> None:
     """
     FIX-batch-8: t_start теперь параметр. Если None — замеряем сами (бэк-совместимость).
@@ -244,16 +250,16 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None) 
 
     margin = calculate_margin_for_listing()
 
+    # FIX-PERF: submit ДО логирования. Открытие ордера — это hot-path,
+    # 4 print'а перед market_open_long добавляли ~2мс. Workers стартуют
+    # сразу, print'ы идут параллельно с уже запущенным market_open_long.
+    for coin in new_pairs:
+        _signal_executor.submit(worker, coin, margin, t_start, source)
+
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("LISTING", f"[{source}] Новый листинг!")
     log_info("LISTING", f"Монеты : {new_pairs}")
     log_info("TRADE",   f"Маржа={margin} USDT | открываем {len(new_pairs)} лонг(ов)...")
-    print(f"{BOLD}{'─' * 60}{RESET}")
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for coin in new_pairs:
-            executor.submit(worker, coin, margin, t_start, source)
-
     print(f"{BOLD}{'═' * 60}{RESET}\n")
 
 
@@ -314,30 +320,39 @@ def run_telegram_listener() -> None:
             if any(neg in tl for neg in TG_LISTING_NEG):
                 return
 
-            try:
-                chat    = await event.get_chat()
-                chat_id = getattr(chat, "id", 0)
-                uname   = getattr(chat, "username", "") or ""
-            except Exception:
-                chat_id, uname = 0, ""
-
-            log_ok("TG", f"Листинг-сигнал! [{chat_id} @{uname}]: {text[:120]}")
+            # FIX-PERF: НЕ дёргаем await event.get_chat() здесь — это network
+            # round-trip к Telegram, 50–200мс на холодном кеше Telethon. Берём
+            # event.chat_id (sync, ~0мс). Username нужен только для лога —
+            # подтягиваем уже ПОСЛЕ запуска воркера (см. ниже). Это даёт
+            # −50…−150мс на самом первом сигнале из канала.
+            chat_id = getattr(event, "chat_id", 0) or 0
 
             pairs = find_listing_pairs(text)
             if not pairs:
                 log_warn("TG", f"Тикер не найден (фильтр пропустил): {text[:80]}")
                 return
 
+            source = f"TG:{chat_id}"
+
             # FIX: оборачиваем target в try/except, иначе исключение в
             # process_signal (например, calculate_margin_for_listing → API ошибка)
             # молча теряется и сигнал не обрабатывается.
             def _safe_signal():
                 try:
-                    process_signal(pairs, f"TG:@{uname}" if uname else "TG", t_start)
+                    process_signal(pairs, source, t_start)
                 except Exception as exc:  # noqa: BLE001
                     log_err("TG", f"process_signal упал: {exc!r}")
 
             threading.Thread(target=_safe_signal, daemon=True).start()
+
+            # FIX-PERF: get_chat() теперь ПОСЛЕ spawn'а worker'а. Сетевой
+            # round-trip к Telegram больше не блокирует открытие ордера.
+            try:
+                chat  = await event.get_chat()
+                uname = getattr(chat, "username", "") or ""
+            except Exception:
+                uname = ""
+            log_ok("TG", f"Листинг-сигнал! [{chat_id} @{uname}]: {text[:120]}")
 
         await client.start()
         log_ok("TG", "Telethon подключён | сессия: listing_session")
