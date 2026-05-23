@@ -339,6 +339,112 @@ class BybitWsTrade:
             return ack
         return None
 
+    # ── FIX-PERF: fire-and-forget ─────────────────────────────────
+    def place_order_fast(self, args: dict) -> dict | None:
+        """
+        FIX-PERF: fire-and-forget WS-размещение ордера.
+
+        Семантика:
+          - Ждём только завершение ws.send() (~1-5мс), НЕ ждём ack от Bybit.
+          - Ack отслеживается в фоне (_watch_ack): при retCode != 0
+            пишется [BYBIT-WS-FAST] REJECTED в stdout. Success → silent.
+
+        Зачем: ack-roundtrip = 70-120мс физика (RTT до Bybit Singapore).
+        Caller'у в hot-path он не нужен — amount/entry_price считаются
+        локально, TP/SL выставляется отдельно через position/trading-stop.
+        Если Bybit отвергнет ордер — узнаем в фоновом логе, retry в этом
+        случае всё равно бесполезен (rejections — permanent: balance/limits/qty).
+
+        Возврат:
+          None       — WS не подключён ИЛИ transport-ошибка при send → REST fallback.
+          dict       — frame ушёл на провод; ack ждём в фоне.
+        """
+        if not self._connected.is_set():
+            return None
+        if self._loop is None or self._ws is None:
+            return None
+
+        req_id = str(uuid.uuid4())
+        ts_ms  = str(int(time.time() * 1000))
+        symbol = args.get("symbol", "?")
+
+        payload = {
+            "reqId": req_id,
+            "op":    "order.create",
+            "header": {
+                "X-BAPI-TIMESTAMP":   ts_ms,
+                "X-BAPI-RECV-WINDOW": "5000",
+                "Referer":            "Parsers",
+            },
+            "args": [args],
+        }
+
+        send_done = threading.Event()
+        send_err: list[str] = []
+
+        async def _send_and_track() -> None:
+            loop = asyncio.get_running_loop()
+            # Регистрируем future, чтобы reader-loop (_dispatch) мог
+            # доставить ack. _watch_ack ждёт его в фоне и логирует reject.
+            fut: asyncio.Future = loop.create_future()
+            with self._pending_lock:
+                self._pending[req_id] = fut
+            loop.create_task(self._watch_ack(req_id, fut, symbol))
+
+            try:
+                ws = self._ws
+                if ws is None:
+                    send_err.append("ws_none")
+                    return
+                payload_str = _json_dumps(payload)
+                send_lock = self._send_lock
+                if send_lock is not None:
+                    async with send_lock:
+                        await ws.send(payload_str)
+                else:
+                    await ws.send(payload_str)
+            except (ConnectionClosedError, OSError, AttributeError) as e:
+                send_err.append(f"transport: {type(e).__name__}: {e}")
+            except Exception as e:  # noqa: BLE001
+                send_err.append(repr(e))
+            finally:
+                send_done.set()
+
+        asyncio.run_coroutine_threadsafe(_send_and_track(), self._loop)
+
+        # Ждём только окончания send (это ~1-5мс, локально), не ack.
+        # 0.5с — потолок на случай зависшего loop'а; в норме сразу.
+        if not send_done.wait(0.5):
+            print(f"[BYBIT-WS-FAST] send timeout {symbol} req_id={req_id} — REST fallback", flush=True)
+            return None
+
+        if send_err:
+            print(f"[BYBIT-WS-FAST] send failed ({send_err[0]}) {symbol} — REST fallback", flush=True)
+            return None
+
+        return {"sent": True, "reqId": req_id}
+
+    async def _watch_ack(self, req_id: str, fut: "asyncio.Future", symbol: str) -> None:
+        """
+        Фоновый наблюдатель за ack после fire-and-forget place_order_fast.
+        Reject → лог. Success → silent. Timeout → лог.
+        """
+        try:
+            ack = await asyncio.wait_for(fut, timeout=_ORDER_ACK_TIMEOUT)
+            if isinstance(ack, dict) and ack.get("retCode", -1) != 0:
+                print(
+                    f"[BYBIT-WS-FAST] REJECTED {symbol} retCode={ack.get('retCode')} "
+                    f"retMsg={ack.get('retMsg')!r}",
+                    flush=True,
+                )
+        except asyncio.TimeoutError:
+            print(f"[BYBIT-WS-FAST] ack timeout {symbol} req_id={req_id}", flush=True)
+        except Exception as e:  # noqa: BLE001 — ConnectionError при WS reconnect
+            print(f"[BYBIT-WS-FAST] ack error {symbol} req_id={req_id}: {e!r}", flush=True)
+        finally:
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+
 
 # ── удобные обёртки ──────────────────────────────────────────────
 
@@ -376,3 +482,15 @@ def place_order_ws(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | No
     if inst is None:
         return None
     return inst.place_order(args, timeout=timeout)
+
+
+def place_order_ws_fast(args: dict) -> dict | None:
+    """
+    FIX-PERF: fire-and-forget — возвращает после ws.send (без ack-wait).
+    Снимает ~70-100мс RTT до Bybit из hot-path. Reject логируется в фоне.
+    None → WS не подключён или transport-ошибка → REST fallback.
+    """
+    inst = _global_instance
+    if inst is None:
+        return None
+    return inst.place_order_fast(args)

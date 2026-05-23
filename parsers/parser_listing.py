@@ -654,6 +654,14 @@ if __name__ == "__main__":
     # FIX-PERF: глобальный sweeper вместо thread-per-claim (см. _try_claim).
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
 
+    # FIX-PERF: pre-warm executor — ThreadPoolExecutor создаёт worker-thread
+    # лениво на первый submit (~3-5мс). На первом листинге не хотим платить
+    # этот налог. Сабмитим N=max_workers no-op задач, ждём их завершения.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor pre-warmed (5 worker'ов готовы)")
+
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:
         try:

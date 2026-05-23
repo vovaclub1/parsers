@@ -56,10 +56,10 @@ from api.gate_api import (   # noqa: E402  (импорт после monkey-patch
 )
 
 # FIX: вынесли импорт из хот-функции market_open_short на модульный уровень.
-# Если модуль не подгружается (например, отсутствует websockets) — place_order_ws
-# становится no-op возвращающий None, и market_open_short падает в REST fallback.
+# FIX-PERF: fire-and-forget вариант place_order_ws_fast — экономит ~70-100мс
+# на ack-roundtrip. Reject логируется в фоне через _watch_ack.
 try:
-    from api.bybit_ws_trade import place_order_ws as _ws_place_order, WSOrderRejected
+    from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
@@ -529,12 +529,12 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 try:
                     ws_ack = _ws_place_order(ws_args)
                 except WSOrderRejected as e:
-                    # FIX-2: WS-канал работает, но Bybit ОТВЕРГ ордер логически
-                    # (баланс/leverage/symbol). REST повтор бесполезен. Сдаёмся,
-                    # worker сделает свой retry через 100мс.
+                    # Защитный путь (fast вариант reject не бросает — он
+                    # логирует асинхронно). Остался на случай если bybit_ws
+                    # модуль не подгрузился и упал на старую sync-обёртку.
                     print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
                     return 0, 0
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
                     ws_ack = None
 
@@ -543,7 +543,7 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                     # FIX: тот же orderLinkId, что и в WS-попытке — idempotency.
                     _post_order(symbol, "Sell", qty_str, 2, order_link_id=order_link_id)
                 else:
-                    placed_via = "WS"
+                    placed_via = "WS-FAST"
 
                 with _delist_exchange_lock:
                     _delist_exchange[ticker_name] = "bybit"
