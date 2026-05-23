@@ -548,10 +548,8 @@ def _reset_interval_if_recovered(session_idx: int) -> None:
         _poller_last_bump_ts[session_idx] = 0.0
 
 
-def _mark_ok(session_idx: int) -> None:
-    """Успех. Сам по себе ничего не делает (кроме watchdog ts ниже)."""
-    # Watchdog timestamp обновляется отдельно в poller()
-    pass
+# FIX-3: _mark_ok был no-op после реструктуризации (FIX-batch-8) — удалён,
+# его вызов в poller() тоже снят. Watchdog timestamp обновляется напрямую.
 
 
 def _get_interval(session_idx: int) -> float:
@@ -566,6 +564,11 @@ def poller(session_idx: int) -> None:
     log_ok("POLLER", f"[{label}] запущен (interval={POLL_INTERVAL_BASE}с base)")
 
     first_run = True
+    # FIX-4: счётчик циклов с повышенным интервалом — раз в N циклов
+    # логируем варн, иначе деградация невидима (флапающий прокси →
+    # interval застрянет на POLL_BACKOFF_MAX, recovery никогда не сработает).
+    elevated_cycles = 0
+    _ELEVATED_WARN_EVERY = 60
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         while True:
@@ -591,10 +594,9 @@ def poller(session_idx: int) -> None:
                 data     = _json_loads(resp.content).get("data", {})
                 articles = data.get("articles") or (data.get("catalogs", [{}])[0].get("articles", []))
 
-                # Обновляем watchdog timestamp + успешный ответ — сбросить backoff
+                # Обновляем watchdog timestamp + успешный ответ — пробуем сбросить backoff
                 with _poller_ts_lock:
                     _poller_last_ts[session_idx] = time.monotonic()
-                _mark_ok(session_idx)
                 _reset_interval_if_recovered(session_idx)
 
                 if articles:
@@ -626,7 +628,16 @@ def poller(session_idx: int) -> None:
                 log_err("POLLER", f"[{label}] ошибка: {e}")
                 _bump_interval(session_idx)
 
-            time.sleep(_get_interval(session_idx))
+            cur_interval = _get_interval(session_idx)
+            # FIX-4: видимость деградации — если интервал давно не сбрасывался,
+            # значит ошибки случаются чаще чем POLL_BACKOFF_RECOVERY.
+            if cur_interval > POLL_INTERVAL_BASE:
+                elevated_cycles += 1
+                if elevated_cycles % _ELEVATED_WARN_EVERY == 0:
+                    log_warn("POLLER", f"[{label}] интервал {cur_interval:.1f}с уже {elevated_cycles} циклов — нестабильное соединение?")
+            else:
+                elevated_cycles = 0
+            time.sleep(cur_interval)
 
 
 # ── Watchdog ──────────────────────────────────────────────────────
@@ -634,6 +645,7 @@ def poller(session_idx: int) -> None:
 # FIX-10: трекаем подряд "alive but stuck" циклы — Python не может убить
 # поток, зависший в TLS handshake / requests.get(), поэтому хотя бы
 # сообщаем юзеру в TG, чтобы он рестартанул контейнер.
+# FIX-13: single-writer (только _watchdog thread читает/пишет) — lock не нужен.
 _WATCHDOG_STUCK_ALERT_AFTER = 3   # 3 цикла × 30с = 90с тишины — точно zombie
 _poller_stuck_counts: dict[int, int] = {}
 
@@ -726,6 +738,10 @@ def run_telegram_delist_listener() -> None:
 
     @client.on(events.NewMessage(chats=channels))
     async def handler(event):
+        # FIX-9: t_start первой строкой — унифицируем с parser_listing.py.
+        # Раньше засекалось после фильтрации; теперь метрика включает CPU
+        # на keyword scan (~0.1мс на текст ~200 символов — мелочь, но честно).
+        t_start = time.perf_counter()
         try:
             text = event.message.message or ""
         except Exception:
@@ -741,8 +757,6 @@ def run_telegram_delist_listener() -> None:
         # FIX-batch-6: negative filter — отсекаем Binance Alpha removals и т.п.
         if any(neg in tl for neg in TG_DELIST_NEG):
             return
-
-        t_start = time.perf_counter()
 
         try:
             chat    = await event.get_chat()

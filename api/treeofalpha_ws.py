@@ -190,13 +190,17 @@ def run_tree_of_alpha_listener(
             daemon=True, name="toa-ws",
         ).start()
     """
-    # FIX: unified с parser_delist.py / parser_listing.py — set_event_loop_policy
-    # вместо deprecated uvloop.install() (deprecated с uvloop 0.18+).
-    # Идемпотентно — главный процесс мог уже выставить policy, повторный вызов OK.
+    # FIX-12: создаём loop локально — НЕ мутируем глобальную asyncio policy
+    # из background thread (паттерн bybit_ws_trade._run_loop). Главный
+    # процесс уже выставил uvloop policy, а мы дополнительно делаем явный
+    # new_event_loop() — это безопасно при многократном вызове из разных thread'ов.
     try:
         import uvloop  # type: ignore[import-not-found]
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        loop = uvloop.new_event_loop()
     except ImportError:
-        pass
-
-    asyncio.run(_listener(delist_callback, listing_callback))
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_listener(delist_callback, listing_callback))
+    finally:
+        loop.close()

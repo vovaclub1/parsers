@@ -55,11 +55,14 @@ from api.gate_api import (   # noqa: E402  (импорт после monkey-patch
 # Если модуль не подгружается (например, отсутствует websockets) — place_order_ws
 # становится no-op возвращающий None, и market_open_short падает в REST fallback.
 try:
-    from api.bybit_ws_trade import place_order_ws as _ws_place_order
+    from api.bybit_ws_trade import place_order_ws as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
         return None
+    class WSOrderRejected(Exception):  # type: ignore[no-redef]
+        """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
+        pass
 
 # ── Конфиг Bybit ─────────────────────────────────────────────────
 BYBIT_BASE_URL = "https://api.bybit.com"
@@ -150,6 +153,13 @@ def _sign(ts: str, body_str: str) -> str:
 _BYBIT_DUPLICATE_RET_CODES = {30050}  # OrderLinkID is duplicate
 
 
+# FIX-8: разрешённые символы в symbol/qty/order_link_id — guard против
+# случайного JSON injection при f-string сборке body_str. Все наши callers
+# формируют их контролируемо (ticker+USDT, str(float), uuid4().hex), но
+# assert ловит regression если когда-нибудь упадёт нестандартный ввод.
+_RE_ORDER_SAFE = re.compile(r"^[A-Za-z0-9._\-]+$")
+
+
 def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 order_link_id: str | None = None,
                 retries: int = 2) -> dict:
@@ -165,6 +175,16 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
         с retCode 30050, и мы это интерпретируем как success (первый прошёл).
         Если None — retries безопаснее НЕ делать (см. retries-логику ниже).
     """
+    # FIX-8: проверяем safe-символы — иначе f-string выше может сломать JSON/HMAC.
+    if not _RE_ORDER_SAFE.match(symbol):
+        raise ValueError(f"unsafe symbol for _post_order: {symbol!r}")
+    if side not in ("Buy", "Sell"):
+        raise ValueError(f"invalid side: {side!r}")
+    if not _RE_ORDER_SAFE.match(qty):
+        raise ValueError(f"unsafe qty for _post_order: {qty!r}")
+    if order_link_id is not None and not _RE_ORDER_SAFE.match(order_link_id):
+        raise ValueError(f"unsafe order_link_id: {order_link_id!r}")
+
     if order_link_id:
         body_str = (
             f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
@@ -195,19 +215,32 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 headers={"X-BAPI-TIMESTAMP": ts, "X-BAPI-SIGN": sign},
                 timeout=3,
             )
+            # FIX-14: 5xx — серверная ошибка Bybit, безопасно retry с orderLinkId.
+            # 4xx — клиентская, retry бесполезен.
+            if 500 <= resp.status_code < 600:
+                last_exc = requests.HTTPError(f"server {resp.status_code}", response=resp)
+                if attempt < effective_retries:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                raise last_exc
             resp.raise_for_status()
             data = _json_loads(resp.content)
             ret_code = data.get("retCode")
             if ret_code == 0:
                 return data
-            # Дубль orderLinkId → первая попытка реально прошла. Возвращаем
-            # как success, чтобы не двойнить позицию.
+            # FIX-7: дубль orderLinkId → нормализуем ответ к success-формату,
+            # чтобы caller'ы которые проверяют retCode == 0 не запутались.
             if order_link_id and ret_code in _BYBIT_DUPLICATE_RET_CODES:
                 print(
                     f"[BYBIT] duplicate orderLinkId={order_link_id} "
                     f"(attempt {attempt + 1}) — первый запрос прошёл, считаем success"
                 )
-                return data
+                return {
+                    "retCode": 0,
+                    "retMsg":  "OK (deduped via orderLinkId)",
+                    "result":  data.get("result", {}),
+                    "_deduped": True,
+                }
             raise RuntimeError(
                 f"Bybit order error retCode={ret_code} "
                 f"msg={data.get('retMsg')} symbol={symbol} qty={qty}"
@@ -218,12 +251,11 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 time.sleep(0.1 * (attempt + 1))
                 continue
             raise
-        except Exception:
-            raise
 
-    if last_exc:
-        raise last_exc
-    return {}
+    # Недостижимо: либо return data, либо raise выше. Но pyright/mypy без этого
+    # ругаются на "function may return None".
+    assert last_exc is not None
+    raise last_exc
 
 
 def _new_order_link_id() -> str:
@@ -232,6 +264,13 @@ def _new_order_link_id() -> str:
     [A-Za-z0-9_-]. uuid4().hex = 32 hex chars — влезает с запасом.
     """
     return uuid.uuid4().hex
+
+
+# FIX-10: публичные алиасы для импорта из других модулей. Прямой импорт
+# приватных `_post_order` / `_new_order_link_id` в listing_api.py нарушал
+# Python-конвенцию. Старые имена сохраняем для backward-compat внутри модуля.
+post_order = _post_order
+new_order_link_id = _new_order_link_id
 
 
 def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
@@ -270,12 +309,10 @@ def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
                 time.sleep(0.1 * (attempt + 1))
                 continue
             raise
-        except Exception:
-            raise
 
-    if last_exc:
-        raise last_exc
-    return {}
+    # Недостижимо (см. _post_order), оставлено только для type-checker'ов.
+    assert last_exc is not None
+    raise last_exc
 
 
 def _get(endpoint: str, params: dict | None = None) -> dict:
@@ -477,6 +514,12 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 }
                 try:
                     ws_ack = _ws_place_order(ws_args)
+                except WSOrderRejected as e:
+                    # FIX-2: WS-канал работает, но Bybit ОТВЕРГ ордер логически
+                    # (баланс/leverage/symbol). REST повтор бесполезен. Сдаёмся,
+                    # worker сделает свой retry через 100мс.
+                    print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
+                    return 0, 0
                 except Exception as e:
                     print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
                     ws_ack = None

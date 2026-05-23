@@ -70,6 +70,21 @@ _AUTH_EXPIRES_SEC = 10
 _ORDER_ACK_TIMEOUT = 1.5
 
 
+class WSOrderRejected(Exception):
+    """
+    FIX-2: WS-канал ОТВЕТИЛ, но Bybit логически отверг ордер
+    (insufficient balance, leverage limit, invalid symbol и т.п.).
+    В отличие от транспортного сбоя (None), REST fallback с теми же
+    параметрами тоже будет отвергнут — поэтому caller должен НЕ делать
+    REST повтор, а сразу сдаваться (worker сделает свой retry).
+    """
+    def __init__(self, ack: dict) -> None:
+        self.ack = ack
+        ret_code = ack.get("retCode") if isinstance(ack, dict) else None
+        ret_msg  = ack.get("retMsg")  if isinstance(ack, dict) else None
+        super().__init__(f"Bybit rejected order retCode={ret_code} retMsg={ret_msg!r}")
+
+
 class BybitWsTrade:
     """
     Singleton-обёртка над persistent WS Bybit V5 Trade.
@@ -256,6 +271,11 @@ class BybitWsTrade:
                 result_box["ack"] = ack
             except asyncio.TimeoutError:
                 result_box["error"] = "timeout"
+            except (ConnectionClosedError, OSError, AttributeError) as e:
+                # FIX-5: явно ловим disconnect mid-send + AttributeError
+                # (self._ws стал None между check и send из-за гонки) —
+                # детальный лог вместо generic Exception.
+                result_box["error"] = f"transport: {type(e).__name__}: {e}"
             except Exception as e:
                 result_box["error"] = repr(e)
             finally:
@@ -268,6 +288,11 @@ class BybitWsTrade:
 
         # ждём результата (max ~timeout + 0.5с запас)
         if not ack_event.wait(timeout + 0.5):
+            print(f"[BYBIT-WS] ack_event wait expired (req_id={req_id}) — REST fallback", flush=True)
+            return None
+
+        if "error" in result_box:
+            print(f"[BYBIT-WS] place_order failed ({result_box['error']}) — REST fallback", flush=True)
             return None
 
         if "ack" in result_box:
@@ -275,8 +300,10 @@ class BybitWsTrade:
             if not isinstance(ack, dict):
                 return None
             if ack.get("retCode", -1) != 0:
-                print(f"[BYBIT-WS] order rejected: {ack}", flush=True)
-                return None
+                # FIX-2: WS-канал сработал, Bybit ОТВЕТИЛ, но логически отверг ордер.
+                # REST с тем же payload вернёт ту же ошибку — поэтому raise, чтобы
+                # caller НЕ делал REST fallback (вместо тихого return None).
+                raise WSOrderRejected(ack)
             return ack
         return None
 
@@ -284,7 +311,9 @@ class BybitWsTrade:
 # ── удобные обёртки ──────────────────────────────────────────────
 
 _global_instance: BybitWsTrade | None = None
-_init_lock = threading.Lock()
+# FIX-11: переименовано из _init_lock — чтобы не путать с BybitWsTrade._instance_lock
+# (тот защищает создание объекта в .get(), а этот — модульный singleton).
+_global_instance_lock = threading.Lock()
 
 
 def init(api_key: str, api_secret: str) -> BybitWsTrade:
@@ -296,7 +325,7 @@ def init(api_key: str, api_secret: str) -> BybitWsTrade:
     _global_instance мог бы присвоиться дважды без этого lock).
     """
     global _global_instance
-    with _init_lock:
+    with _global_instance_lock:
         if _global_instance is None:
             _global_instance = BybitWsTrade.get(api_key, api_secret)
         return _global_instance
