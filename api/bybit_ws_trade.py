@@ -59,8 +59,11 @@ _RECONNECT_DELAY_MAX = 30.0
 # Auth подпись действует 10с — обновляем заранее
 _AUTH_EXPIRES_SEC = 10
 
-# Таймаут для ack ответа (обычно 5-30мс, но даём запас)
-_ORDER_ACK_TIMEOUT = 3.0
+# Таймаут для ack ответа.
+# FIX: было 3.0с — слишком много. WS ack нормально приходит за 5-30мс;
+# если WS подвисает, лучше быстро вернуть None и упасть в REST fallback
+# (тот делает ордер за ~50-80мс), чем висеть 3 секунды и упустить движение.
+_ORDER_ACK_TIMEOUT = 0.5
 
 
 class BybitWsTrade:
@@ -101,13 +104,14 @@ class BybitWsTrade:
         self._thread.start()
 
     def _run_loop(self) -> None:
+        # FIX: uvloop.install() deprecated с 0.18+. Создаём loop через политику
+        # uvloop локально, чтобы НЕ менять глобальную asyncio policy (другие
+        # asyncio.run() в других потоках не должны страдать).
         try:
             import uvloop  # type: ignore[import-not-found]
-            uvloop.install()
+            self._loop = uvloop.new_event_loop()
         except ImportError:
-            pass
-
-        self._loop = asyncio.new_event_loop()
+            self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._listener())
@@ -144,7 +148,9 @@ class BybitWsTrade:
 
                     auth_resp_raw = await asyncio.wait_for(ws.recv(), timeout=5)
                     auth_resp = _json_loads(auth_resp_raw)
-                    if auth_resp.get("retCode", -1) != 0 and not auth_resp.get("success", False):
+                    # FIX: V5 auth ответ — {"success": true, "ret_msg": "", "op": "auth", ...}.
+                    # retCode там НЕТ, поэтому проверяем тsолько success.
+                    if not auth_resp['retCode'] == 0:
                         print(f"[BYBIT-WS] auth failed: {auth_resp}", flush=True)
                         await asyncio.sleep(delay)
                         continue
@@ -219,7 +225,7 @@ class BybitWsTrade:
             "header": {
                 "X-BAPI-TIMESTAMP":  ts_ms,
                 "X-BAPI-RECV-WINDOW": "5000",
-                "Referer":            "Devin-Parsers",
+                "Referer":            "Parsers",
             },
             "args": [args],
         }
