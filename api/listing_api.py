@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+# ── listing_api.py ────────────────────────────────────────────────
+# Bybit (приоритет) + Gate.io (fallback) для лонгов при листингах.
+# Если токена нет на Bybit — открываем на Gate.io.
+# ─────────────────────────────────────────────────────────────────
+
+import re
+import threading
+
+from api.delist_api import (
+    _post,
+    _get_qty_step,
+    _round_qty,
+    get_price,
+    known_coins,
+    EXCLUDED_TOKENS,
+    price_updater,
+    warmup_bybit_connection,
+    preload_lot_steps,
+    QtyStepUnavailable,
+    LEVERAGE,
+)
+from api.gate_api import (
+    gate_get_price,
+    gate_open_long,
+    gate_set_tp_sl_long,
+    gate_price_updater,      # noqa: F401  — реэкспорт
+    gate_preload_lot_steps,  # noqa: F401  — реэкспорт
+    warmup_gate_connection,  # noqa: F401  — реэкспорт
+)
+
+__all__ = [
+    "market_open_long",
+    "set_tp_sl_long",
+    "calculate_margin_for_listing",
+    "find_listing_pairs",
+    "price_updater",
+    "gate_price_updater",
+    "warmup_bybit_connection",
+    "preload_lot_steps",
+    "gate_preload_lot_steps",
+    "warmup_gate_connection",
+    "get_price",
+]
+
+
+# ── Маржа ─────────────────────────────────────────────────────────
+
+def calculate_margin_for_listing() -> float:
+    """
+    Рассчитывает размер маржи для открытия позиции при листинге.
+    :return: float - размер маржи в USDT.
+    """
+    balance = 100
+    return balance * 0.14
+
+
+# ── Открытие лонга ────────────────────────────────────────────────
+
+# Биржа на которой открыта позиция — нужна для set_tp_sl_long
+_last_exchange: dict[str, str] = {}  # {ticker: "bybit" | "gate"}
+_last_exchange_lock = threading.Lock()
+
+
+def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float]:
+    """
+    Открывает рыночный лонг:
+      1. Bybit (приоритет — ниже комиссия)
+      2. Gate.io (fallback — если токена нет на Bybit)
+    :param ticker_name: str - тикер монеты (например "PRL").
+    :param usdt_amount: float - маржа в USDT.
+    :return: tuple[float, float] - (количество, цена входа), (0, 0) если нигде нет.
+    """
+    bybit_price = get_price(ticker_name)
+
+    if bybit_price:
+        symbol  = f"{ticker_name}USDT"
+        raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магия → константа
+
+        try:
+            step = _get_qty_step(symbol)
+        except QtyStepUnavailable as e:
+            # FIX: если шаг неизвестен — не открываем на Bybit, идём на Gate.io.
+            print(f"[QTY STEP MISSING BYBIT] {e} — пробуем Gate.io")
+            bybit_price = None
+        else:
+            amount_tokens = _round_qty(raw_qty, step)
+
+            if amount_tokens <= 0:
+                print(f"[QTY ZERO BYBIT] {symbol}")
+            else:
+                order_args = {
+                    "category":    "linear",
+                    "symbol":      symbol,
+                    "side":        "Buy",
+                    "orderType":   "Market",
+                    "qty":         str(amount_tokens),
+                    "positionIdx": 1,
+                }
+                # FIX-batch-5: WS Trade API → fallback REST.
+                placed_via = "REST"
+                ws_ack = None
+                try:
+                    from api.bybit_ws_trade import place_order_ws
+                    ws_ack = place_order_ws(order_args)
+                except Exception as e:
+                    print(f"[BYBIT-WS] не доступен ({e}) — используем REST")
+
+                if ws_ack is None:
+                    _post("/v5/order/create", order_args)
+                else:
+                    placed_via = "WS"
+
+                with _last_exchange_lock:
+                    _last_exchange[ticker_name] = "bybit"
+                print(f"[BYBIT LONG/{placed_via}] {symbol} | tokens={amount_tokens} | price≈{bybit_price}")
+                return amount_tokens, bybit_price
+
+    # ── Gate.io fallback ─────────────────────────────────────────
+    gate_price = gate_get_price(ticker_name)
+    if not gate_price:
+        print(f"[NO PRICE ANYWHERE] {ticker_name} — нет ни на Bybit ни на Gate.io")
+        return 0, 0
+
+    amount, fill_price = gate_open_long(ticker_name, usdt_amount)
+    if amount:
+        with _last_exchange_lock:
+            _last_exchange[ticker_name] = "gate"
+    return amount, fill_price
+
+
+# ── TP/SL для лонга ───────────────────────────────────────────────
+
+def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str:
+    """
+    Выставляет TP1 +5.5% на 30% + трейлинг 5.5% на 70% на Bybit.
+    :param ticker_name: str - тикер монеты.
+    :param entry_price: float - цена входа.
+    :param amount: float - количество токенов в позиции.
+    :return: str - результат.
+    """
+    symbol = f"{ticker_name}USDT"
+
+    try:
+        step = _get_qty_step(symbol)
+    except QtyStepUnavailable as e:
+        print(f"[TP/SL SKIP] {e}")
+        return "skip"
+
+    sl  = round(entry_price * 0.92, 8)   # -8%
+    tp1 = round(entry_price * 1.055, 8)  # +5.5%
+
+    # FIX: убрал неиспользуемую sl_size — Bybit /position/trading-stop ставит SL
+    # на ВСЮ позицию автоматически (без slSize), а TP1 на 30%, остальное под трейлинг.
+    tp1_size = str(_round_qty(amount * 0.30, step))  # 30% на TP1
+
+    # trailingStop = абсолютное расстояние в USDT от максимума до стопа.
+    trailing_distance = round(entry_price * 0.055, 8)
+
+    _post("/v5/position/trading-stop", {
+        "category":     "linear",
+        "symbol":       symbol,
+        "stopLoss":     str(sl),
+        "slTriggerBy":  "LastPrice",
+        "takeProfit":   str(tp1),
+        "tpTriggerBy":  "LastPrice",
+        "trailingStop": str(trailing_distance),
+        "tpslMode":     "Partial",
+        "tpSize":       tp1_size,
+        "positionIdx":  1,
+    })
+
+    print(f"[TP/SL SET LONG] {ticker_name} | SL={sl}(-8%) | TP1={tp1}(+5.5%/30%) | Trailing=5.5%(70%)")
+    return "Выставил цели (лонг)"
+
+
+def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
+    """
+    Роутер — выставляет TP/SL на той бирже где открыта позиция.
+    """
+    with _last_exchange_lock:
+        exchange = _last_exchange.get(ticker_name, "bybit")
+
+    if exchange == "gate":
+        return gate_set_tp_sl_long(ticker_name, entry_price, amount)
+    return _set_tp_sl_bybit(ticker_name, entry_price, amount)
+
+
+# ── Парсинг тикера из TG-сообщения ───────────────────────────────
+
+# Форматы:
+#   [UPBIT] $PRL listed on Upbit (KRW, BTC, USDT)
+#   [BITHUMB] $PRL listed on Bithumb
+_RE_LISTING_TG   = re.compile(r"\$([A-Z0-9]{2,10})\s+listed\s+on\s+(Upbit|Bithumb)", re.IGNORECASE)
+# FIX: поддержка тикеров с цифрами (1INCH, 1000PEPE)
+_RE_TICKER_PLAIN = re.compile(r"\b([A-Z0-9]{2,8})\b")
+
+
+def find_listing_pairs(text: str) -> list[str]:
+    """
+    Извлекает тикеры из сообщения о листинге.
+    Порядок поиска:
+      1. Явный формат "$TICKER listed on Upbit/Bithumb"
+      2. Fallback: заглавные слова, которые есть в known_coins (Bybit)
+    :param text: str - текст сообщения.
+    :return: list[str] - список тикеров.
+    """
+    # Метод 1: прямой паттерн TG-канала
+    matches = _RE_LISTING_TG.findall(text)
+    if matches:
+        tickers = list(dict.fromkeys(t.upper() for t, _ in matches))
+        print(f"[FIND LISTING] метод=TG-паттерн → {tickers}")
+        return tickers
+
+    # Метод 2: fallback по known_coins
+    text_upper = text.upper()
+    candidates = _RE_TICKER_PLAIN.findall(text_upper)
+    found = [
+        t for t in candidates
+        if t not in EXCLUDED_TOKENS
+        and 2 <= len(t) <= 8
+        and not t.isdigit()
+        and t in known_coins
+    ]
+    found = list(dict.fromkeys(found))
+    if found:
+        print(f"[FIND LISTING] метод=fallback(known_coins) → {found}")
+    else:
+        print(f"[FIND LISTING] ничего не найдено: {text[:80]}")
+    return found

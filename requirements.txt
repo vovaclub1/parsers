@@ -1,0 +1,29 @@
+# FIX: пины версий — без них при пересборке образа могут прилететь breaking changes.
+# Минимальные верхние границы блокируют только следующий major.
+
+# HTTP + Telegram
+requests>=2.31,<3
+urllib3>=1.26,<3
+aiohttp>=3.9,<4
+websockets>=12,<13
+python-dotenv>=1.0,<2
+
+# FIX-batch-1: speedups (drop-in)
+# uvloop      — asyncio event loop в 2-4x быстрее (Cython + libuv)
+# orjson      — JSON парсинг в 3-5x быстрее std json (Rust)
+# tgcrypto    — C-расширение AES для Telethon/Pyrogram, x10 быстрее decode
+uvloop>=0.19,<1
+orjson>=3.9,<4
+
+# Telegram clients
+telethon>=1.36,<2
+pyrogram>=2.0,<3
+tgcrypto>=1.2,<2
+pyTelegramBotAPI>=4.14,<5
+
+# Crypto
+ccxt>=4.2
+solders>=0.20
+base58>=2.1,<3
+hyperliquid-python-sdk>=0.7
+eth-account>=0.10

@@ -1,0 +1,57 @@
+services:
+  delist:
+    image: sseconddooption/delist
+    environment:
+      - PYTHONPATH=/Parsers
+      - PYTHONUNBUFFERED=1
+      - HEARTBEAT_FILE=/tmp/delist_heartbeat
+    volumes:
+      - /root/Parsers/.env:/Parsers/.env
+      - /root/Parsers/delist_session.session:/Parsers/delist_session.session
+    restart: always
+    # FIX: реальный healthcheck — проверяет что heartbeat-файл свежий (< 5мин).
+    # Парсер пишет touch(/tmp/delist_heartbeat) раз в минуту.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/delist_heartbeat && [ $$(($$(date +%s) - $$(stat -c %Y /tmp/delist_heartbeat))) -lt 300 ]"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    command: ["python", "-u", "parsers/parser_delist.py"]
+
+  listing:
+    image: sseconddooption/listing
+    environment:
+      - PYTHONPATH=/Parsers
+      - PYTHONUNBUFFERED=1
+      - HEARTBEAT_FILE=/tmp/listing_heartbeat
+    volumes:
+      - /root/Parsers/.env:/Parsers/.env
+      - /root/Parsers/listing_session.session:/Parsers/listing_session.session
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/listing_heartbeat && [ $$(($$(date +%s) - $$(stat -c %Y /tmp/listing_heartbeat))) -lt 300 ]"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    command: ["python", "-u", "parsers/parser_listing.py"]
+
+  # FIX: arbitrage был объявлен, но parser_arbitrage.py отсутствует в проекте.
+  # Раскомментируй после того как добавишь parsers/parser_arbitrage.py.
+  # arbitrage:
+  #   image: sseconddooption/arbitrage
+  #   environment:
+  #     - PYTHONPATH=/Parsers
+  #     - PYTHONUNBUFFERED=1
+  #     - HEARTBEAT_FILE=/tmp/arbitrage_heartbeat
+  #   volumes:
+  #     - /root/Parsers/.env:/Parsers/.env
+  #   restart: always
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "test -f /tmp/arbitrage_heartbeat && [ $$(($$(date +%s) - $$(stat -c %Y /tmp/arbitrage_heartbeat))) -lt 300 ]"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 60s
+  #   command: ["python", "-u", "parsers/parser_arbitrage.py"]
