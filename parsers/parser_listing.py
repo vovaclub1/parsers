@@ -481,11 +481,25 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None) 
 
     margin = calculate_margin_for_listing()
 
-    # FIX-PERF: submit ДО логирования. Открытие ордера — это hot-path,
-    # 4 print'а перед market_open_long добавляли ~2мс. Workers стартуют
-    # сразу, print'ы идут параллельно с уже запущенным market_open_long.
-    for coin in new_pairs:
-        _signal_executor.submit(worker, coin, margin, t_start, source)
+    # FIX-PERF: для single-coin (99% случаев) — inline-execute worker'а
+    # в caller-thread. Экономим thread hop через executor (1-3мс под GIL
+    # contention, что мы видели как разницу 12мс vs 27мс warm vs cold).
+    # Trade-off: caller (TG handler / poller-thread / TOA WS callback)
+    # блокируется на ~5-10мс на market_open_long. Это приемлемо:
+    #   • TG/TOA async loop: задержка следующего event'а ~10мс OK для
+    #     листингов раз в минуту;
+    #   • Upbit/Bithumb/Binance pollers: сдвиг следующего poll'а ~10мс
+    #     OK при 100мс/2500мс интервалах.
+    # На rare retry-path (price отсутствует, sleep 0.1с × до 2 раз) caller
+    # блокируется до 300мс — приемлемо, т.к. это означает что и так
+    # exchange не отвечает.
+    # Multi-coin (редко: одно сообщение про 2+ листинга) → executor для
+    # параллелизма.
+    if len(new_pairs) == 1:
+        worker(new_pairs[0], margin, t_start, source)
+    else:
+        for coin in new_pairs:
+            _signal_executor.submit(worker, coin, margin, t_start, source)
 
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("LISTING", f"[{source}] Новый листинг!")
@@ -1035,6 +1049,38 @@ if __name__ == "__main__":
     # после рестарта может повторно отстрелить уже отторгованную монету.
     _load_fired_state()
 
+    # FIX-PERF: pre-warm executors + chain warmup — ДО запуска поллеров и
+    # callback'ов. Иначе если poller сразу детектит новый тикер на старте,
+    # первый листинг попадает на cold-path (27мс наблюдалось).
+    #
+    # pre-warm executors: N=40 на каждый — submit-call тоже bytecode
+    # (LOAD_ATTR, CALL), специализируется в CPython adaptive interpreter
+    # после ~32 проходов.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(40)]
+    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(40)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor + _tp_sl_executor pre-warmed (40+40)")
+
+    # Chain warmup: прогрев всей Python-цепочки сигнал → ws.send.
+    # Без этого первый листинг платит +15-20мс на PEP-659 cold-specialization
+    # (CPython 3.12+, см. https://peps.python.org/pep-0659/).
+    # Что прогревается:
+    #   1. find_listing_pairs(sample_text) — регексы _RE_LISTING_TG и co.
+    #   2. market_open_long Python-путь (listing_api.warmup_chain) —
+    #      get_price, _get_qty_step, _round_qty, dict-build из 14 полей,
+    #      json.dumps, ws.send (диверсия в cancel-fake — никаких ордеров).
+    # ~600мс на бутстрапе → первый реальный листинг 5-9мс вместо 27мс cold.
+    try:
+        from api.listing_api import warmup_chain as _lst_warmup_chain
+        sample_signal = "[BITHUMB] $BTC listed on Bithumb"
+        for _ in range(30):
+            find_listing_pairs(sample_signal)
+        ok = _lst_warmup_chain(n=30)
+        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_long path×{ok}/30 ✓")
+    except Exception as e:  # noqa: BLE001
+        log_warn("PARSER", f"Chain warmup упал: {e!r} — первый листинг будет медленнее")
+
     # Регистрируем CoinListing-сигналы в общем дедупе (он шёл мимо).
     try:
         from api import coinlisting_ws as _cl_mod
@@ -1064,15 +1110,6 @@ if __name__ == "__main__":
     # FIX-PERF: единый фоновый L2-writer (dirty-flag + 1с batching) вместо
     # thread.start на каждый _mark_opened в hot-path.
     threading.Thread(target=_fired_persist_loop, daemon=True, name="fired-persist").start()
-
-    # FIX-PERF: pre-warm executors — ThreadPoolExecutor создаёт worker-thread
-    # лениво на первый submit (~3-5мс). На первом листинге не хотим платить
-    # этот налог. Сабмитим N=max_workers no-op задач, ждём их завершения.
-    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
-    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(4)]
-    for f in _warm:
-        f.result()
-    log_ok("PARSER", "_signal_executor (5) + _tp_sl_executor (4) pre-warmed")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:

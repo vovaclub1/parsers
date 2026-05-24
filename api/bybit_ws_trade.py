@@ -578,7 +578,7 @@ def place_order_ws(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | No
     return inst.place_order(args, timeout=timeout)
 
 
-def place_order_ws_fast(args: dict) -> dict | None:
+def place_order_ws_fast(args: dict, _warmup_mode: bool = False) -> dict | None:
     """
     FIX-PERF: fire-and-forget — возвращает после ws.send (без ack-wait).
     Снимает ~70-100мс RTT до Bybit из hot-path. Reject логируется в фоне.
@@ -588,10 +588,20 @@ def place_order_ws_fast(args: dict) -> dict | None:
          No cross-thread asyncio hop, ws.send из caller thread.
       2. Иначе → async WS (этот файл) — fallback.
       3. None → caller делает REST fallback.
+
+    _warmup_mode=True: вместо реального order.create отправляется cancel-fake
+    через inst.warmup() (тот же сетевой путь, никаких побочных эффектов).
+    Используется bootstrap'ом для PEP-659 specialization прогрева ВСЕЙ
+    цепочки market_open_long → _ws_place_order → ws.send без создания
+    реальных ордеров. На production callers'ах флаг всегда False.
     """
     # Быстрый check sync preferred. is_set атомарен, без локов.
     sync = _sync_preferred
     if sync is not None and sync.is_ready():
+        if _warmup_mode:
+            # Диверсия в cancel-fake — exercises тот же ws.send code path.
+            sync.warmup(timeout=0.5)
+            return {"sent": True, "reqId": "warmup-mode"}
         result = sync.place_order_fast(args)
         if result is not None:
             return result
@@ -602,6 +612,9 @@ def place_order_ws_fast(args: dict) -> dict | None:
     inst = _global_instance
     if inst is None:
         return None
+    if _warmup_mode:
+        inst.warmup(timeout=0.5)
+        return {"sent": True, "reqId": "warmup-mode"}
     return inst.place_order_fast(args)
 
 
