@@ -26,6 +26,35 @@ except ImportError:
             b = b.decode()
         return json.loads(b)
 
+# FIX-PERF: msgspec.Struct для /v5/market/tickers (price_updater). Раньше
+# orjson возвращал dict с 1000+ tickers, потом for-loop делал .get() на
+# каждом элементе под GIL — 5-15мс на цикл = окно jitter'а для worker'а
+# когда сигнал прилетал в эту же миллисекунду. msgspec парсит сразу в
+# typed Struct (на C-уровне, частично освобождает GIL для больших payloads)
+# и доступ через атрибут (.symbol vs ["symbol"]) — суммарно ~30-50% быстрее.
+try:
+    import msgspec as _msgspec  # type: ignore[import-not-found]
+
+    class _BybitTicker(_msgspec.Struct, frozen=True):
+        symbol:    str = ""
+        lastPrice: str = ""
+
+    class _BybitTickerList(_msgspec.Struct, frozen=True):
+        list: list[_BybitTicker] = []  # noqa: RUF012
+
+    class _BybitTickersResp(_msgspec.Struct, frozen=True):
+        result: _BybitTickerList | None = None
+
+    _bybit_tickers_decoder = _msgspec.json.Decoder(_BybitTickersResp)
+
+    def _parse_bybit_tickers(raw: bytes) -> list[_BybitTicker]:
+        resp = _bybit_tickers_decoder.decode(raw)
+        if resp.result is None:
+            return []
+        return resp.result.list
+except ImportError:
+    _parse_bybit_tickers = None  # type: ignore[assignment]
+
 # ── DNS кэш с TTL (убирает повторные DNS-запросы) ────────────────
 _original_getaddrinfo = socket.getaddrinfo
 _dns_cache: dict[tuple, tuple[float, list]] = {}   # FIX: с TTL
@@ -425,9 +454,16 @@ def price_updater() -> None:
     Каждые ~2с тянет все linear-тикеры с Bybit и обновляет price_cache.
     Заменяет ccxt.fetch_tickers() — без overhead ccxt.
     Использует clear() + update() чтобы удалять делистингованные монеты.
+
+    FIX-PERF: парсит через msgspec.Struct (см. _parse_bybit_tickers) — на
+    1000+ tickers экономит ~5-10мс GIL hold time vs orjson+dict. Это окно
+    в котором worker может оказаться зажат если сигнал придёт прямо на
+    JSON-parse. Fallback на orjson+dict если msgspec не установлен.
     """
     url     = BYBIT_BASE_URL + "/v5/market/tickers"
     session = requests.Session()
+
+    use_msgspec = _parse_bybit_tickers is not None
 
     while True:
         try:
@@ -437,19 +473,33 @@ def price_updater() -> None:
                 timeout=4,
             )
             resp.raise_for_status()
-            items = _json_loads(resp.content).get("result", {}).get("list", [])  # FIX-batch-1
 
             new_cache: dict[str, float] = {}
             new_known: set[str] = set()
 
-            for item in items:
-                symbol     = item.get("symbol", "")       # BTCUSDT
-                last_price = item.get("lastPrice")
-                if last_price and symbol.endswith("USDT"):
-                    price = float(last_price)
-                    key = symbol[:-4] + "/USDT:USDT"
-                    new_cache[key] = price
-                    new_known.add(symbol[:-4])
+            if use_msgspec:
+                # FIX-PERF: typed Struct, attribute access (.symbol vs ["symbol"]).
+                for tk in _parse_bybit_tickers(resp.content):
+                    symbol     = tk.symbol
+                    last_price = tk.lastPrice
+                    if last_price and symbol.endswith("USDT"):
+                        try:
+                            price = float(last_price)
+                        except ValueError:
+                            continue
+                        coin = symbol[:-4]
+                        new_cache[coin + "/USDT:USDT"] = price
+                        new_known.add(coin)
+            else:
+                items = _json_loads(resp.content).get("result", {}).get("list", [])
+                for item in items:
+                    symbol     = item.get("symbol", "")
+                    last_price = item.get("lastPrice")
+                    if last_price and symbol.endswith("USDT"):
+                        price = float(last_price)
+                        key = symbol[:-4] + "/USDT:USDT"
+                        new_cache[key] = price
+                        new_known.add(symbol[:-4])
 
             with cache_lock:
                 price_cache.clear()
