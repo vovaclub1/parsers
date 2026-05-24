@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import List, Optional
 from config.config import BYBIT_API_KEY, BYBIT_SECRET_KEY
 import requests
 
@@ -25,6 +25,39 @@ except ImportError:
         if isinstance(b, (bytes, bytearray)):
             b = b.decode()
         return json.loads(b)
+
+# FIX-PERF: msgspec.Struct для /v5/market/tickers (price_updater). Раньше
+# orjson возвращал dict с 1000+ tickers, потом for-loop делал .get() на
+# каждом элементе под GIL — 5-15мс на цикл = окно jitter'а для worker'а
+# когда сигнал прилетал в эту же миллисекунду. msgspec парсит сразу в
+# typed Struct (на C-уровне, частично освобождает GIL для больших payloads)
+# и доступ через атрибут (.symbol vs ["symbol"]) — суммарно ~30-50% быстрее.
+try:
+    import msgspec as _msgspec  # type: ignore[import-not-found]
+
+    class _BybitTicker(_msgspec.Struct, frozen=True):
+        symbol:    str = ""
+        lastPrice: str = ""
+
+    # Поле называется `list` (как в JSON), но в аннотации используем
+    # typing.List — иначе `from __future__ import annotations` превращает
+    # `list[_BybitTicker]` в строку, и msgspec при eval'е резолвит `list`
+    # в member_descriptor этого же поля (TypeError: not subscriptable).
+    class _BybitTickerList(_msgspec.Struct, frozen=True):
+        list: List[_BybitTicker] = []  # noqa: RUF012
+
+    class _BybitTickersResp(_msgspec.Struct, frozen=True):
+        result: _BybitTickerList | None = None
+
+    _bybit_tickers_decoder = _msgspec.json.Decoder(_BybitTickersResp)
+
+    def _parse_bybit_tickers(raw: bytes) -> list[_BybitTicker]:
+        resp = _bybit_tickers_decoder.decode(raw)
+        if resp.result is None:
+            return []
+        return resp.result.list
+except ImportError:
+    _parse_bybit_tickers = None  # type: ignore[assignment]
 
 # ── DNS кэш с TTL (убирает повторные DNS-запросы) ────────────────
 _original_getaddrinfo = socket.getaddrinfo
@@ -277,6 +310,92 @@ post_order = _post_order
 new_order_link_id = _new_order_link_id
 
 
+# httpx-клиент с HTTP/2 для не-hot-path запросов (TP/SL trading-stop).
+# Мультиплексирует параллельные _post через один TLS-stream → 3 параллельных
+# TP-постановки идут одной connection-pool записью без повторных handshake.
+# Lazy init: создаётся при первом обращении (httpx опциональная зависимость).
+_httpx_client = None  # type: ignore[var-annotated]
+_httpx_lock = threading.Lock()
+
+
+def _get_httpx_client():
+    """
+    Возвращает httpx.Client(http2=True) или None если httpx не установлен.
+    Singleton, переиспользует connection-pool до Bybit.
+    """
+    global _httpx_client
+    if _httpx_client is not None:
+        return _httpx_client
+    with _httpx_lock:
+        if _httpx_client is not None:
+            return _httpx_client
+        try:
+            import httpx  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+        try:
+            _httpx_client = httpx.Client(
+                http2=True,
+                timeout=httpx.Timeout(3.0, connect=2.0),
+                limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+                headers={
+                    "Content-Type":       "application/json",
+                    "X-BAPI-API-KEY":     BYBIT_API_KEY,
+                    "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+                },
+            )
+            print("[BYBIT-HTTP2] httpx http2-client готов")
+            return _httpx_client
+        except Exception as e:  # noqa: BLE001
+            print(f"[BYBIT-HTTP2] init упал: {e!r} — будет requests fallback")
+            return None
+
+
+def _post_http2(endpoint: str, params: dict, retries: int = 2) -> dict:
+    """
+    HTTP/2 версия _post — мультиплексирует параллельные TP-постановки.
+    Если httpx недоступен / connection broken → graceful fallback на _post.
+    """
+    client = _get_httpx_client()
+    if client is None:
+        return _post(endpoint, params, retries=retries)
+
+    body_str = json.dumps(params, separators=(",", ":"))
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        ts = str(int(time.time() * 1000))
+        sign = _sign(ts, body_str)
+        try:
+            resp = client.post(
+                BYBIT_BASE_URL + endpoint,
+                content=body_str,
+                headers={"X-BAPI-TIMESTAMP": ts, "X-BAPI-SIGN": sign},
+            )
+            resp.raise_for_status()
+            data = _json_loads(resp.content)
+            ret_code = data.get("retCode", -1)
+            if ret_code != 0:
+                raise RuntimeError(
+                    f"Bybit error retCode={ret_code} msg={data.get('retMsg')} params={params}"
+                )
+            return data
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if attempt < retries:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            # Последний шанс: попробуем через requests, если httpx стрельнул
+            # transport-ошибкой. Только если это похоже на сетевой fault.
+            try:
+                return _post(endpoint, params, retries=0)
+            except Exception:
+                pass
+            raise
+
+    assert last_exc is not None
+    raise last_exc
+
+
 def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
     """
     Общий подписанный POST к Bybit V5 (для TP/SL и других не-ордер запросов).
@@ -339,9 +458,16 @@ def price_updater() -> None:
     Каждые ~2с тянет все linear-тикеры с Bybit и обновляет price_cache.
     Заменяет ccxt.fetch_tickers() — без overhead ccxt.
     Использует clear() + update() чтобы удалять делистингованные монеты.
+
+    FIX-PERF: парсит через msgspec.Struct (см. _parse_bybit_tickers) — на
+    1000+ tickers экономит ~5-10мс GIL hold time vs orjson+dict. Это окно
+    в котором worker может оказаться зажат если сигнал придёт прямо на
+    JSON-parse. Fallback на orjson+dict если msgspec не установлен.
     """
     url     = BYBIT_BASE_URL + "/v5/market/tickers"
     session = requests.Session()
+
+    use_msgspec = _parse_bybit_tickers is not None
 
     while True:
         try:
@@ -351,19 +477,33 @@ def price_updater() -> None:
                 timeout=4,
             )
             resp.raise_for_status()
-            items = _json_loads(resp.content).get("result", {}).get("list", [])  # FIX-batch-1
 
             new_cache: dict[str, float] = {}
             new_known: set[str] = set()
 
-            for item in items:
-                symbol     = item.get("symbol", "")       # BTCUSDT
-                last_price = item.get("lastPrice")
-                if last_price and symbol.endswith("USDT"):
-                    price = float(last_price)
-                    key = symbol[:-4] + "/USDT:USDT"
-                    new_cache[key] = price
-                    new_known.add(symbol[:-4])
+            if use_msgspec:
+                # FIX-PERF: typed Struct, attribute access (.symbol vs ["symbol"]).
+                for tk in _parse_bybit_tickers(resp.content):
+                    symbol     = tk.symbol
+                    last_price = tk.lastPrice
+                    if last_price and symbol.endswith("USDT"):
+                        try:
+                            price = float(last_price)
+                        except ValueError:
+                            continue
+                        coin = symbol[:-4]
+                        new_cache[coin + "/USDT:USDT"] = price
+                        new_known.add(coin)
+            else:
+                items = _json_loads(resp.content).get("result", {}).get("list", [])
+                for item in items:
+                    symbol     = item.get("symbol", "")
+                    last_price = item.get("lastPrice")
+                    if last_price and symbol.endswith("USDT"):
+                        price = float(last_price)
+                        key = symbol[:-4] + "/USDT:USDT"
+                        new_cache[key] = price
+                        new_known.add(symbol[:-4])
 
             with cache_lock:
                 price_cache.clear()
@@ -595,11 +735,12 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
 
     def _place_tp(tp_price: str, tp_size: str) -> None:
         """
-        Выставляет один уровень TP через trading-stop.
+        Выставляет один уровень TP через trading-stop (http/2 — мультиплекс
+        3 параллельных TP-постановок через 1 connection).
         :param tp_price: str - цена тейк-профита.
         :param tp_size: str - размер в токенах.
         """
-        _post("/v5/position/trading-stop", {
+        _post_http2("/v5/position/trading-stop", {
             "category":    "linear",
             "symbol":      symbol,
             "takeProfit":  tp_price,
@@ -609,8 +750,8 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
             "positionIdx": 2,
         })
 
-    # SL ставим отдельно (один на всю позицию)
-    _post("/v5/position/trading-stop", {
+    # SL ставим отдельно (один на всю позицию).
+    _post_http2("/v5/position/trading-stop", {
         "category":    "linear",
         "symbol":      symbol,
         "stopLoss":    str(sl),
@@ -763,3 +904,46 @@ def warmup_bybit_connection() -> None:
         print("[WARMUP] Bybit соединение прогрето")
     except Exception as e:
         print(f"[WARMUP ERROR] {e}")
+
+
+# ── TLS heartbeat: держим pool горячим ───────────────────────────
+# Если между ордерами проходит > ~90с (keep-alive idle timeout), connection
+# в пуле закроется, и следующий ордер заплатит полный TCP+TLS handshake
+# (15-30мс из Singapore). Heartbeat-поток шлёт лёгкий /v5/market/time каждые
+# 8с — переиспользует тот же _bybit_session.pool, держит socket hot.
+# Win: гарантированно 0 handshake на сигнале.
+_HEARTBEAT_INTERVAL = 8.0
+
+
+def _bybit_heartbeat_loop() -> None:
+    """Бесконечный keep-alive heartbeat к Bybit. Запускается из main bootstrap."""
+    while True:
+        try:
+            _bybit_session.get(BYBIT_BASE_URL + "/v5/market/time", timeout=3)
+        except Exception:
+            # Глотаем — сеть могла мигнуть, следующий цикл попробует снова.
+            pass
+        time.sleep(_HEARTBEAT_INTERVAL)
+
+
+_heartbeat_thread: threading.Thread | None = None
+_heartbeat_lock = threading.Lock()
+
+
+def start_bybit_heartbeat() -> None:
+    """
+    Запускает фоновый heartbeat (один раз, idempotent). Безопасно вызывать
+    из bootstrap'а — повторные вызовы no-op.
+    """
+    global _heartbeat_thread
+    with _heartbeat_lock:
+        if _heartbeat_thread is not None and _heartbeat_thread.is_alive():
+            return
+        t = threading.Thread(
+            target=_bybit_heartbeat_loop,
+            daemon=True,
+            name="bybit-tls-heartbeat",
+        )
+        t.start()
+        _heartbeat_thread = t
+        print(f"[WARMUP] Bybit TLS-heartbeat запущен ({_HEARTBEAT_INTERVAL:.0f}с интервал)")

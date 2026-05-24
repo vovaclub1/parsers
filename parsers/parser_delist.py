@@ -25,6 +25,48 @@ except ImportError:  # graceful fallback
             b = b.decode()
         return _stdjson.loads(b)
 
+# msgspec — schema-based парсинг Binance article-list ответа (~5-20KB).
+# Вместо json → dict → field-access используем typed Struct: парсер сразу
+# проходит структуру и валидирует поля (≈2-3x быстрее orjson+dict для
+# структурированных ответов). Fallback на _json_loads если msgspec не
+# установлен — поведение бит-в-бит совпадает.
+try:
+    import msgspec as _msgspec  # type: ignore[import-not-found]
+
+    class _BinanceArticle(_msgspec.Struct, frozen=True):
+        id:    int | None = None
+        code:  str | None = None
+        title: str | None = ""
+
+    class _BinanceCatalog(_msgspec.Struct, frozen=True):
+        articles: list[_BinanceArticle] = []  # noqa: RUF012 — msgspec Struct field
+
+    class _BinanceData(_msgspec.Struct, frozen=True):
+        articles: list[_BinanceArticle] | None = None
+        catalogs: list[_BinanceCatalog] | None = None
+
+    class _BinanceResp(_msgspec.Struct, frozen=True):
+        data: _BinanceData | None = None
+
+    _binance_decoder = _msgspec.json.Decoder(_BinanceResp)
+
+    def _parse_binance_articles(raw: bytes) -> list[dict]:
+        """Возвращает список dict'ов с ключами id/code/title для совместимости
+        с process_article (он работает на dict-API)."""
+        resp = _binance_decoder.decode(raw)
+        if resp.data is None:
+            return []
+        if resp.data.articles:
+            return [{"id": a.id, "code": a.code, "title": a.title or ""}
+                    for a in resp.data.articles]
+        if resp.data.catalogs:
+            first = resp.data.catalogs[0]
+            return [{"id": a.id, "code": a.code, "title": a.title or ""}
+                    for a in first.articles]
+        return []
+except ImportError:  # graceful fallback на orjson-путь
+    _parse_binance_articles = None  # type: ignore[assignment]
+
 from config.config import (
     TG_API_ID, TG_API_HASH, DELIST_PROXIES, SESSION_DIR,
     EXTRA_DELIST_CHANNELS, parse_channels,    # FIX-batch-3: multi-channel
@@ -39,6 +81,7 @@ from api.delist_api import (
     set_tp_sl,
     market_open_short,
     warmup_bybit_connection,
+    start_bybit_heartbeat,
     preload_lot_steps,
     gate_price_updater,
     gate_preload_lot_steps,
@@ -371,17 +414,16 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             open_ms = (time.perf_counter() - t_start) * 1000
             log_ok("OPEN", f"[{source}] {coin} | ордер открыт за {BOLD}{open_ms:.0f}мс{RESET}{GREEN}")
 
-            threading.Thread(
-                target=set_tp_sl,
-                args=(coin, entry_price, amount),
-                daemon=True,
-            ).start()
+            # FIX-PERF: preheated pool → submit ~5-20мкс вместо thread.start
+            # ~3-15мс под GIL contention.
+            _tp_sl_executor.submit(set_tp_sl, coin, entry_price, amount)
 
             elapsed_ms = (time.perf_counter() - t_start) * 1000
             log_ok("SHORT", (
                 f"[{source}] {coin} | entry={entry_price} | amount={amount:.4f} | "
                 f"время от статьи до ордера: {BOLD}{elapsed_ms:.0f}мс{RESET}{GREEN}"
             ))
+            # FIX-PERF: tg_log fire-and-forget (см. tg/tg_logger.py).
             tg_log(
                 f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {elapsed_ms:.0f}мс")
             return
@@ -415,6 +457,10 @@ def _on_toa_delist(full_text: str, t_start: float) -> None:
 # `with ThreadPoolExecutor(...)` создавал новый пул на каждый сигнал, а
 # __exit__ блокировал до завершения всех worker'ов — +5-15мс overhead.
 _signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="delist-signal")
+
+# FIX-PERF: отдельный preheated pool для set_tp_sl. Замена thread.start
+# (~3-15мс под GIL contention) на submit (~5-20мкс) в hot-path после OPEN.
+_tp_sl_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="delist-tpsl")
 
 
 def process_signal(pairs: list[str], source: str, t_start: float) -> None:
@@ -609,12 +655,19 @@ def poller(session_idx: int) -> None:
                     age = resp.headers.get("Age", "?")
                     log_info("POLLER", f"[{label}] X-Cache={xc} Age={age}")
 
-                # FIX-batch-1: orjson вместо resp.json() (3-5x быстрее на Binance ответах ~5-20KB).
-                data     = _json_loads(resp.content).get("data", {})
-                # FIX: catalogs может вернуться как [] — старый код data.get("catalogs", [{}])[0]
-                # падал с IndexError, потому что default срабатывал только при отсутствии ключа.
-                catalogs = data.get("catalogs") or [{}]
-                articles = data.get("articles") or (catalogs[0].get("articles", []) if isinstance(catalogs[0], dict) else [])
+                # msgspec.Struct fast-path — типизированный decoder в 2-3x
+                # быстрее orjson+dict при той же логике извлечения.
+                if _parse_binance_articles is not None:
+                    articles = _parse_binance_articles(resp.content)
+                else:
+                    # FIX-batch-1: orjson — fallback (3-5x быстрее std json на ~5-20KB).
+                    data     = _json_loads(resp.content).get("data", {})
+                    # FIX: catalogs может вернуться как [] — старый код data.get("catalogs", [{}])[0]
+                    # падал с IndexError, потому что default срабатывал только при отсутствии ключа.
+                    catalogs = data.get("catalogs") or [{}]
+                    articles = data.get("articles") or (
+                        catalogs[0].get("articles", []) if isinstance(catalogs[0], dict) else []
+                    )
 
                 # Обновляем watchdog timestamp + успешный ответ — пробуем сбросить backoff
                 with _poller_ts_lock:
@@ -849,12 +902,18 @@ if __name__ == "__main__":
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
 
-    # FIX-PERF: дефолтный switchinterval = 5мс — это до 5мс jitter на
-    # каждом cross-thread context switch'е (handler → executor → bybit-ws).
-    # 1мс — компромисс между latency и CPU-нагрузкой для I/O-bound кода.
-    import sys
-    sys.setswitchinterval(0.001)
-    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
+    # NOTE: switchinterval оставлен дефолтный (5мс). См. parser_listing.py
+    # для деталей: 1мс эмпирически давал регрессию p50 на trade-открытии
+    # из-за избыточного GIL pingpong'а между handler/WS-loop/worker thread'ами.
+
+    # FIX-PERF: только gc.freeze() — module-level объекты выезжают в
+    # permanent gen и не сканируются. Дефолтные thresholds=(700, 10, 10)
+    # оставляем: каждый gen0 sweep остаётся в десятках микросекунд.
+    # Подъём порога до 50k превращал паузы в редкие, но крупные (3-15мс)
+    # stop-the-world окна — p99 регрессия для hot-path.
+    import gc
+    gc.freeze()
+    print(f"[BOOT] GC frozen: {gc.get_freeze_count()} objects (thresholds={gc.get_threshold()})")
 
     # ── Прогрев бирж ─────────────────────────────────────────────
     threading.Thread(target=price_updater,      daemon=True).start()
@@ -865,14 +924,23 @@ if __name__ == "__main__":
     warmup_gate_connection()
     preload_lot_steps()
     gate_preload_lot_steps()
+    start_bybit_heartbeat()
 
     # FIX-batch-5: инициализация Bybit V5 WS Trade (persistent connection).
     if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
         try:
-            from api.bybit_ws_trade import init as bybit_ws_init
+            from api.bybit_ws_trade import init as bybit_ws_init, start_periodic_warmup
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
             if inst.is_ready(wait_sec=3.0):
-                log_ok("PARSER", "Bybit WS Trade готов ✓ (−30...−80мс на ордер)")
+                # FIX-PERF: прогреваем РЕАЛЬНЫЙ hot-path через benign
+                # op:order.cancel на несуществующий orderId (без бокового
+                # эффекта). См. parser_listing.py.
+                if inst.warmup():
+                    log_ok("PARSER", "Bybit WS Trade готов + прогрет ✓")
+                else:
+                    log_ok("PARSER", "Bybit WS Trade готов ✓ (warmup не прошёл, не критично)")
+                # Периодический прогрев каждые ~45с.
+                start_periodic_warmup()
             else:
                 log_warn("PARSER", "Bybit WS Trade не успел подключиться за 3с — fallback на REST до коннекта")
         except Exception as e:
@@ -904,12 +972,13 @@ if __name__ == "__main__":
     # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
 
-    # FIX-PERF: pre-warm executor — иначе первый submit платит ~3-5мс
+    # FIX-PERF: pre-warm executors — иначе первый submit платит ~3-5мс
     # на создание worker-thread'а.
     _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
+    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(4)]
     for f in _warm:
         f.result()
-    log_ok("PARSER", "_signal_executor pre-warmed")
+    log_ok("PARSER", "_signal_executor (5) + _tp_sl_executor (4) pre-warmed")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:

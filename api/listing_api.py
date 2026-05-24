@@ -10,8 +10,9 @@ import threading
 
 from api.delist_api import (
     _post,
-    post_order,            # FIX-10: публичный алиас вместо _post_order
-    new_order_link_id,     # FIX-10: публичный алиас вместо _new_order_link_id
+    _post_http2,             # FIX: HTTP/2 client для background TP/SL
+    post_order,              # FIX-10: публичный алиас вместо _post_order
+    new_order_link_id,       # FIX-10: публичный алиас вместо _new_order_link_id
     _get_qty_step,
     _round_qty,
     get_price,
@@ -19,6 +20,7 @@ from api.delist_api import (
     EXCLUDED_TOKENS,
     price_updater,
     warmup_bybit_connection,
+    start_bybit_heartbeat,   # FIX: TLS pool heartbeat
     preload_lot_steps,
     QtyStepUnavailable,
     LEVERAGE,
@@ -54,6 +56,7 @@ __all__ = [
     "price_updater",
     "gate_price_updater",
     "warmup_bybit_connection",
+    "start_bybit_heartbeat",
     "preload_lot_steps",
     "gate_preload_lot_steps",
     "warmup_gate_connection",
@@ -111,6 +114,15 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 # дубль с retCode 30050, защита от double-position при WS
                 # ack timeout (см. post_order в delist_api).
                 order_link_id = new_order_link_id()
+                # Bundle SL + TP1 в order.create — failsafe stop loss попадает
+                # на сервер в одной WS-фрейме с открытием, без зависимости от
+                # отдельного /v5/position/trading-stop (который добавляет
+                # trailing уже в фоне). Если open-frame пройдёт, а trading-stop
+                # задержится — SL уже стоит. trailingStop в order.create
+                # Bybit'ом не поддерживается, поэтому ставится отдельно.
+                sl_price  = round(bybit_price * 0.92, 8)   # -8%
+                tp1_price = round(bybit_price * 1.045, 8)  # +4.5%
+                tp1_qty   = _round_qty(amount_tokens * 0.30, step)
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
@@ -119,6 +131,12 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                     "qty":         qty_str,
                     "positionIdx": 1,
                     "orderLinkId": order_link_id,
+                    "stopLoss":    str(sl_price),
+                    "slTriggerBy": "LastPrice",
+                    "takeProfit":  str(tp1_price),
+                    "tpTriggerBy": "LastPrice",
+                    "tpslMode":    "Partial",
+                    "tpSize":      str(tp1_qty),
                 }
                 # FIX-PERF: WS Trade fire-and-forget (place_order_ws_fast).
                 # Возврат не-None означает «frame ушёл на провод»; ack от
@@ -170,11 +188,14 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
 
 def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет TP1 +5.5% на 30% + трейлинг 5.5% на 70% на Bybit.
-    :param ticker_name: str - тикер монеты.
-    :param entry_price: float - цена входа.
-    :param amount: float - количество токенов в позиции.
-    :return: str - результат.
+    Добавляет trailing stop 3.5% на 70% позиции на Bybit. SL (-8%) и
+    TP1 (+4.5% на 30%) уже выставлены в момент открытия — они летят
+    в одном WS-фрейме с order.create (см. market_open_long). Эта функция
+    только добавляет trailing (Bybit не поддерживает trailingStop в
+    order.create — только через /v5/position/trading-stop).
+
+    Если open прошёл через REST fallback и не нёс SL/TP — повторно
+    выставляем их через trading-stop здесь же (idempotent).
     """
     symbol = f"{ticker_name}USDT"
 
@@ -184,17 +205,16 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
         print(f"[TP/SL SKIP] {e}")
         return "skip"
 
-    sl  = round(entry_price * 0.92, 8)   # -8%
-    tp1 = round(entry_price * 1.055, 8)  # +5.5%
+    sl  = round(entry_price * 0.92, 8)    # -8%
+    tp1 = round(entry_price * 1.045, 8)   # +4.5%
 
-    # FIX: убрал неиспользуемую sl_size — Bybit /position/trading-stop ставит SL
-    # на ВСЮ позицию автоматически (без slSize), а TP1 на 30%, остальное под трейлинг.
     tp1_size = str(_round_qty(amount * 0.30, step))  # 30% на TP1
 
     # trailingStop = абсолютное расстояние в USDT от максимума до стопа.
-    trailing_distance = round(entry_price * 0.055, 8)
+    # 3.5% — потуже чем было (5.5%), чтобы меньше отдавать с пика.
+    trailing_distance = round(entry_price * 0.035, 8)
 
-    _post("/v5/position/trading-stop", {
+    _post_http2("/v5/position/trading-stop", {
         "category":     "linear",
         "symbol":       symbol,
         "stopLoss":     str(sl),
@@ -207,7 +227,7 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
         "positionIdx":  1,
     })
 
-    print(f"[TP/SL SET LONG] {ticker_name} | SL={sl}(-8%) | TP1={tp1}(+5.5%/30%) | Trailing=5.5%(70%)")
+    print(f"[TP/SL SET LONG] {ticker_name} | SL={sl}(-8%) | TP1={tp1}(+4.5%/30%) | Trailing=3.5%(70%)")
     return "Выставил цели (лонг)"
 
 
