@@ -91,6 +91,22 @@ def _purge_expired_cooldown(now: float | None = None) -> None:
 _pending_tasks: set[asyncio.Task] = set()
 
 
+def _retire_task(task: "asyncio.Task") -> None:
+    """
+    done_callback для fire-and-forget create_task'ов. Убирает из множества
+    pending'ов и РЕТРИВИТ exception() — иначе asyncio печатает
+    "Future exception was never retrieved" при GC Future-объекта. Например,
+    `_handle()` может упасть на gaierror внутри `_parse_tokens_from_article_fast`
+    в момент DNS-flap'а на старте.
+    """
+    _pending_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log_err("WS", f"handler crashed: {exc!r}")
+
+
 # ── HTTP Session ─────────────────────────────────────────────────
 _http_session: aiohttp.ClientSession | None = None
 # FIX: без локa два listener'а (SEOUL/TOKYO) могли одновременно увидеть
@@ -408,10 +424,13 @@ async def _listen(url: str, label: str) -> None:
                     except Exception:
                         continue
 
-                    # FIX: храним reference на task чтобы GC не убил
+                    # FIX: храним reference на task чтобы GC не убил.
+                    # _retire_task ретривит исключение — иначе при падении
+                    # _handle (например gaierror в article-parse при DNS flap'е)
+                    # asyncio печатает "Future exception was never retrieved".
                     task = asyncio.create_task(_handle(msg))
                     _pending_tasks.add(task)
-                    task.add_done_callback(_pending_tasks.discard)
+                    task.add_done_callback(_retire_task)
 
         except ConnectionClosedError as e:
             log_warn("WS", f"{label} disconnected {e.code} — reconnect через {delay:.0f}с")

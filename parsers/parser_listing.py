@@ -953,20 +953,16 @@ if __name__ == "__main__":
     sys.setswitchinterval(0.001)
     print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
 
-    # FIX-PERF: GC tuning. Дефолт thresholds=(700, 10, 10) триггерит gen0
-    # сбор каждые ~700 новых объектов — в hot-path может прийтись на ws.send
-    # и добавить 0.5-5мс паузы. Поднимаем до (50000, 10, 10): gen0 редко,
-    # gen1/gen2 контролирует утечки. Сам по себе worker аллоцирует мало
-    # объектов (несколько str + dict), 50k порог нормально для часов работы.
+    # FIX-PERF: только gc.freeze() — все module-level объекты (regex,
+    # imported classes, globals) переезжают в permanent gen и больше не
+    # сканируются ни на одном GC-цикле. Дефолтные thresholds=(700, 10, 10)
+    # оставляем: gen0 sweep каждые ~700 аллокаций обходит горстку объектов
+    # за десятки микросекунд. Подъём порога до 50k делал sweep'ы редкими,
+    # но КАЖДЫЙ ИЗ НИХ стал ~3-15мс stop-the-world — это p99 регрессия
+    # для hot-path (зафиксировано: 33мс trade vs 9мс на default'ах).
     import gc
-    gc.set_threshold(50000, 10, 10)
-    # gc.freeze() — перемещает все текущие tracked объекты в "permanent"
-    # генерацию, которая никогда не сканируется. После загрузки всех модулей
-    # это десятки тысяч объектов (module globals, regex compiled patterns,
-    # imported classes), которые GC иначе перебирал бы на каждом цикле.
-    # После freeze GC сканирует только новое (runtime allocations).
     gc.freeze()
-    print(f"[BOOT] GC tuned: thresholds={gc.get_threshold()}, frozen={gc.get_freeze_count()} objects")
+    print(f"[BOOT] GC frozen: {gc.get_freeze_count()} objects (thresholds={gc.get_threshold()})")
 
     threading.Thread(target=price_updater,      daemon=True).start()
     threading.Thread(target=gate_price_updater, daemon=True).start()
