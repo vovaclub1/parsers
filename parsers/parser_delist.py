@@ -476,10 +476,15 @@ def process_signal(pairs: list[str], source: str, t_start: float) -> None:
 
     margin = calculate_margin_for_delist()
 
-    # FIX-PERF: submit ДО логирования — открытие ордера в hot-path,
-    # print/log идут параллельно с уже запущенным market_open_short.
-    for coin in new_pairs:
-        _signal_executor.submit(worker, coin, margin, t_start, source)
+    # FIX-PERF: для single-coin (99%) — inline worker, экономим executor
+    # hop (~1-3мс под GIL contention). Multi-coin → executor для параллелизма.
+    # Trade-off: caller блокируется на ~5-10мс на market_open_short.
+    # Подробности — см. parser_listing.process_signal.
+    if len(new_pairs) == 1:
+        worker(new_pairs[0], margin, t_start, source)
+    else:
+        for coin in new_pairs:
+            _signal_executor.submit(worker, coin, margin, t_start, source)
 
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("DELIST", f"[{source}] Новый делистинг!")
@@ -971,6 +976,26 @@ if __name__ == "__main__":
     log_ok("PARSER", "Ждём 5с пока price_cache наполнится...")
     time.sleep(5)
 
+    # FIX-PERF: pre-warm + chain warmup ДО запуска поллеров. Иначе если
+    # poller сразу детектит свежую статью на старте — первый делистинг
+    # попадает на cold-path (видели 27мс на listing'е аналогично).
+    # См. parser_listing.py для деталей PEP-659 motivation.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(40)]
+    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(40)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor + _tp_sl_executor pre-warmed (40+40)")
+
+    try:
+        from api.delist_api import warmup_chain as _del_warmup_chain
+        sample_signal = "Binance Will Delist BTC"
+        for _ in range(30):
+            find_pairs(sample_signal)
+        ok = _del_warmup_chain(n=30)
+        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_short path×{ok}/30 ✓")
+    except Exception as e:  # noqa: BLE001
+        log_warn("PARSER", f"Chain warmup упал: {e!r} — первый делистинг будет медленнее")
+
     tg_log(f"🚀 <b>DELIST парсер запущен</b>\nПоллеры: {len(_sessions)}\nБиржи: Bybit + Gate.io (fallback)")
     log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами")
 
@@ -991,14 +1016,6 @@ if __name__ == "__main__":
 
     # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
-
-    # FIX-PERF: pre-warm executors — иначе первый submit платит ~3-5мс
-    # на создание worker-thread'а.
-    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
-    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(4)]
-    for f in _warm:
-        f.result()
-    log_ok("PARSER", "_signal_executor (5) + _tp_sl_executor (4) pre-warmed")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:

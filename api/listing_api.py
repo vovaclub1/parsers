@@ -42,7 +42,7 @@ try:
     from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
-    def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
+    def _ws_place_order(args: dict, _warmup_mode: bool = False) -> dict | None:  # type: ignore[misc]
         return None
     class WSOrderRejected(Exception):  # type: ignore[no-redef]
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
@@ -182,6 +182,82 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
         with _last_exchange_lock:
             _last_exchange[ticker_name] = "gate"
     return amount, fill_price
+
+
+# ── Chain warmup (PEP-659 specialization) ────────────────────────
+# Прогрев CPython adaptive interpreter'а: первый запуск любого
+# bytecode'а до specialization ~1.5-3x медленнее. На market_open_long
+# с её 14-полевым dict, function-call'ами get_price/_get_qty_step/
+# _round_qty/uuid это даёт +5-15мс на ПЕРВОМ листинге vs warm.
+# Прогоняем тот же путь N раз с диверсией финального ws.send в
+# cancel-fake (через _warmup_mode=True в place_order_ws_fast).
+
+def warmup_chain(n: int = 30) -> int:
+    """
+    Прогоняет ТОТ ЖЕ Python-путь, что и market_open_long, N раз —
+    без создания реальных ордеров. Возвращает число успешных итераций.
+
+    Прогревает:
+      • get_price → cache.get
+      • f-string symbol build
+      • _get_qty_step
+      • _round_qty (с Decimal precision cache)
+      • new_order_link_id (uuid4)
+      • round(price * coef, 8) — SL/TP вычисления
+      • dict-литерал из 14 полей (CPython BUILD_MAP)
+      • _ws_place_order routing → sync.warmup() (cancel-fake)
+      • json.dumps + ws.send (через warmup'овский payload)
+
+    BTC выбран потому что:
+      • Всегда в price_cache
+      • Шаг лота preloaded
+      • amount_tokens > 0 при margin=14 USDT
+    """
+    sample_ticker = "BTC"
+    sample_margin = 14.0
+    symbol = f"{sample_ticker}USDT"
+    ok = 0
+
+    for _ in range(n):
+        try:
+            bybit_price = get_price(sample_ticker)
+            if not bybit_price:
+                continue
+            raw_qty = (sample_margin / bybit_price) * LEVERAGE
+            try:
+                step = _get_qty_step(symbol)
+            except QtyStepUnavailable:
+                continue
+            amount_tokens = _round_qty(raw_qty, step)
+            if amount_tokens <= 0:
+                continue
+            qty_str = str(amount_tokens)
+            order_link_id = new_order_link_id()
+            sl_price  = round(bybit_price * 0.92, 8)
+            tp1_price = round(bybit_price * 1.045, 8)
+            tp1_qty   = _round_qty(amount_tokens * 0.30, step)
+            order_args = {
+                "category":    "linear",
+                "symbol":      symbol,
+                "side":        "Buy",
+                "orderType":   "Market",
+                "qty":         qty_str,
+                "positionIdx": 1,
+                "orderLinkId": order_link_id,
+                "stopLoss":    str(sl_price),
+                "slTriggerBy": "LastPrice",
+                "takeProfit":  str(tp1_price),
+                "tpTriggerBy": "LastPrice",
+                "tpslMode":    "Partial",
+                "tpSize":      str(tp1_qty),
+            }
+            # _warmup_mode=True → диверсия в cancel-fake. Никакого ордера.
+            _ws_place_order(order_args, _warmup_mode=True)
+            ok += 1
+        except Exception:  # noqa: BLE001
+            # Все ошибки игнорим — warmup best-effort, не должен валить bootstrap.
+            pass
+    return ok
 
 
 # ── TP/SL для лонга ───────────────────────────────────────────────
