@@ -140,9 +140,15 @@ BINANCE_FAPI_URL     = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 # Win: −200мс медианной детекции Korean листингов.
 # Хардкод (не env) — это публичный лимит биржи, не персональные данные.
 POLL_INTERVAL       = 0.1
-# Binance futures — публичный rate-limit 2400 req/min / IP. 500мс = 120 req/min,
-# в 20x ниже лимита, безопасно. Под polling без прокси.
-BINANCE_POLL_INTERVAL = 0.5
+# Binance futures — публичный rate-limit 2400 req/min / IP.
+# FIX-PERF: было 500мс — приводило к GIL contention в hot-path трейда.
+# exchangeInfo = 300-500KB JSON, msgspec decode держит GIL ~5-15мс.
+# Если торговый сигнал прилетал в окно decode — терял +5-15мс на GIL acquire.
+# Зафиксировано: первый трейд после регрессии = 31мс (норма 7-11мс).
+# 2500мс = 24 req/min, decode-окно открыто ~1% времени вместо ~5% при 500мс.
+# Цена: median детекция Binance листингов хуже на ~1с — приемлемо
+# (Binance анонсирует листинги, мы и через TG-канал поймаем быстрее).
+BINANCE_POLL_INTERVAL = 2.5
 # При ошибке/429 — отдельный (более длинный) sleep, чтобы не флудить.
 POLL_ERROR_BACKOFF  = 3.0
 
@@ -978,16 +984,21 @@ if __name__ == "__main__":
     # FIX-batch-5: Bybit V5 WS Trade — persistent connection для ордеров.
     if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
         try:
-            from api.bybit_ws_trade import init as bybit_ws_init
+            from api.bybit_ws_trade import init as bybit_ws_init, start_periodic_warmup
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
             if inst.is_ready(wait_sec=3.0):
-                # FIX-PERF: прогреваем cross-thread + ws.send pathway
-                # одним benign op:ping до первого реального ордера —
-                # снимает ~2-4мс с первого трейда после рестарта.
+                # FIX-PERF: прогреваем РЕАЛЬНЫЙ hot-path (uuid → Future →
+                # _pending → create_task → nested json → ws.send → dispatch)
+                # через benign op:order.cancel на несуществующий orderId.
+                # Без бокового эффекта: позиция не открывается.
                 if inst.warmup():
-                    log_ok("PARSER", "Bybit WS Trade готов + прогрет ✓ (−30...−80мс на ордер)")
+                    log_ok("PARSER", "Bybit WS Trade готов + прогрет ✓")
                 else:
-                    log_ok("PARSER", "Bybit WS Trade готов ✓ (warmup ping не прошёл, не критично)")
+                    log_ok("PARSER", "Bybit WS Trade готов ✓ (warmup не прошёл, не критично)")
+                # Периодический прогрев каждые ~45с — между листингами
+                # CPython adaptive caches успевают остыть, периодика держит
+                # их горячими. Лёгкая нагрузка (~0.02 req/s до Bybit).
+                start_periodic_warmup()
             else:
                 log_warn("PARSER", "Bybit WS Trade не успел подключиться за 3с — fallback на REST")
         except Exception as e:
