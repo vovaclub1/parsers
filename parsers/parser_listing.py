@@ -981,7 +981,13 @@ if __name__ == "__main__":
             from api.bybit_ws_trade import init as bybit_ws_init
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
             if inst.is_ready(wait_sec=3.0):
-                log_ok("PARSER", "Bybit WS Trade готов ✓ (−30...−80мс на ордер)")
+                # FIX-PERF: прогреваем cross-thread + ws.send pathway
+                # одним benign op:ping до первого реального ордера —
+                # снимает ~2-4мс с первого трейда после рестарта.
+                if inst.warmup():
+                    log_ok("PARSER", "Bybit WS Trade готов + прогрет ✓ (−30...−80мс на ордер)")
+                else:
+                    log_ok("PARSER", "Bybit WS Trade готов ✓ (warmup ping не прошёл, не критично)")
             else:
                 log_warn("PARSER", "Bybit WS Trade не успел подключиться за 3с — fallback на REST")
         except Exception as e:
