@@ -945,13 +945,15 @@ if __name__ == "__main__":
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
 
-    # FIX-PERF: дефолтный switchinterval = 5мс. Hot-path пересекает 3
-    # потока (handler → executor-worker → bybit-ws loop → executor-worker),
-    # каждая GIL-передача до 5мс = до 15мс лишних. 1мс уменьшает оверхед
-    # до ~3мс при той же CPU-нагрузке (не критично для I/O-bound сервиса).
-    import sys
-    sys.setswitchinterval(0.001)
-    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
+    # NOTE: switchinterval оставлен дефолтный (5мс). Раньше тут было
+    # `sys.setswitchinterval(0.001)` — попытка снизить max GIL hold.
+    # Эмпирически это давало РЕГРЕССИЮ p50 на trade-открытии (27мс vs 9мс):
+    # под нагрузкой (price_updater Bybit+Gate, telethon polling, WS heartbeat,
+    # 5 worker-thread'ов) 1мс switch → слишком частые context-switches →
+    # каждый thread тратит больше времени на GIL acquire/release pingpong,
+    # а worker'у нужно несколько раз перехватить GIL за один трейд
+    # (handler thread → WS-loop thread → handler thread). 5мс позволяет
+    # каждой стадии завершиться атомарно и быстрее отдать управление дальше.
 
     # FIX-PERF: только gc.freeze() — все module-level объекты (regex,
     # imported classes, globals) переезжают в permanent gen и больше не

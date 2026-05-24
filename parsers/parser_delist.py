@@ -902,12 +902,9 @@ if __name__ == "__main__":
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
 
-    # FIX-PERF: дефолтный switchinterval = 5мс — это до 5мс jitter на
-    # каждом cross-thread context switch'е (handler → executor → bybit-ws).
-    # 1мс — компромисс между latency и CPU-нагрузкой для I/O-bound кода.
-    import sys
-    sys.setswitchinterval(0.001)
-    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
+    # NOTE: switchinterval оставлен дефолтный (5мс). См. parser_listing.py
+    # для деталей: 1мс эмпирически давал регрессию p50 на trade-открытии
+    # из-за избыточного GIL pingpong'а между handler/WS-loop/worker thread'ами.
 
     # FIX-PERF: только gc.freeze() — module-level объекты выезжают в
     # permanent gen и не сканируются. Дефолтные thresholds=(700, 10, 10)
