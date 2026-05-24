@@ -72,6 +72,7 @@ from config.config import (
     EXTRA_DELIST_CHANNELS, parse_channels,    # FIX-batch-3: multi-channel
     TREE_OF_ALPHA_WS_ENABLED,                  # FIX-batch-4: TOA WS
     BYBIT_WS_TRADE_ENABLED,                    # FIX-batch-5: Bybit WS Trade
+    BYBIT_SYNC_WS_ENABLED,                     # FIX-PERF: sync WS hot-path
     BYBIT_API_KEY, BYBIT_SECRET_KEY,
 )
 from api.delist_api import (
@@ -928,23 +929,42 @@ if __name__ == "__main__":
 
     # FIX-batch-5: инициализация Bybit V5 WS Trade (persistent connection).
     if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
+        # FIX-PERF: sync WS как основной hot-path; async как резерв.
+        # См. parser_listing.py — та же логика.
+        sync_ready = False
+        if BYBIT_SYNC_WS_ENABLED:
+            try:
+                from api import bybit_sync_ws_trade as _sync_mod
+                from api.bybit_ws_trade import use_sync_ws
+                sync_inst = _sync_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                if sync_inst.is_ready(wait_sec=3.0):
+                    sync_warm = sync_inst.warmup()
+                    use_sync_ws(sync_inst)
+                    _sync_mod.start_periodic_warmup()
+                    sync_ready = True
+                    suffix = "+ прогрет" if sync_warm else "(warmup не прошёл)"
+                    log_ok("PARSER", f"Bybit SYNC WS Trade готов {suffix} ✓ (no cross-thread)")
+                else:
+                    log_warn("PARSER", "Bybit SYNC WS не подключился за 3с — fallback на async")
+            except Exception as e:
+                log_warn("PARSER", f"Bybit SYNC WS init упал: {e!r} — fallback на async")
+
         try:
             from api.bybit_ws_trade import init as bybit_ws_init, start_periodic_warmup
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
             if inst.is_ready(wait_sec=3.0):
-                # FIX-PERF: прогреваем РЕАЛЬНЫЙ hot-path через benign
-                # op:order.cancel на несуществующий orderId (без бокового
-                # эффекта). См. parser_listing.py.
-                if inst.warmup():
-                    log_ok("PARSER", "Bybit WS Trade готов + прогрет ✓")
+                if not sync_ready:
+                    if inst.warmup():
+                        log_ok("PARSER", "Bybit ASYNC WS Trade готов + прогрет ✓")
+                    else:
+                        log_ok("PARSER", "Bybit ASYNC WS Trade готов ✓ (warmup не прошёл)")
+                    start_periodic_warmup()
                 else:
-                    log_ok("PARSER", "Bybit WS Trade готов ✓ (warmup не прошёл, не критично)")
-                # Периодический прогрев каждые ~45с.
-                start_periodic_warmup()
+                    log_ok("PARSER", "Bybit ASYNC WS готов (резерв на случай sync-disconnect)")
             else:
-                log_warn("PARSER", "Bybit WS Trade не успел подключиться за 3с — fallback на REST до коннекта")
+                log_warn("PARSER", "Bybit ASYNC WS не подключился за 3с — fallback на REST до коннекта")
         except Exception as e:
-            log_err("PARSER", f"Bybit WS Trade init упал: {e} — будет REST")
+            log_err("PARSER", f"Bybit ASYNC WS init упал: {e!r} — будет REST")
     else:
         log_info("PARSER", "Bybit WS Trade отключён (BYBIT_WS_TRADE_ENABLED=0 или нет ключей) — используем REST")
 
