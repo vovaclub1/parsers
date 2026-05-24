@@ -164,15 +164,17 @@ class BybitSyncWsTrade:
         while not self._stop:
             try:
                 print(f"[BYBIT-SYNC-WS] connect → {WS_TRADE_URL}", flush=True)
-                # websockets.sync ClientConnection:
-                # • ping_interval/timeout управляет встроенным keepalive
+                # websockets.sync ClientConnection (v12):
                 # • open_timeout — на TCP+TLS+WS handshake
+                # • ping_interval/ping_timeout у sync-клиента появились
+                #   только в websockets 13.0. У нас pinned >=12,<13,
+                #   поэтому передавать их нельзя — будет TypeError.
+                #   Keepalive держится periodic warmup'ом (каждые 45с)
+                #   и TCP-level дроп ловится в recv/send → reconnect.
                 ws = ws_connect(
                     WS_TRADE_URL,
                     open_timeout=10,
                     close_timeout=5,
-                    ping_interval=20,
-                    ping_timeout=10,
                     max_size=2**20,  # 1MB, ack-фреймы крошечные
                 )
             except Exception as e:
