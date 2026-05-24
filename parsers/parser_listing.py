@@ -161,6 +161,10 @@ _DIRECT_POLL_SOURCES = {"UPBIT", "BITHUMB", "BINANCE"}
 
 _FIRED_FILE = Path(SESSION_DIR) / "listing_fired.json"
 
+# FIX-PERF: dirty-flag для фонового L2-writer'а — вместо thread.start() на
+# каждый успешный open (то стоило ~3-15мс в hot-path worker'а под GIL contention).
+_fired_dirty = threading.Event()
+
 # ── Watchdog: время последнего успешного запроса ───────────────────
 _upbit_last_ts   = time.monotonic()
 _bithumb_last_ts = time.monotonic()
@@ -295,25 +299,44 @@ def _try_claim(coin: str, source: str) -> bool:
 
 def _mark_opened(coin: str, source: str) -> None:
     """
-    Worker зовёт после успешного open. Записывает в L2 + persist на диск.
+    Worker зовёт после успешного open. Обновляет L2 (in-memory) и поднимает
+    dirty-flag — фоновый writer (_fired_persist_loop) сохранит на диск.
+
+    FIX-PERF: НЕ спавним поток здесь — это hot-path worker'а. Раньше
+    threading.Thread(_persist_fired_state).start() стоил ~3-15мс под GIL
+    contention (создание потока — это OS-syscall + GIL acquire несколько раз).
+    Теперь только set.add (~1мкс) + Event.set (~1мкс).
+
     ANNOUNCEMENT → global. DIRECT → per-exchange.
     """
     kind, exchange = _classify_source(source)
-    persist = False
+    dirty = False
     with _fired_lock:
         if kind == "ANNOUNCE":
             if coin not in _global_fired:
                 _global_fired.add(coin)
-                persist = True
+                dirty = True
         elif kind == "DIRECT" and exchange:
             bucket = _per_exchange_fired.setdefault(exchange, set())
             if coin not in bucket:
                 bucket.add(coin)
-                persist = True
+                dirty = True
         # OTHER — не пишем в L2 (на всякий случай).
-    if persist:
-        threading.Thread(target=_persist_fired_state, daemon=True,
-                         name="dedup-persist").start()
+    if dirty:
+        _fired_dirty.set()
+
+
+def _fired_persist_loop() -> None:
+    """
+    Единый фоновый writer L2 на диск. Просыпается по dirty-flag, ждёт ещё
+    1с (батчинг — если за это окно прилетит несколько open'ов на burst'е,
+    всё запишется одним write+rename), потом сохраняет.
+    """
+    while True:
+        _fired_dirty.wait()
+        time.sleep(1.0)
+        _fired_dirty.clear()
+        _persist_fired_state()
 
 
 def _fired_sweeper() -> None:
@@ -348,21 +371,23 @@ def worker(coin: str, margin: float, t_start: float,
             open_ms = (time.perf_counter() - t_start) * 1000
             log_ok("OPEN", f"[{source}] {coin} | ордер открыт за {BOLD}{open_ms:.0f}мс{RESET}{GREEN}")
 
-            # Помечаем в L2: ANNOUNCE → global / DIRECT → per-exchange.
-            _mark_opened(coin, source)
-
-            threading.Thread(
-                target=set_tp_sl_long,
-                args=(coin, entry_price, amount),
-                daemon=True,
-            ).start()
+            # FIX-PERF: TP/SL спавним ПЕРВЫМ (failsafe SL должен уйти ASAP)
+            # и через preheated pool — submit ~5-20мкс вместо thread.start ~3-15мс.
+            _tp_sl_executor.submit(set_tp_sl_long, coin, entry_price, amount)
 
             elapsed_ms = (time.perf_counter() - t_start) * 1000
             log_ok("LONG", (
                 f"[{source}] {coin} | entry={entry_price} | amount={amount:.4f} | "
                 f"время от сигнала до ордера: {BOLD}{elapsed_ms:.0f}мс{RESET}{GREEN}"
             ))
+            # FIX-PERF: tg_log теперь fire-and-forget (см. tg/tg_logger.py) —
+            # возвращается за ~10мкс, реальный HTTP уходит в фоне.
             tg_log(f"🟢 <b>LISTING LONG</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {elapsed_ms:.0f}мс")
+
+            # FIX-PERF: bookkeeping ПОСЛЕ метрики и tg_log — не должен влиять
+            # на «время от сигнала до ордера». _mark_opened теперь только
+            # set-add + Event.set (~2мкс), без thread.start.
+            _mark_opened(coin, source)
             return
         except Exception as e:
             log_err("WORKER", f"{coin}: попытка {attempt}/{retries} упала → {e}")
@@ -400,6 +425,13 @@ def _on_toa_listing(full_text: str, t_start: float) -> None:
 # на каждый сигнал. Создание пула + блокировка __exit__ до завершения всех
 # worker'ов съедали ~5-15мс из hot-path. Pool живёт всё время работы парсера.
 _signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="listing-signal")
+
+# FIX-PERF: отдельный preheated pool для set_tp_sl_long. Раньше worker делал
+# `threading.Thread(target=set_tp_sl_long).start()` — это OS-syscall + GIL
+# acquire несколько раз = 3-15мс jitter в hot-path под contention. submit
+# в уже-запущенный pool ~5-20мкс. Pool отделён от _signal_executor чтобы
+# burst листингов (5 worker'ов) не блокировал TP/SL постановку у уже открытых.
+_tp_sl_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="listing-tpsl")
 
 
 def process_signal(pairs: list[str], source: str, t_start: float | None = None) -> None:
@@ -938,14 +970,18 @@ if __name__ == "__main__":
 
     # FIX-PERF: глобальный sweeper вместо thread-per-claim (см. _try_claim).
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
+    # FIX-PERF: единый фоновый L2-writer (dirty-flag + 1с batching) вместо
+    # thread.start на каждый _mark_opened в hot-path.
+    threading.Thread(target=_fired_persist_loop, daemon=True, name="fired-persist").start()
 
-    # FIX-PERF: pre-warm executor — ThreadPoolExecutor создаёт worker-thread
+    # FIX-PERF: pre-warm executors — ThreadPoolExecutor создаёт worker-thread
     # лениво на первый submit (~3-5мс). На первом листинге не хотим платить
     # этот налог. Сабмитим N=max_workers no-op задач, ждём их завершения.
     _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
+    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(4)]
     for f in _warm:
         f.result()
-    log_ok("PARSER", "_signal_executor pre-warmed (5 worker'ов готовы)")
+    log_ok("PARSER", "_signal_executor (5) + _tp_sl_executor (4) pre-warmed")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:
