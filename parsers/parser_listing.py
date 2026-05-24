@@ -399,21 +399,24 @@ def worker(coin: str, margin: float, t_start: float,
                 time.sleep(0.1)
                 continue
 
-            open_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("OPEN", f"[{source}] {coin} | ордер открыт за {BOLD}{open_ms:.0f}мс{RESET}{GREEN}")
-
-            # FIX-PERF: TP/SL спавним ПЕРВЫМ (failsafe SL должен уйти ASAP)
-            # и через preheated pool — submit ~5-20мкс вместо thread.start ~3-15мс.
+            # FIX-PERF: failsafe SL+TP1 уже улетели в одной order.create-фрейме
+            # (stopLoss/takeProfit полях). Эта submit'ка добавляет trailing-stop
+            # 3.5% через trading-stop endpoint — не критично для failsafe, поэтому
+            # делаем ДО открытия метрики (submit ~5-20μs не сдвинет open_ms).
             _tp_sl_executor.submit(set_tp_sl_long, coin, entry_price, amount)
 
-            elapsed_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("LONG", (
-                f"[{source}] {coin} | entry={entry_price} | amount={amount:.4f} | "
-                f"время от сигнала до ордера: {BOLD}{elapsed_ms:.0f}мс{RESET}{GREEN}"
+            open_ms = (time.perf_counter() - t_start) * 1000
+            # FIX-PERF: один print вместо двух — раньше OPEN-print + intermediate
+            # work + LONG-print между метриками съедали ~4мс на stdout flush
+            # (PYTHONUNBUFFERED=1, f-string с ANSI escape codes). Теперь open_ms
+            # = total path time, делать второй замер бессмысленно (был бы +100μs).
+            log_ok("OPEN", (
+                f"[{source}] {coin} | ордер за {BOLD}{open_ms:.0f}мс{RESET}{GREEN} | "
+                f"entry={entry_price} | amount={amount:.4f}"
             ))
             # FIX-PERF: tg_log теперь fire-and-forget (см. tg/tg_logger.py) —
             # возвращается за ~10мкс, реальный HTTP уходит в фоне.
-            tg_log(f"🟢 <b>LISTING LONG</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {elapsed_ms:.0f}мс")
+            tg_log(f"🟢 <b>LISTING LONG</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
 
             # FIX-PERF: bookkeeping ПОСЛЕ метрики и tg_log — не должен влиять
             # на «время от сигнала до ордера». _mark_opened теперь только

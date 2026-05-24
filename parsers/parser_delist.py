@@ -412,21 +412,19 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
                 time.sleep(0.1)
                 continue
 
-            open_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("OPEN", f"[{source}] {coin} | ордер открыт за {BOLD}{open_ms:.0f}мс{RESET}{GREEN}")
-
-            # FIX-PERF: preheated pool → submit ~5-20мкс вместо thread.start
-            # ~3-15мс под GIL contention.
+            # FIX-PERF: TP/SL submit ДО метрики (~5-20μs, не сдвинет open_ms).
+            # Один print вместо двух — экономия ~4мс на intermediate stdout flush.
+            # См. parser_listing.py для деталей.
             _tp_sl_executor.submit(set_tp_sl, coin, entry_price, amount)
 
-            elapsed_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("SHORT", (
-                f"[{source}] {coin} | entry={entry_price} | amount={amount:.4f} | "
-                f"время от статьи до ордера: {BOLD}{elapsed_ms:.0f}мс{RESET}{GREEN}"
+            open_ms = (time.perf_counter() - t_start) * 1000
+            log_ok("OPEN", (
+                f"[{source}] {coin} | ордер за {BOLD}{open_ms:.0f}мс{RESET}{GREEN} | "
+                f"entry={entry_price} | amount={amount:.4f}"
             ))
             # FIX-PERF: tg_log fire-and-forget (см. tg/tg_logger.py).
             tg_log(
-                f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {elapsed_ms:.0f}мс")
+                f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
             return
         except Exception as e:
             log_err("WORKER", f"{coin}: попытка {attempt}/{retries} упала → {e}")
