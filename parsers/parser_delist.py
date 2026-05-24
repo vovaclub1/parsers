@@ -414,17 +414,16 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             open_ms = (time.perf_counter() - t_start) * 1000
             log_ok("OPEN", f"[{source}] {coin} | ордер открыт за {BOLD}{open_ms:.0f}мс{RESET}{GREEN}")
 
-            threading.Thread(
-                target=set_tp_sl,
-                args=(coin, entry_price, amount),
-                daemon=True,
-            ).start()
+            # FIX-PERF: preheated pool → submit ~5-20мкс вместо thread.start
+            # ~3-15мс под GIL contention.
+            _tp_sl_executor.submit(set_tp_sl, coin, entry_price, amount)
 
             elapsed_ms = (time.perf_counter() - t_start) * 1000
             log_ok("SHORT", (
                 f"[{source}] {coin} | entry={entry_price} | amount={amount:.4f} | "
                 f"время от статьи до ордера: {BOLD}{elapsed_ms:.0f}мс{RESET}{GREEN}"
             ))
+            # FIX-PERF: tg_log fire-and-forget (см. tg/tg_logger.py).
             tg_log(
                 f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {elapsed_ms:.0f}мс")
             return
@@ -458,6 +457,10 @@ def _on_toa_delist(full_text: str, t_start: float) -> None:
 # `with ThreadPoolExecutor(...)` создавал новый пул на каждый сигнал, а
 # __exit__ блокировал до завершения всех worker'ов — +5-15мс overhead.
 _signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="delist-signal")
+
+# FIX-PERF: отдельный preheated pool для set_tp_sl. Замена thread.start
+# (~3-15мс под GIL contention) на submit (~5-20мкс) в hot-path после OPEN.
+_tp_sl_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="delist-tpsl")
 
 
 def process_signal(pairs: list[str], source: str, t_start: float) -> None:
@@ -955,12 +958,13 @@ if __name__ == "__main__":
     # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
 
-    # FIX-PERF: pre-warm executor — иначе первый submit платит ~3-5мс
+    # FIX-PERF: pre-warm executors — иначе первый submit платит ~3-5мс
     # на создание worker-thread'а.
     _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
+    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(4)]
     for f in _warm:
         f.result()
-    log_ok("PARSER", "_signal_executor pre-warmed")
+    log_ok("PARSER", "_signal_executor (5) + _tp_sl_executor (4) pre-warmed")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:
