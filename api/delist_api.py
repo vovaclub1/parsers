@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import List, Optional
 from config.config import BYBIT_API_KEY, BYBIT_SECRET_KEY
 import requests
 
@@ -39,8 +39,12 @@ try:
         symbol:    str = ""
         lastPrice: str = ""
 
+    # Поле называется `list` (как в JSON), но в аннотации используем
+    # typing.List — иначе `from __future__ import annotations` превращает
+    # `list[_BybitTicker]` в строку, и msgspec при eval'е резолвит `list`
+    # в member_descriptor этого же поля (TypeError: not subscriptable).
     class _BybitTickerList(_msgspec.Struct, frozen=True):
-        list: list[_BybitTicker] = []  # noqa: RUF012
+        list: List[_BybitTicker] = []  # noqa: RUF012
 
     class _BybitTickersResp(_msgspec.Struct, frozen=True):
         result: _BybitTickerList | None = None
