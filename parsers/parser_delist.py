@@ -929,16 +929,18 @@ if __name__ == "__main__":
     # FIX-batch-5: инициализация Bybit V5 WS Trade (persistent connection).
     if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
         try:
-            from api.bybit_ws_trade import init as bybit_ws_init
+            from api.bybit_ws_trade import init as bybit_ws_init, start_periodic_warmup
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
             if inst.is_ready(wait_sec=3.0):
-                # FIX-PERF: прогреваем cross-thread + ws.send pathway
-                # benign op:ping до первого реального ордера (см.
-                # parser_listing.py — снимает ~2-4мс с первого трейда).
+                # FIX-PERF: прогреваем РЕАЛЬНЫЙ hot-path через benign
+                # op:order.cancel на несуществующий orderId (без бокового
+                # эффекта). См. parser_listing.py.
                 if inst.warmup():
-                    log_ok("PARSER", "Bybit WS Trade готов + прогрет ✓ (−30...−80мс на ордер)")
+                    log_ok("PARSER", "Bybit WS Trade готов + прогрет ✓")
                 else:
-                    log_ok("PARSER", "Bybit WS Trade готов ✓ (warmup ping не прошёл, не критично)")
+                    log_ok("PARSER", "Bybit WS Trade готов ✓ (warmup не прошёл, не критично)")
+                # Периодический прогрев каждые ~45с.
+                start_periodic_warmup()
             else:
                 log_warn("PARSER", "Bybit WS Trade не успел подключиться за 3с — fallback на REST до коннекта")
         except Exception as e:

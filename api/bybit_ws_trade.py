@@ -241,48 +241,83 @@ class BybitWsTrade:
             return self._connected.wait(wait_sec)
         return False
 
-    def warmup(self, timeout: float = 0.5) -> bool:
+    def warmup(self, timeout: float = 1.0) -> bool:
         """
-        Прогревает cross-thread + ws.send hot-path до первого реального ордера.
-        Шлёт `op: ping` через ровно ту же машинерию что и place_order_fast:
-          run_coroutine_threadsafe → loop wake → _json_dumps → ws.send → Event.set.
+        Прогревает РОВНО тот же hot-path, что place_order_fast.
 
-        Зачем: первый трейд после старта стабильно на 3-5мс медленнее
-        последующих (эмпирически: ETH 11мс vs XRP 7мс в одной сессии).
-        Холодная часть — это не сам TCP/TLS (он уже прогрет auth-фреймом),
-        а Python-side cross-thread wakeup: asyncio control-socket пара,
-        loop._ready cache, JIT-инлайнинг частых веток в websockets.send.
+        Что прогреваем (всё то, что op:ping не трогал):
+          • uuid.uuid4() — первый вызов в процессе инициализирует PRNG.
+          • loop.create_future() — Future-аллокация.
+          • self._pending_lock + dict insert/pop.
+          • loop.create_task(_watch_ack...) — первая Task на loop'е тяжелее.
+          • _json_dumps(nested) — вложенный payload (header + args), не плоский.
+          • ws.send больших фреймов (~250 байт, близко к боевым ~400).
+          • _dispatch → _pending.pop → future.set_result — приём ack-frame.
 
-        Возврат: True если ping прошёл за timeout. False — fallback warmup
-        не выполнен (WS не подключён или timeout). Не критично.
+        Сценарий: отправляем `op:order.cancel` с фиктивным orderId.
+        Bybit возвращает retCode != 0 (Order not found) за ~50-100мс,
+        НИЧЕГО НЕ ИЗМЕНЯЯ на стороне биржи (cancel несуществующего).
+        Никакой риск — позиция не открывается, баланс не задевается.
+
+        Возврат: True если ack пришёл за timeout. False — WS не подключён
+        либо таймаут (не критично, продолжаем без прогрева).
         """
         if not self._connected.is_set() or self._loop is None or self._ws is None:
             return False
 
+        req_id = "warmup-" + str(uuid.uuid4())
+        ts_ms = str(int(time.time() * 1000))
+        payload = {
+            "reqId": req_id,
+            "op":    "order.cancel",
+            "header": {
+                "X-BAPI-TIMESTAMP":   ts_ms,
+                "X-BAPI-RECV-WINDOW": "5000",
+                "Referer":            "Parsers",
+            },
+            "args": [{
+                "category": "linear",
+                "symbol":   "BTCUSDT",
+                # Заведомо несуществующий orderId — Bybit ответит rejection
+                # за ~50-100мс. Реального ордера нигде не создаётся.
+                "orderId":  "00000000-0000-0000-0000-000000000000",
+            }],
+        }
+
         done = threading.Event()
 
-        async def _ping() -> None:
+        async def _warmup_send() -> None:
             try:
+                loop = asyncio.get_running_loop()
+                fut: asyncio.Future = loop.create_future()
+                with self._pending_lock:
+                    self._pending[req_id] = fut
                 ws = self._ws
                 if ws is None:
                     return
                 send_lock = self._send_lock
-                payload_str = _json_dumps({"op": "ping"})
+                payload_str = _json_dumps(payload)
                 if send_lock is not None:
                     async with send_lock:
                         await ws.send(payload_str)
                 else:
                     await ws.send(payload_str)
+                try:
+                    await asyncio.wait_for(fut, timeout=timeout)
+                except (asyncio.TimeoutError, Exception):
+                    pass
             except Exception:
                 pass
             finally:
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
                 done.set()
 
         try:
-            asyncio.run_coroutine_threadsafe(_ping(), self._loop)
+            asyncio.run_coroutine_threadsafe(_warmup_send(), self._loop)
         except Exception:
             return False
-        return done.wait(timeout)
+        return done.wait(timeout + 0.2)
 
     def place_order(self, args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
         """
@@ -537,3 +572,48 @@ def place_order_ws_fast(args: dict) -> dict | None:
     if inst is None:
         return None
     return inst.place_order_fast(args)
+
+
+# ── периодический прогрев hot-path ────────────────────────────────
+# Один прогрев на старте недостаточен: если первый листинг прилетит
+# через 30+ минут, asyncio _ready cache, PEP-659 inline caches и
+# CPU branch predictor остынут. Гоняем фоновый warmup каждые 45с
+# (между торговыми сессиями listings обычно ≥ часов).
+#
+# 45с выбраны эмпирически: достаточно часто чтобы CPython adaptive
+# specializations не остыли, достаточно редко чтобы не флудить Bybit
+# (limit /v5/trade = ~10 req/s, мы делаем 0.022 req/s — на 3 порядка ниже).
+_PERIODIC_WARMUP_INTERVAL = 45.0
+_periodic_warmup_thread: threading.Thread | None = None
+_periodic_warmup_lock = threading.Lock()
+
+
+def _periodic_warmup_loop() -> None:
+    """Фоновый прогрев hot-path place_order_fast каждые N секунд."""
+    while True:
+        time.sleep(_PERIODIC_WARMUP_INTERVAL)
+        inst = _global_instance
+        if inst is None:
+            continue
+        try:
+            inst.warmup(timeout=1.0)
+        except Exception:
+            pass
+
+
+def start_periodic_warmup() -> None:
+    """
+    Запускает фоновый прогревочный поток (idempotent).
+    Вызывать из bootstrap'а после успешного init+is_ready+warmup.
+    """
+    global _periodic_warmup_thread
+    with _periodic_warmup_lock:
+        if _periodic_warmup_thread is not None and _periodic_warmup_thread.is_alive():
+            return
+        t = threading.Thread(
+            target=_periodic_warmup_loop,
+            daemon=True,
+            name="bybit-ws-warmup",
+        )
+        t.start()
+        _periodic_warmup_thread = t
