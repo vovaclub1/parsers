@@ -241,6 +241,49 @@ class BybitWsTrade:
             return self._connected.wait(wait_sec)
         return False
 
+    def warmup(self, timeout: float = 0.5) -> bool:
+        """
+        Прогревает cross-thread + ws.send hot-path до первого реального ордера.
+        Шлёт `op: ping` через ровно ту же машинерию что и place_order_fast:
+          run_coroutine_threadsafe → loop wake → _json_dumps → ws.send → Event.set.
+
+        Зачем: первый трейд после старта стабильно на 3-5мс медленнее
+        последующих (эмпирически: ETH 11мс vs XRP 7мс в одной сессии).
+        Холодная часть — это не сам TCP/TLS (он уже прогрет auth-фреймом),
+        а Python-side cross-thread wakeup: asyncio control-socket пара,
+        loop._ready cache, JIT-инлайнинг частых веток в websockets.send.
+
+        Возврат: True если ping прошёл за timeout. False — fallback warmup
+        не выполнен (WS не подключён или timeout). Не критично.
+        """
+        if not self._connected.is_set() or self._loop is None or self._ws is None:
+            return False
+
+        done = threading.Event()
+
+        async def _ping() -> None:
+            try:
+                ws = self._ws
+                if ws is None:
+                    return
+                send_lock = self._send_lock
+                payload_str = _json_dumps({"op": "ping"})
+                if send_lock is not None:
+                    async with send_lock:
+                        await ws.send(payload_str)
+                else:
+                    await ws.send(payload_str)
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_ping(), self._loop)
+        except Exception:
+            return False
+        return done.wait(timeout)
+
     def place_order(self, args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
         """
         Синхронно размещает ордер через WS. Возвращает dict с ack от Bybit,
