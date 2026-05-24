@@ -531,6 +531,22 @@ _global_instance: BybitWsTrade | None = None
 # (тот защищает создание объекта в .get(), а этот — модульный singleton).
 _global_instance_lock = threading.Lock()
 
+# FIX-PERF: preferred sync WS instance. Если bootstrap вызвал
+# use_sync_ws(sync_inst) и sync подключён — place_order_ws_fast будет
+# использовать его (без cross-thread asyncio hop'а, экономия ~0.5-2мс).
+# В fallback на async — если sync не инициализирован или не подключён.
+_sync_preferred: Any = None  # api.bybit_sync_ws_trade.BybitSyncWsTrade | None
+
+
+def use_sync_ws(sync_inst: Any) -> None:
+    """
+    Регистрирует sync WS как предпочтительный hot-path для
+    place_order_ws_fast. Если sync_inst позже отвалится (is_set=False),
+    place_order_ws_fast автоматически уйдёт на async fallback.
+    """
+    global _sync_preferred
+    _sync_preferred = sync_inst
+
 
 def init(api_key: str, api_secret: str) -> BybitWsTrade:
     """
@@ -566,8 +582,23 @@ def place_order_ws_fast(args: dict) -> dict | None:
     """
     FIX-PERF: fire-and-forget — возвращает после ws.send (без ack-wait).
     Снимает ~70-100мс RTT до Bybit из hot-path. Reject логируется в фоне.
-    None → WS не подключён или transport-ошибка → REST fallback.
+
+    Маршрутизация:
+      1. Если sync WS зарегистрирован (use_sync_ws) и connected → sync.
+         No cross-thread asyncio hop, ws.send из caller thread.
+      2. Иначе → async WS (этот файл) — fallback.
+      3. None → caller делает REST fallback.
     """
+    # Быстрый check sync preferred. is_set атомарен, без локов.
+    sync = _sync_preferred
+    if sync is not None and sync.is_ready():
+        result = sync.place_order_fast(args)
+        if result is not None:
+            return result
+        # Sync вернул None (transport-ошибка) — пробуем async fallback
+        # вместо REST. Async может быть подключён, когда sync временно
+        # на reconnect'е.
+
     inst = _global_instance
     if inst is None:
         return None

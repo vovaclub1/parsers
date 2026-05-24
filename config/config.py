@@ -50,6 +50,12 @@ TREE_OF_ALPHA_WS_ENABLED = os.getenv("TREE_OF_ALPHA_WS_ENABLED", "1").lower() in
 # FIX-batch-5: включает Bybit V5 WS Trading API для размещения ордеров.
 BYBIT_WS_TRADE_ENABLED = os.getenv("BYBIT_WS_TRADE_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 
+# FIX-PERF: sync-вариант WS клиента (api/bybit_sync_ws_trade.py). Убирает
+# cross-thread asyncio hop из hot-path (-0.5...-2мс на трейд).
+# Default ON — async остаётся как fallback при init/transport ошибках.
+# Поставить "0" если sync-вариант вызовет регрессии в проде.
+BYBIT_SYNC_WS_ENABLED = os.getenv("BYBIT_SYNC_WS_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+
 
 def parse_channels(csv: str) -> list[str | int]:
     """
