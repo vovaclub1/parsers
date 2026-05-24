@@ -909,6 +909,16 @@ if __name__ == "__main__":
     sys.setswitchinterval(0.001)
     print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
 
+    # FIX-PERF: GC tuning. Дефолт gen0 thresh=700 — на hot-path легко
+    # вылетает gen0-sweep (0.5-5мс pause). Поднимаем до 50000, GC только
+    # на крупных всплесках. gc.freeze() закрепляет все loaded module globals
+    # в permanent gen (никогда не сканируются) — снимает десятки тысяч
+    # объектов с обычных циклов сборки.
+    import gc
+    gc.set_threshold(50000, 10, 10)
+    gc.freeze()
+    print(f"[BOOT] GC tuned: thresholds={gc.get_threshold()}, frozen={gc.get_freeze_count()} objects")
+
     # ── Прогрев бирж ─────────────────────────────────────────────
     threading.Thread(target=price_updater,      daemon=True).start()
     threading.Thread(target=gate_price_updater, daemon=True).start()
