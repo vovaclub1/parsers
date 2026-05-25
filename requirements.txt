@@ -19,6 +19,12 @@ orjson>=3.9,<4
 msgspec>=0.18,<1
 httpx[http2]>=0.27,<1
 
+# curl_cffi — requests-совместимый HTTP-клиент с импersonation
+# реальных TLS-fingerprint'ов (Chrome/Safari/Firefox). Без него
+# Binance CDN (Akamai) детектит python-requests JA3 и возвращает
+# 400 на /bapi/composite/v1/public/cms/article/list/query.
+curl_cffi>=0.7,<1
+
 # Telegram clients
 telethon>=1.36,<2
 cryptg>=0.4,<1
