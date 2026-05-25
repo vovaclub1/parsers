@@ -156,6 +156,14 @@ POLL_DEAD_THRESHOLD     = 5      # подряд connection-error'ов = «про
 POLL_DEAD_INTERVAL      = 60.0   # интервал retry для «мёртвого» поллера
 POLL_DEAD_LOG_EVERY     = 30     # лог только каждый N-й тик пока мёртвый
 
+# Heartbeat: раз в N успешных циклов поллер логирует «alive ✓ K pollов».
+# Это видимое подтверждение что Binance отдаёт 200 (после fix `_t`) и
+# парсер крутится — иначе после `первый запуск — запомнили K статей`
+# логи молчат пока не появится новая статья (что бывает раз в часы/сутки).
+# 60 × ~1с = ~60с между heartbeat'ами на каждый живой поллер → 3-4
+# строки в минуту суммарно, не спам.
+POLL_HEARTBEAT_EVERY    = 60
+
 DELIST_KEYWORDS    = ["Will Delist", "Delisting Notice", "Binance Will Delist"]
 
 # FIX-batch-8: cache-busting — разрешённые значения pageSize.
@@ -350,6 +358,74 @@ for _i in range(len(_sessions)):
     _poller_intervals[_i] = POLL_INTERVAL_BASE
     # 0 = ни одного bump'а ещё не было → нет смысла ресетить
     _poller_last_bump_ts[_i] = 0.0
+
+# Startup-probe: сессии (прокси), которые не прошли первичный health-check.
+# Поллер для них стартует сразу в DEAD-режиме (60с интервал), чтобы:
+#   • не выпускать burst из 5 одинаковых ошибок в первые 15с,
+#   • не молотить TCP connect() в воду 1× в секунду по мёртвому endpoint'у,
+#   • DEAD-режим всё равно переодически перепроверяет — если прокси
+#     поднимется, поллер сам выйдет из DEAD на первом 200.
+# Заполняется ниже в _probe_proxy_health() (после построения сессий, до
+# запуска поток-поллеров main()).
+_poller_initial_dead: set[int] = set()
+
+
+def _probe_proxy_health() -> None:
+    """
+    Быстрая проверка каждой сессии: 1 запрос к реальному Binance endpoint
+    с коротким timeout. Сессии, которые мгновенно падают (мёртвый прокси:
+    Connection refused / DNS-фейл / SOCKS handshake error) сразу помечаются
+    как DEAD и стартуют поллер в DEAD-режиме.
+
+    Это не валидация раз и навсегда: DEAD-режим перепроверяет с интервалом
+    POLL_DEAD_INTERVAL (60с), так что временно недоступный прокси сам
+    воскреснет на первом 200. Цель — убрать лог-шум на старте.
+
+    Запускается в N параллельных потоках, чтобы probe не растягивался на
+    N×timeout секунд (для 4 прокси с 3с timeout — 12с старта → 3с).
+    """
+    if not _sessions:
+        return
+
+    test_url = _build_binance_url()
+    results: dict[int, str] = {}
+    results_lock = threading.Lock()
+
+    def _probe_one(idx: int) -> None:
+        sess = _sessions[idx]
+        label = f"proxy[{idx}]" if idx > 0 else "direct"
+        try:
+            r = sess.get(test_url, timeout=3)
+            r.raise_for_status()
+            with results_lock:
+                results[idx] = f"[{label}] OK ({r.status_code})"
+        except Exception as e:  # noqa: BLE001
+            with results_lock:
+                results[idx] = f"[{label}] DEAD: {e!r}"
+            # Помечаем как DEAD только при connection-уровне ошибке
+            # или HTTP 4xx-блоке (это не лечится в коде; нужны другие IP).
+            if _is_connection_error(e) or _is_http_block(e):
+                _poller_initial_dead.add(idx)
+
+    threads = []
+    for i in range(len(_sessions)):
+        t = threading.Thread(target=_probe_one, args=(i,), daemon=True,
+                             name=f"probe-{i}")
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=5)
+
+    alive = len(_sessions) - len(_poller_initial_dead)
+    print(f"[PROXY-PROBE] {alive}/{len(_sessions)} сессий живы:", flush=True)
+    for idx in sorted(results):
+        marker = "✗" if idx in _poller_initial_dead else "✓"
+        print(f"  {marker} {results[idx]}", flush=True)
+
+
+# Probe вызывается из main(), перед запуском поллер-потоков —
+# к тому моменту все вспомогательные функции (_build_binance_url,
+# _is_connection_error, _is_http_block) уже определены ниже по модулю.
 
 # Циклический итератор по сессиям
 _session_cycle = itertools.cycle(enumerate(_sessions))
@@ -876,8 +952,23 @@ def poller(session_idx: int) -> None:
     # FIX: трекинг подряд connection-error'ов → переход в DEAD-режим
     # (60с интервал, лог раз в N тиков). Любой успех — сброс.
     conn_err_streak = 0
-    dead_mode       = False
+    # Если startup-probe пометил эту сессию мёртвой — стартуем сразу в DEAD,
+    # чтобы не выпускать burst из 5 ошибок подряд в логи в первые 15с.
+    dead_mode       = session_idx in _poller_initial_dead
     dead_log_skip   = 0
+    if dead_mode:
+        log_warn(
+            "POLLER",
+            f"[{label}] стартую сразу в DEAD-режиме (startup-probe не прошёл), "
+            f"интервал {POLL_DEAD_INTERVAL:.0f}с"
+        )
+
+    # FIX: heartbeat для видимости — после первого запуска поллер логирует
+    # только при появлении новых статей (line с `if new_count > 0`). Это
+    # правильно (не спамить каждую секунду), но создаёт иллюзию что система
+    # «висит». Раз в POLL_HEARTBEAT_EVERY успешных циклов печатаем «alive» —
+    # тогда пользователь видит что Binance отдаёт 200 и парсер крутится.
+    success_count = 0
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         while True:
@@ -930,6 +1021,17 @@ def poller(session_idx: int) -> None:
                     dead_mode = False
                     conn_err_streak = 0
                     dead_log_skip = 0
+
+                # Heartbeat: видимое подтверждение что поллер живой и Binance
+                # отдаёт 200. Печатаем РЕДКО (раз в POLL_HEARTBEAT_EVERY циклов),
+                # чтобы не спамить, но достаточно часто чтобы быть полезным.
+                success_count += 1
+                if not first_run and success_count % POLL_HEARTBEAT_EVERY == 0:
+                    log_ok(
+                        "POLLER",
+                        f"[{label}] alive ✓ {success_count} успешных pollов, "
+                        f"последний ответ — {len(articles) if articles else 0} статей"
+                    )
 
                 if articles:
                     if first_run:
@@ -1293,6 +1395,13 @@ if __name__ == "__main__":
 
     tg_log(f"🚀 <b>DELIST парсер запущен</b>\nПоллеры: {len(_sessions)}\nБиржи: Bybit + Gate.io (fallback)")
     log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами")
+
+    # Startup proxy health-probe — отсеиваем заведомо мёртвые прокси
+    # (Connection refused / DNS-фейл / 4xx-блок), чтобы не молотить TCP-connect
+    # 1× в секунду по dead endpoint'у и не наполнять лог 5-ю одинаковыми
+    # ошибками за первые 15с. Помеченные DEAD поллеры стартуют в DEAD-режиме
+    # (60с интервал) и сами восстанавливаются на первом 200.
+    _probe_proxy_health()
 
     # FIX: поллеры — daemon=True. Если main thread (TG listener) умирает,
     # Docker должен иметь возможность перезапустить контейнер.
