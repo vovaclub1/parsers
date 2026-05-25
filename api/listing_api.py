@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import re
 import threading
-import time
 
 from api.delist_api import (
     _post,
@@ -49,16 +48,6 @@ except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
         pass
 
-# FIX-PERF: модуль для замера latency сигнал→fill. track() = dict-set
-# (~100-300ns), бэкграунд-поток подписан на /v5/private execution-стрим
-# и логирует [FILL] с реальными биржевыми таймстемпами.
-try:
-    from api.bybit_ws_execution import track as _exec_track
-except Exception as _exec_import_exc:  # noqa: BLE001 — graceful
-    print(f"[BYBIT-WS-EXEC] модуль не подгружен: {_exec_import_exc!r} — замер latency недоступен")
-    def _exec_track(order_link_id: str, t_signal_perf: float) -> None:  # type: ignore[misc]
-        return
-
 __all__ = [
     "market_open_long",
     "set_tp_sl_long",
@@ -93,18 +82,13 @@ _last_exchange: dict[str, str] = {}  # {ticker: "bybit" | "gate"}
 _last_exchange_lock = threading.Lock()
 
 
-def market_open_long(ticker_name: str, usdt_amount: float,
-                     t_signal_perf: float | None = None) -> tuple[float, float]:
+def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float]:
     """
     Открывает рыночный лонг:
       1. Bybit (приоритет — ниже комиссия)
       2. Gate.io (fallback — если токена нет на Bybit)
     :param ticker_name: str - тикер монеты (например "PRL").
     :param usdt_amount: float - маржа в USDT.
-    :param t_signal_perf: time.perf_counter() в момент прихода сигнала.
-        Если передан — регистрируется в bybit_ws_execution для замера
-        end-to-end latency сигнал→fill (см. [FILL] логи). Hot-path
-        overhead ~200ns. None — без замера, всё работает как раньше.
     :return: tuple[float, float] - (количество, цена входа), (0, 0) если нигде нет.
     """
     bybit_price = get_price(ticker_name)
@@ -130,12 +114,6 @@ def market_open_long(ticker_name: str, usdt_amount: float,
                 # дубль с retCode 30050, защита от double-position при WS
                 # ack timeout (см. post_order в delist_api).
                 order_link_id = new_order_link_id()
-                # FIX-PERF: регистрируем ордер в private execution-стриме для
-                # замера latency сигнал→fill. ДО send (чтобы fill, который
-                # может прийти через 30мс, гарантированно нашёл запись в
-                # pending). Стоимость: ~200ns (dict-set под GIL).
-                if t_signal_perf is not None:
-                    _exec_track(order_link_id, t_signal_perf)
                 # Bundle SL + TP1 в order.create — failsafe stop loss попадает
                 # на сервер в одной WS-фрейме с открытием, без зависимости от
                 # отдельного /v5/position/trading-stop (который добавляет
@@ -255,10 +233,6 @@ def warmup_chain(n: int = 30) -> int:
                 continue
             qty_str = str(amount_tokens)
             order_link_id = new_order_link_id()
-            # FIX-PERF: прогреваем ветку с _exec_track — иначе её bytecode
-            # cold на первом реальном листинге. Стоимость: ~200ns × n, и
-            # 30 orphan-записей в _pending которые GC чистит через 30с.
-            _exec_track(order_link_id, time.perf_counter())
             sl_price  = round(bybit_price * 0.92, 8)
             tp1_price = round(bybit_price * 1.045, 8)
             tp1_qty   = _round_qty(amount_tokens * 0.30, step)
