@@ -11,6 +11,35 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# FIX: Binance CDN (Akamai) fingerprintит TLS-handshake python-requests
+# (JA3/JA4) и возвращает 400 на /bapi/composite/.../article/list/query.
+# curl_cffi эмулирует реальный TLS Chrome'а через libcurl-impersonate.
+# API совместим с requests.Session (.get/.headers/.proxies/.raise_for_status).
+# Fallback на requests если curl_cffi не доступен — там 400 продолжатся,
+# но контейнер не упадёт.
+try:
+    from curl_cffi import requests as _cffi_requests  # type: ignore[import-not-found]
+    # "chrome" — алиас на самый свежий поддерживаемый профиль (см.
+    # curl_cffi.requests.BrowserType). При необходимости переопределить
+    # точную версию — BINANCE_TLS_IMPERSONATE=chrome120 в .env.
+    _HTTP_IMPERSONATE = os.getenv("BINANCE_TLS_IMPERSONATE", "chrome")
+
+    def _new_http_session(proxy: str | None) -> "object":
+        kwargs: dict = {"impersonate": _HTTP_IMPERSONATE}
+        if proxy:
+            kwargs["proxies"] = {"http": proxy, "https": proxy}
+        return _cffi_requests.Session(**kwargs)
+
+    _HTTP_BACKEND = "curl_cffi"
+except ImportError:  # graceful fallback — поведение прежнее, 400 останутся
+    def _new_http_session(proxy: str | None) -> "object":
+        s = requests.Session()
+        if proxy:
+            s.proxies = {"http": proxy, "https": proxy}
+        return s
+
+    _HTTP_BACKEND = "requests"
+
 # FIX-batch-1: orjson в хот path Binance article parsing (3-5x быстрее).
 try:
     import orjson as _orjson  # type: ignore[import-not-found]
@@ -112,8 +141,16 @@ POLL_INTERVAL_BASE = 1.0
 # интервалом, восстанавливается через POLL_BACKOFF_RECOVERY секунд.
 POLL_BACKOFF_429   = 30.0   # пауза при HTTP 429 (как раньше)
 POLL_BACKOFF_MULT  = 1.5    # после ошибки этот поллер замедляется в 1.5x
-POLL_BACKOFF_MAX   = 5.0    # потолок индивидуального интервала
+POLL_BACKOFF_MAX   = 5.0    # потолок интервала для transient-ошибок
 POLL_BACKOFF_RECOVERY = 60.0  # секунд до возврата к POLL_INTERVAL_BASE
+
+# FIX: для «постоянных» отказов (мёртвый прокси: Connection refused,
+# timeout на handshake) поднимаем интервал до 60с, иначе лог захлёбывается
+# 1 ошибкой в секунду на каждый dead proxy. Триггер — N подряд connection
+# errors. После восстановления интервал сам падает по обычной recovery-логике.
+POLL_DEAD_THRESHOLD     = 5      # подряд connection-error'ов = «прокси мёртв»
+POLL_DEAD_INTERVAL      = 60.0   # интервал retry для «мёртвого» поллера
+POLL_DEAD_LOG_EVERY     = 30     # лог только каждый N-й тик пока мёртвый
 
 DELIST_KEYWORDS    = ["Will Delist", "Delisting Notice", "Binance Will Delist"]
 
@@ -235,11 +272,22 @@ _fired_dirty = threading.Event()
 seen_ids: set[int] = set()
 seen_lock = threading.Lock()
 
-# FIX: Binance article-list endpoint начал возвращать 400 с минимальным набором
-# заголовков. CDN (CloudFront) и/или API-gateway требуют браузерные хедера +
-# clienttype/lang. Воспроизводим headers того, что отправляет www.binance.com
-# при загрузке /en/support/announcement-list.
-_BASE_HEADERS = {
+# FIX: Binance API gateway требует Binance-специфичные хедера
+# (clienttype/lang/Referer/Origin). Браузерные UA/Accept/Sec-* при
+# наличии curl_cffi подставляет сам через impersonate-профиль — мы их
+# не дублируем, иначе бы перетёрли «реальный» Chrome-набор.
+#
+# В fallback-режиме (requests) добавляем минимальный набор браузерных
+# заголовков — TLS fingerprint всё равно выдаст python-requests, и
+# 400 продолжатся, но хотя бы хедеры не «пустые».
+_BINANCE_API_HEADERS = {
+    "clienttype": "web",
+    "lang": "en",
+    "Referer": "https://www.binance.com/en/support/announcement-list/",
+    "Origin": "https://www.binance.com",
+}
+_BASE_HEADERS_FALLBACK = {
+    **_BINANCE_API_HEADERS,
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -247,12 +295,8 @@ _BASE_HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/json",
-    "clienttype": "web",
-    "lang": "en",
-    "Referer": "https://www.binance.com/en/support/announcement-list/",
-    "Origin": "https://www.binance.com",
 }
+_BASE_HEADERS = _BINANCE_API_HEADERS if _HTTP_BACKEND == "curl_cffi" else _BASE_HEADERS_FALLBACK
 
 # ── Watchdog timestamps ───────────────────────────────────────────
 _poller_last_ts: dict[int, float] = {}        # {session_idx: timestamp}
@@ -269,13 +313,14 @@ _poller_intervals: dict[int, float] = {}
 _poller_last_bump_ts: dict[int, float] = {}
 _poller_intervals_lock = threading.Lock()
 
-# Создаём отдельную сессию для каждого прокси
-_sessions: list[requests.Session] = []
+# Создаём отдельную сессию для каждого прокси.
+# FIX: при наличии curl_cffi — используем его (с импersonation Chrome TLS).
+# Headers всё равно ставим — это hint для CDN'а (User-Agent логируется),
+# но решающий фактор для Akamai — JA3/JA4 fingerprint.
+_sessions: list = []
 for proxy in PROXIES:
-    s = requests.Session()
+    s = _new_http_session(proxy)
     s.headers.update(_BASE_HEADERS)
-    if proxy:
-        s.proxies = {"http": proxy, "https": proxy}
     _sessions.append(s)
 
 # Инициализируем timestamps для watchdog + интервалы для backoff
@@ -740,11 +785,29 @@ def _get_interval(session_idx: int) -> float:
         return _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """
+    True если ошибка похожа на «прокси/сеть мертва» (Connection refused,
+    timeout на handshake, ProxyError). Используется для перехода в DEAD-режим
+    с длинным интервалом — иначе мёртвый прокси спамит 1 ошибкой в секунду.
+    """
+    s = repr(exc)
+    return (
+        isinstance(exc, (ConnectionError, TimeoutError))
+        or "ProxyError" in s
+        or "Connection refused" in s
+        or "Failed to establish a new connection" in s
+        or "Max retries exceeded" in s
+        or "timed out" in s
+        or "Connection reset" in s
+    )
+
+
 def poller(session_idx: int) -> None:
     label   = f"proxy[{session_idx}]" if session_idx > 0 else "direct"
     session = _sessions[session_idx]
 
-    log_ok("POLLER", f"[{label}] запущен (interval={POLL_INTERVAL_BASE}с base)")
+    log_ok("POLLER", f"[{label}] запущен (interval={POLL_INTERVAL_BASE}с base, http={_HTTP_BACKEND})")
 
     first_run = True
     # FIX-4: счётчик циклов с повышенным интервалом — раз в N циклов
@@ -752,6 +815,12 @@ def poller(session_idx: int) -> None:
     # interval застрянет на POLL_BACKOFF_MAX, recovery никогда не сработает).
     elevated_cycles = 0
     _ELEVATED_WARN_EVERY = 60
+
+    # FIX: трекинг подряд connection-error'ов → переход в DEAD-режим (60с
+    # интервал, лог только каждый N-й тик). Любой успешный ответ — сброс.
+    conn_err_streak = 0
+    dead_mode       = False
+    dead_log_skip   = 0
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         while True:
@@ -797,6 +866,14 @@ def poller(session_idx: int) -> None:
                     _poller_last_ts[session_idx] = time.monotonic()
                 _reset_interval_if_recovered(session_idx)
 
+                # FIX: успех — выходим из DEAD-режима, обнуляем streak.
+                if dead_mode or conn_err_streak > 0:
+                    if dead_mode:
+                        log_ok("POLLER", f"[{label}] восстановилось ✓ выходим из DEAD-режима")
+                    dead_mode = False
+                    conn_err_streak = 0
+                    dead_log_skip = 0
+
                 if articles:
                     if first_run:
                         with seen_lock:
@@ -830,17 +907,42 @@ def poller(session_idx: int) -> None:
                     log_warn("POLLER", f"[{label}] статей нет или пустой ответ")
 
             except Exception as e:
-                log_err("POLLER", f"[{label}] ошибка: {e}")
-                _bump_interval(session_idx)
+                # FIX: классифицируем ошибку. Connection refused / timeout /
+                # ProxyError = «прокси мёртв» — после N подряд переходим в
+                # DEAD-режим (длинный интервал + редкий лог). HTTP 4xx и
+                # прочее — обычный bump (cap 5с).
+                is_conn = _is_connection_error(e)
+                if is_conn:
+                    conn_err_streak += 1
+                else:
+                    conn_err_streak = 0
+
+                if dead_mode:
+                    # В DEAD-режиме логируем только каждый N-й тик.
+                    if dead_log_skip == 0:
+                        log_warn("POLLER", f"[{label}] DEAD ({conn_err_streak} conn-err'ов подряд): {e}")
+                    dead_log_skip = (dead_log_skip + 1) % POLL_DEAD_LOG_EVERY
+                else:
+                    log_err("POLLER", f"[{label}] ошибка: {e}")
+                    if is_conn and conn_err_streak >= POLL_DEAD_THRESHOLD:
+                        dead_mode = True
+                        dead_log_skip = 0
+                        log_warn("POLLER", f"[{label}] → DEAD-режим: интервал {POLL_DEAD_INTERVAL:.0f}с (лог раз в {POLL_DEAD_LOG_EVERY} тика)")
+                    else:
+                        _bump_interval(session_idx)
+
                 # FIX: обновляем watchdog timestamp даже на ошибке — поток
                 # жив и делает прогресс, просто API/прокси отвечает плохо.
                 # Без этого watchdog ложно считал поток «zombie» и слал TG
                 # алерты каждые 90с (на постоянно отдающем 400 endpoint'е).
-                # Реальные zombie-потоки (TLS handshake stuck) определяем
-                # по тому, что цикл while True вообще не итерируется —
-                # такой поток вообще сюда не дойдёт и timestamp не обновит.
                 with _poller_ts_lock:
                     _poller_last_ts[session_idx] = time.monotonic()
+
+            if dead_mode:
+                # FIX: длинный интервал → меньше шума в логах + меньше
+                # бессмысленных connect()'ов на мёртвый прокси.
+                time.sleep(POLL_DEAD_INTERVAL)
+                continue
 
             cur_interval = _get_interval(session_idx)
             # FIX-4: видимость деградации — если интервал давно не сбрасывался,
