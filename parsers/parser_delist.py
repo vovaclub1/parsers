@@ -211,18 +211,47 @@ def _parse_proxies(raw: str) -> list[str | None]:
 
 PROXIES: list[str | None] = _parse_proxies(DELIST_PROXIES)
 
-# ── дедупликация сигналов ────────────────────────────────────────
+# ── дедупликация сигналов: L1 (TTL) + L2 (persistent) ─────────────
+# L1 — короткоживущая защита от near-simultaneous дублей (несколько каналов
+#      пишут об одном делистинге).
+# L2 — постоянная память: «эту монету уже шортили». Защищает от повторного
+#      открытия после рестарта контейнера / получения той же статьи через
+#      разные источники (TG, BINANCE poller, TOA).
+# L2 пишется только после УСПЕШНОГО open (worker callback), чтобы провалившийся
+# open не сделал монету «забытой».
 _fired_lock    = threading.Lock()
 _fired_coins:  set[str] = set()
 _fired_expiry: dict[str, float] = {}
-_FIRED_TTL     = 60   # секунд до снятия блокировки монеты
+_FIRED_TTL     = 60   # L1: секунд до снятия блокировки монеты
+
+# L2: постоянное хранилище отстрелянных монет (любой источник).
+_global_fired: set[str] = set()
+_FIRED_FILE = Path(SESSION_DIR) / "delist_fired.json"
+
+# FIX-PERF: dirty-flag для фонового L2-writer'а — вместо thread.start() на
+# каждый успешный open (то стоило ~3-15мс в hot-path worker'а под GIL contention).
+_fired_dirty = threading.Event()
 
 seen_ids: set[int] = set()
 seen_lock = threading.Lock()
 
+# FIX: Binance article-list endpoint начал возвращать 400 с минимальным набором
+# заголовков. CDN (CloudFront) и/или API-gateway требуют браузерные хедера +
+# clienttype/lang. Воспроизводим headers того, что отправляет www.binance.com
+# при загрузке /en/support/announcement-list.
 _BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "clienttype": "web",
+    "lang": "en",
+    "Referer": "https://www.binance.com/en/support/announcement-list/",
+    "Origin": "https://www.binance.com",
 }
 
 # ── Watchdog timestamps ───────────────────────────────────────────
@@ -274,25 +303,21 @@ def _build_binance_url() -> str:
     был уникальным на каждом запросе. Иначе разные edge'ы могут вернуть
     stale (10-30с задержки от момента публикации статьи).
 
-    Что делаем:
-      1. pageSize крутим из whitelist BINANCE_PAGE_SIZES — все эти значения
-         валидны для API. Меняя его, попадаем на разные cache key.
-      2. _t=<ms-timestamp> — гарантированный uniqueness каждого запроса.
-      3. Перемешиваем порядок параметров — у некоторых CDN порядок учитывается.
-
-    FIX: убран дополнительный rnd_name=rnd_val — _t уже даёт уникальный
-    cache key, второй random был избыточен (не вреден, но шум).
+    FIX: убран random.shuffle(params) — Binance API gateway начал возвращать
+    400 на «нестандартный» порядок параметров (видимо WAF-правило).
+    pageSize крутим из whitelist, чтобы попадать на разные CloudFront cache
+    keys, но порядок параметров теперь фиксированный.
+    _t=<ms-timestamp> — гарантированный uniqueness каждого запроса.
     """
     page_sz = random.choice(BINANCE_PAGE_SIZES)
 
     params = [
         ("type", "1"),
+        ("catalogId", str(CATEGORY_ID)),
         ("pageNo", "1"),
         ("pageSize", str(page_sz)),
-        ("catalogId", str(CATEGORY_ID)),
         ("_t", str(int(time.time() * 1000))),  # ms timestamp — гарантированный uniqueness
     ]
-    random.shuffle(params)
     qs = "&".join(f"{k}={v}" for k, v in params)
     return f"{BINANCE_API_URL}?{qs}"
 
@@ -324,15 +349,62 @@ def log_err(tag: str, msg: str):   _log(tag, RED,    msg)
 
 # ── Дедупликация сигналов ─────────────────────────────────────────
 
+def _load_fired_state() -> None:
+    """Подгружает L2 с диска. Безопасно к отсутствию файла / битым данным."""
+    try:
+        if not _FIRED_FILE.exists():
+            return
+        raw = _FIRED_FILE.read_bytes()
+        if not raw.strip():
+            return
+        try:
+            import orjson as _oj  # type: ignore[import-not-found]
+            data = _oj.loads(raw)
+        except ImportError:
+            import json as _stdj
+            data = _stdj.loads(raw.decode())
+        gf = data.get("global", [])
+        with _fired_lock:
+            if isinstance(gf, list):
+                _global_fired.update(str(c) for c in gf if isinstance(c, str))
+        log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)}")
+    except Exception as e:  # noqa: BLE001
+        log_warn("DEDUP", f"L2 load failed: {e!r} — стартуем с пустого")
+
+
+def _persist_fired_state() -> None:
+    """Атомарный сейв L2 (write+rename). Вызывается фоновым writer'ом."""
+    try:
+        with _fired_lock:
+            snapshot = {"global": sorted(_global_fired)}
+        try:
+            import orjson as _oj  # type: ignore[import-not-found]
+            payload = _oj.dumps(snapshot, option=_oj.OPT_INDENT_2)
+        except ImportError:
+            import json as _stdj
+            payload = _stdj.dumps(snapshot, indent=2).encode()
+        _FIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _FIRED_FILE.with_suffix(".json.tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(_FIRED_FILE)
+    except Exception as e:  # noqa: BLE001
+        log_warn("DEDUP", f"L2 persist failed: {e!r}")
+
+
 def _try_claim(coin: str) -> bool:
     """
     Возвращает True если монета ещё не в работе и блокирует её на _FIRED_TTL секунд.
     Защищает от двойного открытия одной монеты.
+    L2 (_global_fired) — проверка «уже шортили эту монету когда-либо».
     FIX-PERF: было — на каждый claim спавнили sleep-thread для TTL-cleanup.
     threading.Thread.start() ≈ 3-5мс на coin (для 5 монет = 15-25мс в hot-path).
     Теперь один фоновый sweeper (_fired_sweeper) подметает по таймстампу.
     """
     with _fired_lock:
+        # L2: уже шортили эту монету (навсегда) → skip.
+        if coin in _global_fired:
+            return False
+        # L1: монета сейчас обрабатывается (TTL) → skip.
         if coin in _fired_coins:
             return False
         _fired_coins.add(coin)
@@ -340,8 +412,38 @@ def _try_claim(coin: str) -> bool:
     return True
 
 
+def _mark_opened(coin: str) -> None:
+    """
+    Worker зовёт после успешного open. Обновляет L2 (in-memory) и поднимает
+    dirty-flag — фоновый writer (_fired_persist_loop) сохранит на диск.
+
+    FIX-PERF: НЕ спавним поток здесь — это hot-path worker'а. Только set.add
+    (~1мкс) + Event.set (~1мкс).
+    """
+    dirty = False
+    with _fired_lock:
+        if coin not in _global_fired:
+            _global_fired.add(coin)
+            dirty = True
+    if dirty:
+        _fired_dirty.set()
+
+
+def _fired_persist_loop() -> None:
+    """
+    Единый фоновый writer L2 на диск. Просыпается по dirty-flag, ждёт ещё
+    1с (батчинг — если за это окно прилетит несколько open'ов на burst'е,
+    всё запишется одним write+rename), потом сохраняет.
+    """
+    while True:
+        _fired_dirty.wait()
+        time.sleep(1.0)
+        _fired_dirty.clear()
+        _persist_fired_state()
+
+
 def _fired_sweeper() -> None:
-    """FIX-PERF: единый поток для TTL-cleanup _fired_coins."""
+    """FIX-PERF: единый поток для TTL-cleanup L1 _fired_coins. L2 — навсегда."""
     while True:
         time.sleep(5)
         now = time.monotonic()
@@ -425,6 +527,11 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             # FIX-PERF: tg_log fire-and-forget (см. tg/tg_logger.py).
             tg_log(
                 f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
+
+            # FIX-PERF: bookkeeping L2 ПОСЛЕ метрики и tg_log — не влияет
+            # на «время от сигнала до ордера». _mark_opened только set.add +
+            # Event.set (~2мкс), без thread.start (см. _fired_persist_loop).
+            _mark_opened(coin)
             return
         except Exception as e:
             log_err("WORKER", f"{coin}: попытка {attempt}/{retries} упала → {e}")
@@ -462,14 +569,21 @@ _signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="delist-
 _tp_sl_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="delist-tpsl")
 
 
-def process_signal(pairs: list[str], source: str, t_start: float) -> None:
+def process_signal(pairs: list[str], source: str, t_start: float | None = None) -> None:
     """
     Общая функция обработки сигнала делистинга.
-    Фильтрует дубли через _try_claim, открывает шорты.
+    Фильтрует дубли через _try_claim (L1 TTL + L2 persistent), открывает шорты.
+
+    FIX: t_start теперь опционален. Если None — замеряем сами (бэк-совместимость).
+    Если передан (из TOA WS / TG handler / poller) — используем точный момент
+    прихода сигнала, чтобы метрики OPEN в логах отражали полный путь.
     """
+    if t_start is None:
+        t_start = time.perf_counter()
+
     new_pairs = [c for c in pairs if _try_claim(c)]
     if not new_pairs:
-        log_warn("SIGNAL", f"[{source}] все монеты уже в работе: {pairs}")
+        log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
         return
 
     margin = calculate_margin_for_delist()
@@ -648,6 +762,11 @@ def poller(session_idx: int) -> None:
                 if resp.status_code == 429:
                     log_warn("POLLER", f"[{label}] 429 — пауза {POLL_BACKOFF_429}с + замедление")
                     _bump_interval(session_idx)
+                    # FIX: обновляем watchdog timestamp — поток жив и делает
+                    # прогресс. Иначе после нескольких 429 watchdog ложно
+                    # считал поток zombie.
+                    with _poller_ts_lock:
+                        _poller_last_ts[session_idx] = time.monotonic()
                     time.sleep(POLL_BACKOFF_429)
                     continue
                 resp.raise_for_status()
@@ -713,6 +832,15 @@ def poller(session_idx: int) -> None:
             except Exception as e:
                 log_err("POLLER", f"[{label}] ошибка: {e}")
                 _bump_interval(session_idx)
+                # FIX: обновляем watchdog timestamp даже на ошибке — поток
+                # жив и делает прогресс, просто API/прокси отвечает плохо.
+                # Без этого watchdog ложно считал поток «zombie» и слал TG
+                # алерты каждые 90с (на постоянно отдающем 400 endpoint'е).
+                # Реальные zombie-потоки (TLS handshake stuck) определяем
+                # по тому, что цикл while True вообще не итерируется —
+                # такой поток вообще сюда не дойдёт и timestamp не обновит.
+                with _poller_ts_lock:
+                    _poller_last_ts[session_idx] = time.monotonic()
 
             cur_interval = _get_interval(session_idx)
             # FIX-4: видимость деградации — если интервал давно не сбрасывался,
@@ -974,6 +1102,10 @@ if __name__ == "__main__":
     log_ok("PARSER", "Ждём 5с пока price_cache наполнится...")
     time.sleep(5)
 
+    # Загружаем L2-дедуп с диска ДО запуска поллеров — иначе первый тик
+    # после рестарта может повторно отстрелить уже отшорченную монету.
+    _load_fired_state()
+
     # FIX-PERF: pre-warm + chain warmup ДО запуска поллеров. Иначе если
     # poller сразу детектит свежую статью на старте — первый делистинг
     # попадает на cold-path (видели 27мс на listing'е аналогично).
@@ -1012,8 +1144,11 @@ if __name__ == "__main__":
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
 
-    # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
+    # FIX-PERF: глобальный sweeper для L1 _fired_coins вместо thread-per-claim.
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
+    # FIX-PERF: единый фоновый L2-writer (dirty-flag + 1с batching) вместо
+    # thread.start на каждый _mark_opened в hot-path.
+    threading.Thread(target=_fired_persist_loop, daemon=True, name="fired-persist").start()
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:
