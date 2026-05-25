@@ -193,6 +193,22 @@ TG_DELIST_NEG = [
     "alpha removal",
     "from alpha",
     "delisting postponed",  # отменили
+    # FIX: "Notice of Removal of Margin Trading Pairs" ≠ делистинг токена.
+    # Снимаются только margin-пары; на spot/perp монета остаётся, шорт
+    # открывать нельзя (получаем ложный сигнал на случайный тикер из
+    # текста, см. инцидент с FOLLOWING/AT 2026-05-25).
+    "margin trading pairs",
+    "margin trading pair",
+    "removal of margin",
+    "margin pairs",
+    "isolated margin",
+    "cross margin",
+    # Аналогичные «не-делисты»: leveraged token shutdowns, copy-trading
+    # ограничения и т.п. — это не уход монеты с биржи.
+    "leveraged tokens",
+    "copy trading",
+    "convert pairs",
+    "convert pair",
 ]
 
 # Watchdog

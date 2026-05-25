@@ -148,6 +148,30 @@ EXCLUDED_TOKENS = {
     # FIX: убрана "USDⓈ" — regex [A-Z0-9] её никогда не вернёт (Ⓢ U+24C8 не ASCII).
     "USDS",  # Binance liquid staking
     "ANNOUNCEMENT", "ANNOUNCEMENTS",
+    # FIX: ложные срабатывания на «margin trading pairs» нотисах
+    # (см. инцидент 2026-05-25: матчилось 'FOLLOWING' и 'AT',
+    # последнее реально шортилось как тикер AT). Расширяем список
+    # самыми частыми «английскими словами длиной 2-8», которые могут
+    # появиться в теле уведомления и пройти regex [A-Z0-9]{2,10}.
+    "AT", "AS", "BY", "OR", "OF", "IT", "IF", "SO", "DO",
+    "FOLLOWING", "FOLLOWED", "FOLLOWS",
+    "PLEASE", "NOTE", "NOTED", "NOTES",
+    "EFFECTIVE", "STARTING", "BEGINNING", "ENDING", "ENDS",
+    "DATE", "TIME", "TIMES", "HOUR", "HOURS",
+    "USERS", "USER", "CLIENTS", "CLIENT",
+    "WITHDRAWAL", "WITHDRAWALS", "WITHDRAW",
+    "DEPOSIT", "DEPOSITS",
+    "ORDER", "ORDERS", "POSITION", "POSITIONS",
+    "BALANCE", "BALANCES", "ACCOUNT", "ACCOUNTS",
+    "FUND", "FUNDS", "FUNDING",
+    "ISOLATED", "CROSS", "LEVERAGE", "LEVERAGED",
+    "CONVERT", "CONVERTED", "CONVERTING",
+    "COPY", "BOT", "BOTS",
+    "REGION", "REGIONS", "COUNTRY", "COUNTRIES",
+    "SUBJECT", "TERMS", "AGREEMENT", "POLICY", "POLICIES",
+    "DUE", "PER", "VIA", "INTO", "OUT", "AFTER", "BEFORE",
+    "ABOVE", "BELOW", "BETWEEN",
+    "DETAILS", "DETAIL", "MORE", "LESS", "ABOUT",
 }
 
 # ── Кэш цен ──────────────────────────────────────────────────────
