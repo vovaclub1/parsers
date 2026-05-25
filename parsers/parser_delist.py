@@ -402,9 +402,16 @@ def _probe_proxy_health() -> None:
     if not _sessions:
         return
 
-    test_url = _build_binance_url()
+    # FIX-INCIDENT: форсим pageSize=max, чтобы probe-ответ принёс полный
+    # набор актуальных статей — этим набором pre-fill'ним seen_ids ДО
+    # старта поллеров. Иначе первый запрос поллера может попасть на
+    # random pageSize=5, в seen_ids уйдут 5 ID, а следующий запрос с
+    # pageSize=20 принесёт 15 «новых» (исторических) → mass open shorts.
+    test_url = _build_binance_url(force_page_size=max(BINANCE_PAGE_SIZES))
     results: dict[int, str] = {}
     results_lock = threading.Lock()
+    prefilled_ids: list[int] = []
+    prefilled_lock = threading.Lock()
 
     def _probe_one(idx: int) -> None:
         sess = _sessions[idx]
@@ -414,6 +421,26 @@ def _probe_proxy_health() -> None:
             r.raise_for_status()
             with results_lock:
                 results[idx] = f"[{label}] OK ({r.status_code})"
+            # FIX-INCIDENT: pre-fill seen_ids из ответа любой живой сессии.
+            # Несколько сессий могут отдать пересекающиеся наборы — set'у
+            # пофиг на дубликаты. Берём всё что распарсилось; ошибка
+            # парсинга не валит probe — мы здесь не для этого.
+            try:
+                if _parse_binance_articles is not None:
+                    arts = _parse_binance_articles(r.content)
+                else:
+                    d = _json_loads(r.content).get("data", {})
+                    cats = d.get("catalogs") or [{}]
+                    arts = d.get("articles") or (
+                        cats[0].get("articles", []) if isinstance(cats[0], dict) else []
+                    )
+                with prefilled_lock:
+                    for a in arts:
+                        aid = a.get("id")
+                        if aid is not None:
+                            prefilled_ids.append(aid)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001
             with results_lock:
                 results[idx] = f"[{label}] DEAD: {e!r}"
@@ -437,6 +464,19 @@ def _probe_proxy_health() -> None:
         marker = "✗" if idx in _poller_initial_dead else "✓"
         print(f"  {marker} {results[idx]}", flush=True)
 
+    # FIX-INCIDENT: pre-fill seen_ids ДО старта поллеров. После этого даже
+    # если у поллера random выдаст pageSize=5 на первом запросе — все 5
+    # ID уже в seen_ids (из probe c pageSize=20), и логика "новые статьи"
+    # сработает корректно (0 новых → 0 process_article).
+    if prefilled_ids:
+        with seen_lock:
+            seen_ids.update(prefilled_ids)
+        print(
+            f"[PROXY-PROBE] seen_ids pre-filled: {len(set(prefilled_ids))} "
+            f"уникальных статей забанено до старта поллеров",
+            flush=True,
+        )
+
 
 # Probe вызывается из main(), перед запуском поллер-потоков —
 # к тому моменту все вспомогательные функции (_build_binance_url,
@@ -454,7 +494,7 @@ def _next_session() -> tuple[int, object]:
 
 # ── FIX-batch-8: cache-busting URL builder ────────────────────────
 
-def _build_binance_url() -> str:
+def _build_binance_url(force_page_size: int | None = None) -> str:
     """
     Собирает URL к Binance article API.
 
@@ -467,8 +507,15 @@ def _build_binance_url() -> str:
     Cache-busting на стороне CloudFront остаётся через ротацию pageSize ∈
     {5,10,15,20} — это 4 разных cache key, чего достаточно при interval=1с,
     учитывая что у нас несколько поллеров (direct + N proxies).
+
+    FIX-INCIDENT: force_page_size форсит конкретное значение pageSize. Нужно
+    для первого запроса поллера: если на нём попадёт случайно pageSize=5,
+    в seen_ids уйдёт только 5 ID, и на следующем запросе с pageSize=20 ещё
+    15 «старых» статей будут считаться новыми → массовый process_article →
+    шорты по всем подряд тикерам. Поллер обязан на старте взять max(20)
+    чтобы гарантированно набрать полный «бан-лист» исторических статей.
     """
-    page_sz = random.choice(BINANCE_PAGE_SIZES)
+    page_sz = force_page_size if force_page_size is not None else random.choice(BINANCE_PAGE_SIZES)
     return (
         f"{BINANCE_API_URL}"
         f"?type=1&catalogId={CATEGORY_ID}&pageNo=1&pageSize={page_sz}"
@@ -989,7 +1036,14 @@ def poller(session_idx: int) -> None:
         while True:
             try:
                 # FIX-batch-8: cache-busting URL — на каждый запрос новый cache key.
-                url = _build_binance_url()
+                # FIX-INCIDENT: на первом запросе ФОРСИМ pageSize=max(BINANCE_PAGE_SIZES).
+                # Иначе если random выдаст pageSize=5, в seen_ids уйдёт всего 5 ID,
+                # а следующий запрос с pageSize=20 принесёт 15 «новых» (на самом деле
+                # старых) статей → массовый process_article → шорты пачкой. См. инцидент
+                # 2026-05-25: 5 → 20 пейдж-сайз скачок открыл позиции по 30+ тикерам.
+                url = _build_binance_url(
+                    force_page_size=max(BINANCE_PAGE_SIZES) if first_run else None
+                )
                 resp = session.get(url, timeout=4)
                 if resp.status_code == 429:
                     log_warn("POLLER", f"[{label}] 429 — пауза {POLL_BACKOFF_429}с + замедление")
