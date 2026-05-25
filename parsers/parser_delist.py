@@ -365,27 +365,23 @@ def _next_session() -> tuple[int, object]:
 
 def _build_binance_url() -> str:
     """
-    Собирает URL к Binance article API так, чтобы CloudFront cache key
-    был уникальным на каждом запросе. Иначе разные edge'ы могут вернуть
-    stale (10-30с задержки от момента публикации статьи).
+    Собирает URL к Binance article API.
 
-    FIX: убран random.shuffle(params) — Binance API gateway начал возвращать
-    400 на «нестандартный» порядок параметров (видимо WAF-правило).
-    pageSize крутим из whitelist, чтобы попадать на разные CloudFront cache
-    keys, но порядок параметров теперь фиксированный.
-    _t=<ms-timestamp> — гарантированный uniqueness каждого запроса.
+    FIX: убран `_t=<ms-timestamp>` cache-busting параметр. Binance WAF
+    отбивает HTTP 400 любой запрос с неизвестным query-параметром (whitelist:
+    только type/catalogId/pageNo/pageSize). Был воспроизведён `curl` без
+    кук/headers — с `_t` → 400, без `_t` → 200. Это и было настоящей причиной
+    «delist parser ничего не получает» (а не TLS/JA3/IP-блок, как казалось).
+
+    Cache-busting на стороне CloudFront остаётся через ротацию pageSize ∈
+    {5,10,15,20} — это 4 разных cache key, чего достаточно при interval=1с,
+    учитывая что у нас несколько поллеров (direct + N proxies).
     """
     page_sz = random.choice(BINANCE_PAGE_SIZES)
-
-    params = [
-        ("type", "1"),
-        ("catalogId", str(CATEGORY_ID)),
-        ("pageNo", "1"),
-        ("pageSize", str(page_sz)),
-        ("_t", str(int(time.time() * 1000))),  # ms timestamp — гарантированный uniqueness
-    ]
-    qs = "&".join(f"{k}={v}" for k, v in params)
-    return f"{BINANCE_API_URL}?{qs}"
+    return (
+        f"{BINANCE_API_URL}"
+        f"?type=1&catalogId={CATEGORY_ID}&pageNo=1&pageSize={page_sz}"
+    )
 
 
 # ── Heartbeat для docker healthcheck ──────────────────────────────
