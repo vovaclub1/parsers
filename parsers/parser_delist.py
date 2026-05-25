@@ -796,16 +796,55 @@ def _is_connection_error(exc: BaseException) -> bool:
     timeout на handshake, ProxyError). Используется для перехода в
     DEAD-режим с длинным интервалом — иначе мёртвый прокси спамит
     1 ошибкой в секунду.
+
+    FIX: добавлены curl_cffi-паттерны — раньше ловили только requests'ы
+    стиль ('Connection refused', 'Max retries exceeded'), а curl_cffi
+    шлёт другие сообщения ('Failed to perform, curl: (7) ...',
+    'Resolving timed out after ...'). Без этого DEAD-режим не
+    срабатывал и логи захлёбывались 1 ошибкой/сек.
     """
     s = repr(exc)
     return (
         isinstance(exc, (ConnectionError, TimeoutError))
+        # requests/urllib3 стиль
         or "ProxyError" in s
         or "Connection refused" in s
         or "Failed to establish a new connection" in s
         or "Max retries exceeded" in s
         or "timed out" in s
         or "Connection reset" in s
+        # curl_cffi стиль (libcurl error messages)
+        or "Failed to perform" in s
+        or "Failed to connect to" in s
+        or "Could not connect to server" in s
+        or "Resolving timed out" in s
+        or "Could not resolve host" in s
+        or "curl: (7)" in s   # CURLE_COULDNT_CONNECT
+        or "curl: (28)" in s  # CURLE_OPERATION_TIMEDOUT
+        or "curl: (6)" in s   # CURLE_COULDNT_RESOLVE_HOST
+        or "curl: (35)" in s  # CURLE_SSL_CONNECT_ERROR
+        or "curl: (56)" in s  # CURLE_RECV_ERROR
+    )
+
+
+def _is_http_block(exc: BaseException) -> bool:
+    """
+    True если ошибка — устойчивый HTTP-блок (400/403). Это не транзиентка
+    и не сетевая дыра, а WAF/IP-блок на стороне Binance: дальнейшие
+    запросы 100% дадут то же самое. Лечится только сменой egress IP
+    (другой прокси / резидентные прокси / VPN), кодом — никак.
+    Используется тем же DEAD-режимом, чтобы не спамить лог 400-ми.
+
+    Распознаём по тексту, потому что:
+      • requests шлёт HTTPError с '400 Client Error' / '403 Forbidden'
+      • curl_cffi (через .raise_for_status()) шлёт 'HTTP Error 400:'
+    """
+    s = repr(exc)
+    return (
+        "HTTP Error 400" in s
+        or "HTTP Error 403" in s
+        or "400 Client Error" in s
+        or "403 Client Error" in s
     )
 
 
@@ -913,12 +952,17 @@ def poller(session_idx: int) -> None:
                     log_warn("POLLER", f"[{label}] статей нет или пустой ответ")
 
             except Exception as e:
-                # FIX: классифицируем ошибку. Connection refused / timeout /
-                # ProxyError = «прокси мёртв» — после N подряд переходим в
-                # DEAD-режим (60с интервал, редкий лог). HTTP 4xx и прочее —
-                # обычный bump (cap 5с).
-                is_conn = _is_connection_error(e)
-                if is_conn:
+                # FIX: классифицируем ошибку.
+                #   • connection error (прокси/DNS/handshake умер) → DEAD
+                #   • HTTP 400/403 (IP/ASN-блок Binance WAF) → тоже DEAD,
+                #     потому что кодом не лечится: нужны другие egress IP
+                #     (резидентные прокси) или другой источник. Лог раз в
+                #     N тиков, иначе захлёбываемся 1 ошибкой/сек × 4 поллера.
+                #   • прочее (HTTP 5xx, schema-mismatch и т.п.) → обычный
+                #     bump (cap 5с) — это транзиентка, должно само пройти.
+                is_conn  = _is_connection_error(e)
+                is_block = _is_http_block(e)
+                if is_conn or is_block:
                     conn_err_streak += 1
                 else:
                     conn_err_streak = 0
@@ -926,14 +970,15 @@ def poller(session_idx: int) -> None:
                 if dead_mode:
                     # В DEAD-режиме логируем только каждый N-й тик.
                     if dead_log_skip == 0:
-                        log_warn("POLLER", f"[{label}] DEAD ({conn_err_streak} conn-err'ов подряд): {e}")
+                        log_warn("POLLER", f"[{label}] DEAD ({conn_err_streak} подряд): {e}")
                     dead_log_skip = (dead_log_skip + 1) % POLL_DEAD_LOG_EVERY
                 else:
                     log_err("POLLER", f"[{label}] ошибка: {e}")
-                    if is_conn and conn_err_streak >= POLL_DEAD_THRESHOLD:
+                    if (is_conn or is_block) and conn_err_streak >= POLL_DEAD_THRESHOLD:
                         dead_mode = True
                         dead_log_skip = 0
-                        log_warn("POLLER", f"[{label}] → DEAD-режим: интервал {POLL_DEAD_INTERVAL:.0f}с (лог раз в {POLL_DEAD_LOG_EVERY} тика)")
+                        reason = "IP/ASN-блок (HTTP 400/403)" if is_block else "сеть/прокси мертва"
+                        log_warn("POLLER", f"[{label}] → DEAD-режим: {reason}, интервал {POLL_DEAD_INTERVAL:.0f}с (лог раз в {POLL_DEAD_LOG_EVERY} тика)")
                     else:
                         _bump_interval(session_idx)
 
