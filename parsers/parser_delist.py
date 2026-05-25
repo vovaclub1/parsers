@@ -134,16 +134,31 @@ BINANCE_API_URL    = "https://www.binance.com/bapi/composite/v1/public/cms/artic
 ARTICLE_DETAIL_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
 CATEGORY_ID        = 161
 
-# FIX-batch-8: 3с → 1с базового интервала.
-# С N=3 прокси и stagger даёт median детекции ~500мс вместо ~1500мс.
-# Хардкод (не env) — это публичный параметр поллера, не персональные данные.
-POLL_INTERVAL_BASE = 1.0
+# Базовый интервал между запросами одного поллера (секунды).
+# FIX: 1.0с давал 60 req/min на IP — Binance стабильно банил 429 в первые
+# ~15с (по логам: 14 запросов от direct → 429, потом каждый раз после
+# POLL_BACKOFF_429 паузы цикл повторялся). 3.0с даёт ~20 req/min на IP —
+# с запасом ниже наблюдаемого лимита /bapi/composite, при этом с 3-4
+# поллерами эффективный глобальный rate остаётся ~1 req/с (median
+# детекции ~500мс — приемлемо для делистинга).
+# Env DELIST_POLL_INTERVAL=Xс позволяет тюнить без передеплоя: уменьшить
+# если 3с надёжно держит и хочется быстрее, или увеличить если 3с всё
+# ещё ловит 429 (тогда Binance срезал лимиты — попробуй 5.0 или 6.0).
+POLL_INTERVAL_BASE = float(os.getenv("DELIST_POLL_INTERVAL", "3.0"))
+# Анти-стадо: добавляем ±jitter на каждый sleep, чтобы N поллеров,
+# стартовавших на одном CPU-тике, не били Binance синхронно.
+# 0.10 = ±10% — при 3с интервале это ±300мс, незаметно для детекции,
+# но размывает пики req/с на стороне Binance.
+POLL_INTERVAL_JITTER = 0.10
 # FIX-batch-8: per-poller адаптивный backoff при 429 — поллер, который
 # нарвался на rate limit, делает свой следующий запрос с увеличенным
 # интервалом, восстанавливается через POLL_BACKOFF_RECOVERY секунд.
 POLL_BACKOFF_429   = 30.0   # пауза при HTTP 429 (как раньше)
 POLL_BACKOFF_MULT  = 1.5    # после ошибки этот поллер замедляется в 1.5x
-POLL_BACKOFF_MAX   = 5.0    # потолок интервала для transient-ошибок
+# FIX: при POLL_INTERVAL_BASE=3.0 потолок 5.0 = всего 1.7x запаса. Поднимаем
+# до 5× базового, чтобы backoff реально мог растянуться при флапающем
+# Binance/прокси (иначе MULT=1.5 упирается в потолок после первого bump'а).
+POLL_BACKOFF_MAX   = max(15.0, POLL_INTERVAL_BASE * 5)
 POLL_BACKOFF_RECOVERY = 60.0  # секунд до возврата к POLL_INTERVAL_BASE
 
 # FIX: «постоянные» отказы (мёртвый прокси: Connection refused,
@@ -1118,7 +1133,11 @@ def poller(session_idx: int) -> None:
                     log_warn("POLLER", f"[{label}] интервал {cur_interval:.1f}с уже {elevated_cycles} циклов — нестабильное соединение?")
             else:
                 elevated_cycles = 0
-            time.sleep(cur_interval)
+            # ±jitter чтобы поллеры не били Binance синхронно (анти-стадо).
+            # Без jitter'а 3 stagger'нутых поллера сходятся в фазе через
+            # несколько циклов и создают пики req/с на стороне Binance.
+            jitter = cur_interval * POLL_INTERVAL_JITTER * (2 * random.random() - 1)
+            time.sleep(cur_interval + jitter)
 
 
 # ── Watchdog ──────────────────────────────────────────────────────
@@ -1394,7 +1413,7 @@ if __name__ == "__main__":
         log_warn("PARSER", f"Chain warmup упал: {e!r} — первый делистинг будет медленнее")
 
     tg_log(f"🚀 <b>DELIST парсер запущен</b>\nПоллеры: {len(_sessions)}\nБиржи: Bybit + Gate.io (fallback)")
-    log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами")
+    log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → base={POLL_INTERVAL_BASE:.1f}с, jitter=±{POLL_INTERVAL_JITTER*100:.0f}%, ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами глобально")
 
     # Startup proxy health-probe — отсеиваем заведомо мёртвые прокси
     # (Connection refused / DNS-фейл / 4xx-блок), чтобы не молотить TCP-connect
