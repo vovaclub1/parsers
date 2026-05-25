@@ -101,6 +101,16 @@ except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
         pass
 
+# FIX-PERF: модуль для замера latency сигнал→fill. track() = dict-set
+# (~100-300ns), бэкграунд-поток подписан на /v5/private execution-стрим
+# и логирует [FILL] с реальными биржевыми таймстемпами.
+try:
+    from api.bybit_ws_execution import track as _exec_track
+except Exception as _exec_import_exc:  # noqa: BLE001 — graceful
+    print(f"[BYBIT-WS-EXEC] модуль не подгружен: {_exec_import_exc!r} — замер latency недоступен")
+    def _exec_track(order_link_id: str, t_signal_perf: float) -> None:  # type: ignore[misc]
+        return
+
 # ── Конфиг Bybit ─────────────────────────────────────────────────
 BYBIT_BASE_URL = "https://api.bybit.com"
 ORDER_CREATE_URL = BYBIT_BASE_URL + "/v5/order/create"   # FIX-batch-8: pre-built URL
@@ -629,12 +639,17 @@ _delist_exchange: dict[str, str] = {}   # {ticker: "bybit" | "gate"}
 _delist_exchange_lock = threading.Lock()
 
 
-def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, float]:
+def market_open_short(ticker_name: str, usdt_amount: float,
+                      t_signal_perf: float | None = None) -> tuple[float, float]:
     """
     Открывает рыночный шорт напрямую через Bybit V5 REST.
     Без ccxt — убирает overhead load_markets / нормализации.
     :param ticker_name: str - тикер монеты.
     :param usdt_amount: float - маржа в USDT.
+    :param t_signal_perf: time.perf_counter() в момент прихода сигнала.
+        Если передан — регистрируется в bybit_ws_execution для замера
+        end-to-end latency сигнал→fill (см. [FILL] логи). Hot-path
+        overhead ~200ns. None — без замера, всё работает как раньше.
     :return: tuple[float, float] - (количество, цена входа), (0, 0) если не удалось.
     """
     bybit_price = get_price(ticker_name)
@@ -661,6 +676,12 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 # реально прошёл, но ack не пришёл, REST с тем же
                 # orderLinkId Bybit отвергнет (retCode 30050 → success).
                 order_link_id = _new_order_link_id()
+                # FIX-PERF: регистрируем ордер в private execution-стриме для
+                # замера latency сигнал→fill. ДО send (fill, который может
+                # прийти через 30мс, гарантированно найдёт запись в pending).
+                # Стоимость: ~200ns (dict-set под GIL).
+                if t_signal_perf is not None:
+                    _exec_track(order_link_id, t_signal_perf)
 
                 # FIX-batch-5: пробуем WS Trade API (−30...−80мс), при ошибке/None — REST.
                 placed_via = "REST"
@@ -743,6 +764,10 @@ def warmup_chain(n: int = 30) -> int:
                 continue
             qty_str = str(amount_tokens)
             order_link_id = _new_order_link_id()
+            # FIX-PERF: прогреваем ветку с _exec_track — иначе её bytecode
+            # cold на первом реальном делистинге. Стоимость: ~200ns × n, и
+            # 30 orphan-записей в _pending которые GC чистит через 30с.
+            _exec_track(order_link_id, time.perf_counter())
             ws_args = {
                 "category":    "linear",
                 "symbol":      symbol,

@@ -406,7 +406,7 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             # в hot-path. Открытие позиции важнее, чем factual лог.
             if attempt > 1:
                 log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
-            amount, entry_price = market_open_short(coin, margin)
+            amount, entry_price = market_open_short(coin, margin, t_signal_perf=t_start)
             if not amount:
                 log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
                 time.sleep(0.1)
@@ -968,6 +968,21 @@ if __name__ == "__main__":
                 log_warn("PARSER", "Bybit ASYNC WS не подключился за 3с — fallback на REST до коннекта")
         except Exception as e:
             log_err("PARSER", f"Bybit ASYNC WS init упал: {e!r} — будет REST")
+
+        # FIX-PERF: private execution stream для замера latency сигнал→fill.
+        # Отдельное WS-подключение к /v5/private, фоновый thread. Hot-path
+        # ничего не платит, кроме одного dict-set (~200ns) в market_open_short.
+        # При fill'е логирует [FILL] symbol exchange_fill_delay=Xмс e2e_recv=Yмс.
+        # Можно выключить через BYBIT_EXEC_LATENCY=0.
+        try:
+            from api import bybit_ws_execution as _exec_mod
+            if _exec_mod.is_enabled():
+                _exec_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                log_ok("PARSER", "Bybit WS Execution stream запущен (замер сигнал→fill)")
+            else:
+                log_info("PARSER", "Bybit WS Execution отключён (BYBIT_EXEC_LATENCY=0)")
+        except Exception as e:
+            log_warn("PARSER", f"Bybit WS Execution init упал: {e!r} — без замера latency")
     else:
         log_info("PARSER", "Bybit WS Trade отключён (BYBIT_WS_TRADE_ENABLED=0 или нет ключей) — используем REST")
 
