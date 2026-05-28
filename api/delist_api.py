@@ -172,6 +172,27 @@ EXCLUDED_TOKENS = {
     "DUE", "PER", "VIA", "INTO", "OUT", "AFTER", "BEFORE",
     "ABOVE", "BELOW", "BETWEEN",
     "DETAILS", "DETAIL", "MORE", "LESS", "ABOUT",
+    # FIX: словарные английские слова из Binance Earn / Launchpool /
+    # promo-заголовков. Метод 5 (fallback по known_coins) в
+    # find_listing_pairs выдирает любые \b[A-Z0-9]{2,8}\b слова и
+    # отсеивает по EXCLUDED_TOKENS + known_coins. На длинных промо-
+    # текстах ('Subscribe to ... Locked Products ... Enjoy 200% APR
+    # for 7 Days') проходило APR/DAYS/etc. Все они тут.
+    "APR", "APY",
+    "DAYS", "DAY", "WEEK", "WEEKS", "MONTH", "MONTHS", "YEAR", "YEARS",
+    "SPECIAL", "OFFER", "OFFERS",
+    "SUBSCRIBE", "SUBSCRIPTION",
+    "LOCKED", "FLEXIBLE",
+    "ENJOY", "ENJOYS", "ENJOYED",
+    "REWARD", "REWARDS",
+    "PROMO", "PROMOTION", "PROMOTIONAL",
+    "STAKE", "STAKING", "STAKED",
+    "LAUNCHPOOL", "MEGADROP", "AIRDROPS",
+    "BONUS", "BONUSES",
+    "LIMITED", "EXCLUSIVE",
+    # Часто встречаются в Bithumb/Upbit заголовках на корейском
+    # транслите/английском, но не тикеры:
+    "EVENT", "EVENTS", "CELEBRATION", "CELEBRATE",
 }
 
 # ── Кэш цен ──────────────────────────────────────────────────────

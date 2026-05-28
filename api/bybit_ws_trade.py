@@ -153,7 +153,32 @@ class BybitWsTrade:
         if self._send_lock is None:
             self._send_lock = asyncio.Lock()
         delay = _RECONNECT_DELAY_MIN
+        # FIX: время последнего «sync здоров» лога — чтобы не флудить
+        # лог сообщением каждые 5с.
+        _last_sync_idle_log = 0.0
         while not self._stop:
+            # FIX (latency-critical): Bybit V5 Trade держит ОДИН коннект
+            # на API-key. Если sync-вариант уже подключён, async-попытка
+            # подключиться → Bybit выкидывает старую сессию → sync
+            # реконнектится → выкидывает async → бесконечный flap каждую
+            # секунду. В логе из-за этого place_order_ws_fast регулярно
+            # уходит на REST (а это +30-80мс к каждому ордеру).
+            #
+            # Решение: пока sync.is_ready() — async просто ждёт. Когда
+            # sync ляжет (is_ready=False), async тут же подключится и
+            # станет основным каналом. Это даёт нам полноценный fallback
+            # без conflicting sessions.
+            if _sync_preferred is not None and _sync_preferred.is_ready():
+                now_mono = time.monotonic()
+                if now_mono - _last_sync_idle_log > 300:
+                    print(
+                        "[BYBIT-WS] sync WS активен — async listener в standby",
+                        flush=True,
+                    )
+                    _last_sync_idle_log = now_mono
+                await asyncio.sleep(5.0)
+                continue
+
             try:
                 print(f"[BYBIT-WS] connect → {WS_TRADE_URL}", flush=True)
                 async with websockets.connect(
@@ -206,6 +231,13 @@ class BybitWsTrade:
                         await self._dispatch(msg)
 
             except (ConnectionClosedError, OSError, asyncio.TimeoutError) as e:
+                # FIX: если sync поднялся между нашим connect'ом и этим
+                # except'ом (race), не печатаем шум — на следующей
+                # итерации мы и так уйдём в standby выше.
+                if _sync_preferred is not None and _sync_preferred.is_ready():
+                    self._connected.clear()
+                    self._ws = None
+                    continue
                 print(f"[BYBIT-WS] disconnect: {e} — reconnect через {delay:.0f}с", flush=True)
             except Exception as e:
                 print(f"[BYBIT-WS] error: {e!r} — reconnect через {delay:.0f}с", flush=True)

@@ -128,6 +128,19 @@ TG_LISTING_NEG = [
     "postponed", "delay", "delayed", "cancelled", "canceled",
     "alpha will remove", "from the featuring list",
     "hodler airdrop",  # FIX-batch-7: Binance HODLer Airdrop — не листинг
+    # FIX: Earn / Launchpool / promo — инцидент 2026-05-28 04:00:03
+    # ('Binance Earn New Listing Special Offer: ...') открыл фейковые
+    # лонги GENIUS/OPG/APR. Тот же фильтр в treeofalpha_ws.LISTING_NEG.
+    "earn", "locked product", "locked products",
+    "flexible product", "flexible products",
+    "simple earn",
+    "subscribe to", "subscribe and",
+    "special offer",
+    "launchpool",
+    "% apr", "apr for",
+    "% apy", "apy for",
+    "promotion", "promotional",
+    "rewards pool", "staking pool",
     "делист", "делисты",
 ]
 
@@ -174,6 +187,14 @@ _fired_lock     = threading.Lock()
 # L1: короткоживущая защита от near-simultaneous дублей.
 _recent_signals: dict[tuple[str, str], float] = {}   # (coin, source) -> expiry
 _FIRED_TTL      = 60
+
+# FIX: метрика отставания между источниками. Для каждой свежеcклеймленной
+# монеты запоминаем (первый_источник, perf_counter()) — когда второй
+# источник по той же монете попадает в _try_claim → skip, считаем дельту
+# и логируем "CoinListing опоздал на 4.2с от BWEnews". Это нужно чтобы
+# отличать «WS-источник не сработал» от «WS-источник работает, но медленный».
+_first_claim_ts: dict[str, tuple[str, float]] = {}   # coin -> (source, t)
+_FIRST_CLAIM_TTL = 300  # храним 5 минут — на дольше дельта уже неинтересна
 
 # L2: постоянное хранилище опыта.
 _global_fired: set[str] = set()                       # ANNOUNCEMENT-monedas навсегда
@@ -325,7 +346,29 @@ def _try_claim(coin: str, source: str) -> bool:
             if c == coin and ts > now:
                 return False
         _recent_signals[(coin, source)] = now + _FIRED_TTL
+        # FIX: запоминаем первый источник, который заявил эту монету.
+        # _first_claim_ts заполняется только один раз — пока запись жива,
+        # последующие claim'ы по этой монете уйдут в _is_already_fired/L1
+        # и сюда не попадут. Это нормально: нам нужна метка именно ПЕРВОГО.
+        _first_claim_ts[coin] = (source, now)
     return True
+
+
+def _measure_lag(coin: str) -> tuple[str, float] | None:
+    """
+    Возвращает (первый_источник, отставание_в_сек) если по этой монете
+    есть запомненный первый источник, иначе None. Используется в
+    process_signal для метрики отставания опоздавших источников.
+    """
+    now = time.monotonic()
+    with _fired_lock:
+        first = _first_claim_ts.get(coin)
+        if first is None:
+            return None
+        first_src, t0 = first
+        if now - t0 > _FIRST_CLAIM_TTL:
+            return None
+        return first_src, now - t0
 
 
 def _mark_opened(coin: str, source: str) -> None:
@@ -379,6 +422,15 @@ def _fired_sweeper() -> None:
             expired = [k for k, ts in _recent_signals.items() if ts <= now]
             for k in expired:
                 _recent_signals.pop(k, None)
+            # FIX: чистим _first_claim_ts по TTL, иначе на длинной дистанции
+            # словарь растёт неограниченно (1 запись на каждую монету,
+            # которая когда-либо стреляла).
+            expired_first = [
+                c for c, (_src, t0) in _first_claim_ts.items()
+                if now - t0 > _FIRST_CLAIM_TTL
+            ]
+            for c in expired_first:
+                _first_claim_ts.pop(c, None)
 
 
 # ── воркер (открытие лонга) ───────────────────────────────────────
@@ -424,9 +476,23 @@ def worker(coin: str, margin: float, t_start: float,
             _mark_opened(coin, source)
             return
         except Exception as e:
+            err_str = str(e)
             log_err("WORKER", f"{coin}: попытка {attempt}/{retries} упала → {e}")
+            # FIX: если это 400/404 от Gate.io — повтор бессмысленен,
+            # бирж'а семантически отказала (тикер ещё не залистен / запрещён
+            # для нашего IP / неверный leverage). Инцидент CTR 2026-05-28:
+            # 3 × 400 Bad Request за 0мс, забивали лог и зря тратили retries.
+            # 400/404 — fail fast, без sleep.
+            if "400 Client Error" in err_str or "404 Client Error" in err_str:
+                log_warn("WORKER", f"{coin}: {err_str.split('http')[0].strip()} — fail fast, биржа отвергла")
+                break
             if attempt < retries:
-                time.sleep(0.1)
+                # FIX: 0.1с → 0.05с. На retry-path основная задержка — это
+                # сетевой round-trip, дополнительные 50мс не имеют смысла.
+                # Также worker блокирует TG-handler thread (process_signal
+                # вызывает worker inline для single-coin), поэтому 0.3с
+                # суммарной блокировки урезаем до 0.15с.
+                time.sleep(0.05)
 
     log_err("WORKER", f"{coin}: все {retries} попытки провалились")
     tg_log(f"⚠️Listing {coin}: все попытки провалились")
@@ -479,7 +545,21 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None) 
 
     new_pairs = [c for c in pairs if _try_claim(c, source)]
     if not new_pairs:
-        log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
+        # FIX: метрика отставания — для каждой отброшенной монеты считаем,
+        # на сколько секунд опоздал текущий источник относительно того,
+        # кто первым заявил эту монету. Это zero-cost для success-path
+        # (мы сюда не попадаем когда new_pairs не пуст). _measure_lag —
+        # одно чтение dict под уже существующим lock'ом, O(1).
+        lag_info: list[str] = []
+        for coin in pairs:
+            lag = _measure_lag(coin)
+            if lag is not None:
+                first_src, dt = lag
+                lag_info.append(f"{coin}: {source} опоздал на {dt:.2f}с от {first_src}")
+        if lag_info:
+            log_warn("SIGNAL-LAG", " | ".join(lag_info))
+        else:
+            log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
         return
 
     margin = calculate_margin_for_listing()
@@ -706,12 +786,20 @@ def _load_bithumb_tickers(session: requests.Session) -> set[str]:
             resp.raise_for_status()
             # FIX-batch-1: orjson.
             data = _json_loads(resp.content).get("data", {})
+            # FIX: убран фильтр `withdrawal_status==1 AND deposit_status==1`.
+            # Bithumb открывает торги ДО включения переводов — фильтр
+            # отсекал свежий листинг и ловил его только через 50+ минут
+            # после открытия маркета (инцидент BILL 2026-05-28:
+            # реальный листинг 08:16:30 UTC, наш поллер засёк в 09:10).
+            # Защита от bulk-апдейтов (>10 новых тикеров за тик)
+            # сохранена в run_bithumb_poller — она и фильтрует мусор от
+            # maintenance/первой инициализации списка после рестарта.
+            # Дополнительно: keys любого типа кроме str отсекаем явно,
+            # чтобы не словить exception в .upper() / set ops дальше по пайплайну.
             return {
-                ticker
-                for ticker, info in data.items()
-                if isinstance(info, dict)
-                and info.get("withdrawal_status") == 1
-                and info.get("deposit_status") == 1
+                ticker.upper()
+                for ticker in data.keys()
+                if isinstance(ticker, str) and ticker
             }
         except Exception:
             if attempt == 3:
