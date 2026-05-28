@@ -63,13 +63,20 @@ def log_err(tag, msg):  _log(tag, RED,    msg)
 
 # ── Настройки ─────────────────────────────────────────────────────
 # FIX: API_KEY больше не захардкожен — берём из .env через config.
+# FIX: WARN → ERR при пустом ключе. Раньше уведомление терялось среди
+# обычных логов, и юзер не видел, что CoinListing вообще не работает.
 if not COINLISTING_API_KEY:
-    log_warn("CL", "COINLISTING_API_KEY не задан в .env — WS не подключится")
+    log_err("CL", "COINLISTING_API_KEY НЕ ЗАДАН в .env — CoinListing WS не подключится. "
+                  "Получите ключ на https://coinlisting.pro и пропишите в .env.")
 
 URL_SEOUL = f"wss://seoul.coinlisting.pro/listings?key={COINLISTING_API_KEY}"
 URL_TOKYO = f"wss://tokyo.coinlisting.pro/listings?key={COINLISTING_API_KEY}"
 
-TRADE_SOURCES = {"UPBIT", "BITHUMB"}
+# FIX: prefix-match вместо exact-match. Сервер шлёт source как
+# "BITHUMB", "BITHUMB_KR", "Bithumb", "UPBIT-KRW" и т.п. Старый
+# фильтр `source.upper() in {"UPBIT","BITHUMB"}` молча отбрасывал
+# любые вариации. Теперь сравниваем по startswith — все варианты ловятся.
+TRADE_SOURCE_PREFIXES = ("UPBIT", "BITHUMB")
 
 COOLDOWN_SEC = 120
 
@@ -129,9 +136,15 @@ async def get_http_session() -> aiohttp.ClientSession:
             return _http_session
 
         timeout = aiohttp.ClientTimeout(
-            total=2,
-            connect=1,
-            sock_read=1,
+            # FIX: total 2 → 6, sock_read 1 → 4. Bithumb feed
+            # (feed.bithumb.com) на корейских CDN-узлах часто отвечает
+            # медленно — в логе видели Connection timeout ровно через
+            # 1-2с при реальном листинге BILL 2026-05-28 08:16:37.
+            # 6с — компромисс: достаточно чтобы дотянуться сквозь медленный
+            # TLS handshake, и не настолько долго, чтобы блокировать handler.
+            total=6,
+            connect=2,
+            sock_read=4,
         )
 
         connector = aiohttp.TCPConnector(
@@ -345,7 +358,9 @@ async def _handle(msg: dict) -> None:
     # Универсально: (msg.get(...) or "") как защита от None.
     source = (msg.get("source") or "").upper()
 
-    if source not in TRADE_SOURCES:
+    # FIX: prefix-match. Поддерживает "BITHUMB", "BITHUMB_KR", "UPBIT-KRW"
+    # и пр. вариации. Раньше "BITHUMB_KR" молча выкидывался.
+    if not any(source.startswith(p) for p in TRADE_SOURCE_PREFIXES):
         return
 
     title = msg.get("title") or ""
