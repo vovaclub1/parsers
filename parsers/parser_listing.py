@@ -1067,6 +1067,72 @@ def _try_fetch_upbit_announcement(
     return title, category
 
 
+def _upbit_id_exists(session: requests.Session, notice_id: int) -> bool:
+    """True если /announcements/{id} вернул success=true (что угодно)."""
+    title, _ = _try_fetch_upbit_announcement(session, notice_id)
+    return title is not None
+
+
+def _discover_upbit_max_id(session: requests.Session) -> int:
+    """
+    Бинарный поиск максимального существующего announcement-id.
+    Возвращает (max + 1) — с этого id поллер начнёт работу.
+
+    Алгоритм:
+      1. baseline = UPBIT_ANNOUNCEMENT_START_ID — заведомо существующий
+         id на момент коммита. Если он сам уже стал 404 (Upbit удалил
+         старые) — фоллбэк на baseline без discovery, бот будет
+         догонять реальный max естественным инкрементом.
+      2. Экспоненциальный рост: пробуем baseline+1, +2, +4, +8, ...
+         пока не получим 404 → найдена верхняя граница [lo, hi].
+      3. Бинарный поиск в [lo, hi] → lo = последний существующий.
+
+    Latency: для разрыва ~N итераций нужно ~2*log2(N) запросов.
+    N=1000 → ~20 req, N=10000 → ~26 req. При 50мс sleep между ними
+    discovery занимает ~1-3с на проде.
+    """
+    baseline = UPBIT_ANNOUNCEMENT_START_ID
+
+    # 0. Sanity check: baseline должен существовать. Если нет —
+    # bail-out, иначе бесконечный 404-loop в экспоненциальной фазе.
+    if not _upbit_id_exists(session, baseline):
+        log_warn(
+            "UPBIT-NOTICE",
+            f"baseline id={baseline} уже не существует — discovery skip, "
+            f"начнём с baseline (будем догонять max естественным инкрементом)",
+        )
+        return baseline
+
+    # 1. Экспоненциальный рост до первого 404.
+    lo = baseline
+    step = 1
+    hi: int | None = None
+    while step <= 1_000_000:  # safety net
+        probe = baseline + step
+        if _upbit_id_exists(session, probe):
+            lo = probe
+            step *= 2
+        else:
+            hi = probe
+            break
+        time.sleep(0.05)  # не флудим Upbit
+    if hi is None:
+        # Не нашли 404 за 1M шагов — что-то странное, fallback.
+        log_warn("UPBIT-NOTICE", f"discovery: не нашли границу за 1M, fallback lo={lo}")
+        return lo + 1
+
+    # 2. Бинарный поиск.
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if _upbit_id_exists(session, mid):
+            lo = mid
+        else:
+            hi = mid
+        time.sleep(0.05)
+
+    return lo + 1
+
+
 def run_upbit_announcement_poller() -> None:
     session = requests.Session()
     session.headers.update({
@@ -1074,7 +1140,18 @@ def run_upbit_announcement_poller() -> None:
         "User-Agent": "Mozilla/5.0",
     })
 
-    next_id = UPBIT_ANNOUNCEMENT_START_ID
+    # FIX: обязательно стартуем с реально актуального id, иначе после
+    # каждого рестарта бот будет ловить старые листинги, пока не дойдёт
+    # до сегодняшнего id'а — а это сотни ложных «листингов» за итерации.
+    try:
+        t0 = time.perf_counter()
+        next_id = _discover_upbit_max_id(session)
+        elapsed = (time.perf_counter() - t0) * 1000
+        log_ok("UPBIT-NOTICE", f"discovery: текущий max+1 = {next_id} ({elapsed:.0f}мс)")
+    except Exception as e:
+        log_err("UPBIT-NOTICE", f"discovery упал ({e!r}), fallback baseline={UPBIT_ANNOUNCEMENT_START_ID}")
+        next_id = UPBIT_ANNOUNCEMENT_START_ID
+
     log_ok("UPBIT-NOTICE", f"Старт с id={next_id} (poll {UPBIT_ANNOUNCEMENT_POLL_INTERVAL*1000:.0f}мс)")
 
     while True:
