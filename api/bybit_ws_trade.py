@@ -153,7 +153,32 @@ class BybitWsTrade:
         if self._send_lock is None:
             self._send_lock = asyncio.Lock()
         delay = _RECONNECT_DELAY_MIN
+        # FIX: время последнего «sync здоров» лога — чтобы не флудить
+        # лог сообщением каждые 5с.
+        _last_sync_idle_log = 0.0
         while not self._stop:
+            # FIX (latency-critical): Bybit V5 Trade держит ОДИН коннект
+            # на API-key. Если sync-вариант уже подключён, async-попытка
+            # подключиться → Bybit выкидывает старую сессию → sync
+            # реконнектится → выкидывает async → бесконечный flap каждую
+            # секунду. В логе из-за этого place_order_ws_fast регулярно
+            # уходит на REST (а это +30-80мс к каждому ордеру).
+            #
+            # Решение: пока sync.is_ready() — async просто ждёт. Когда
+            # sync ляжет (is_ready=False), async тут же подключится и
+            # станет основным каналом. Это даёт нам полноценный fallback
+            # без conflicting sessions.
+            if _sync_preferred is not None and _sync_preferred.is_ready():
+                now_mono = time.monotonic()
+                if now_mono - _last_sync_idle_log > 300:
+                    print(
+                        "[BYBIT-WS] sync WS активен — async listener в standby",
+                        flush=True,
+                    )
+                    _last_sync_idle_log = now_mono
+                await asyncio.sleep(5.0)
+                continue
+
             try:
                 print(f"[BYBIT-WS] connect → {WS_TRADE_URL}", flush=True)
                 async with websockets.connect(
@@ -206,6 +231,13 @@ class BybitWsTrade:
                         await self._dispatch(msg)
 
             except (ConnectionClosedError, OSError, asyncio.TimeoutError) as e:
+                # FIX: если sync поднялся между нашим connect'ом и этим
+                # except'ом (race), не печатаем шум — на следующей
+                # итерации мы и так уйдём в standby выше.
+                if _sync_preferred is not None and _sync_preferred.is_ready():
+                    self._connected.clear()
+                    self._ws = None
+                    continue
                 print(f"[BYBIT-WS] disconnect: {e} — reconnect через {delay:.0f}с", flush=True)
             except Exception as e:
                 print(f"[BYBIT-WS] error: {e!r} — reconnect через {delay:.0f}с", flush=True)
@@ -531,6 +563,22 @@ _global_instance: BybitWsTrade | None = None
 # (тот защищает создание объекта в .get(), а этот — модульный singleton).
 _global_instance_lock = threading.Lock()
 
+# FIX-PERF: preferred sync WS instance. Если bootstrap вызвал
+# use_sync_ws(sync_inst) и sync подключён — place_order_ws_fast будет
+# использовать его (без cross-thread asyncio hop'а, экономия ~0.5-2мс).
+# В fallback на async — если sync не инициализирован или не подключён.
+_sync_preferred: Any = None  # api.bybit_sync_ws_trade.BybitSyncWsTrade | None
+
+
+def use_sync_ws(sync_inst: Any) -> None:
+    """
+    Регистрирует sync WS как предпочтительный hot-path для
+    place_order_ws_fast. Если sync_inst позже отвалится (is_set=False),
+    place_order_ws_fast автоматически уйдёт на async fallback.
+    """
+    global _sync_preferred
+    _sync_preferred = sync_inst
+
 
 def init(api_key: str, api_secret: str) -> BybitWsTrade:
     """
@@ -562,15 +610,43 @@ def place_order_ws(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | No
     return inst.place_order(args, timeout=timeout)
 
 
-def place_order_ws_fast(args: dict) -> dict | None:
+def place_order_ws_fast(args: dict, _warmup_mode: bool = False) -> dict | None:
     """
     FIX-PERF: fire-and-forget — возвращает после ws.send (без ack-wait).
     Снимает ~70-100мс RTT до Bybit из hot-path. Reject логируется в фоне.
-    None → WS не подключён или transport-ошибка → REST fallback.
+
+    Маршрутизация:
+      1. Если sync WS зарегистрирован (use_sync_ws) и connected → sync.
+         No cross-thread asyncio hop, ws.send из caller thread.
+      2. Иначе → async WS (этот файл) — fallback.
+      3. None → caller делает REST fallback.
+
+    _warmup_mode=True: вместо реального order.create отправляется cancel-fake
+    через inst.warmup() (тот же сетевой путь, никаких побочных эффектов).
+    Используется bootstrap'ом для PEP-659 specialization прогрева ВСЕЙ
+    цепочки market_open_long → _ws_place_order → ws.send без создания
+    реальных ордеров. На production callers'ах флаг всегда False.
     """
+    # Быстрый check sync preferred. is_set атомарен, без локов.
+    sync = _sync_preferred
+    if sync is not None and sync.is_ready():
+        if _warmup_mode:
+            # Диверсия в cancel-fake — exercises тот же ws.send code path.
+            sync.warmup(timeout=0.5)
+            return {"sent": True, "reqId": "warmup-mode"}
+        result = sync.place_order_fast(args)
+        if result is not None:
+            return result
+        # Sync вернул None (transport-ошибка) — пробуем async fallback
+        # вместо REST. Async может быть подключён, когда sync временно
+        # на reconnect'е.
+
     inst = _global_instance
     if inst is None:
         return None
+    if _warmup_mode:
+        inst.warmup(timeout=0.5)
+        return {"sent": True, "reqId": "warmup-mode"}
     return inst.place_order_fast(args)
 
 

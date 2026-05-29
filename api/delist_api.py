@@ -95,7 +95,7 @@ try:
     from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
-    def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
+    def _ws_place_order(args: dict, _warmup_mode: bool = False) -> dict | None:  # type: ignore[misc]
         return None
     class WSOrderRejected(Exception):  # type: ignore[no-redef]
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
@@ -148,6 +148,51 @@ EXCLUDED_TOKENS = {
     # FIX: убрана "USDⓈ" — regex [A-Z0-9] её никогда не вернёт (Ⓢ U+24C8 не ASCII).
     "USDS",  # Binance liquid staking
     "ANNOUNCEMENT", "ANNOUNCEMENTS",
+    # FIX: ложные срабатывания на «margin trading pairs» нотисах
+    # (см. инцидент 2026-05-25: матчилось 'FOLLOWING' и 'AT',
+    # последнее реально шортилось как тикер AT). Расширяем список
+    # самыми частыми «английскими словами длиной 2-8», которые могут
+    # появиться в теле уведомления и пройти regex [A-Z0-9]{2,10}.
+    "AT", "AS", "BY", "OR", "OF", "IT", "IF", "SO", "DO",
+    "FOLLOWING", "FOLLOWED", "FOLLOWS",
+    "PLEASE", "NOTE", "NOTED", "NOTES",
+    "EFFECTIVE", "STARTING", "BEGINNING", "ENDING", "ENDS",
+    "DATE", "TIME", "TIMES", "HOUR", "HOURS",
+    "USERS", "USER", "CLIENTS", "CLIENT",
+    "WITHDRAWAL", "WITHDRAWALS", "WITHDRAW",
+    "DEPOSIT", "DEPOSITS",
+    "ORDER", "ORDERS", "POSITION", "POSITIONS",
+    "BALANCE", "BALANCES", "ACCOUNT", "ACCOUNTS",
+    "FUND", "FUNDS", "FUNDING",
+    "ISOLATED", "CROSS", "LEVERAGE", "LEVERAGED",
+    "CONVERT", "CONVERTED", "CONVERTING",
+    "COPY", "BOT", "BOTS",
+    "REGION", "REGIONS", "COUNTRY", "COUNTRIES",
+    "SUBJECT", "TERMS", "AGREEMENT", "POLICY", "POLICIES",
+    "DUE", "PER", "VIA", "INTO", "OUT", "AFTER", "BEFORE",
+    "ABOVE", "BELOW", "BETWEEN",
+    "DETAILS", "DETAIL", "MORE", "LESS", "ABOUT",
+    # FIX: словарные английские слова из Binance Earn / Launchpool /
+    # promo-заголовков. Метод 5 (fallback по known_coins) в
+    # find_listing_pairs выдирает любые \b[A-Z0-9]{2,8}\b слова и
+    # отсеивает по EXCLUDED_TOKENS + known_coins. На длинных промо-
+    # текстах ('Subscribe to ... Locked Products ... Enjoy 200% APR
+    # for 7 Days') проходило APR/DAYS/etc. Все они тут.
+    "APR", "APY",
+    "DAYS", "DAY", "WEEK", "WEEKS", "MONTH", "MONTHS", "YEAR", "YEARS",
+    "SPECIAL", "OFFER", "OFFERS",
+    "SUBSCRIBE", "SUBSCRIPTION",
+    "LOCKED", "FLEXIBLE",
+    "ENJOY", "ENJOYS", "ENJOYED",
+    "REWARD", "REWARDS",
+    "PROMO", "PROMOTION", "PROMOTIONAL",
+    "STAKE", "STAKING", "STAKED",
+    "LAUNCHPOOL", "MEGADROP", "AIRDROPS",
+    "BONUS", "BONUSES",
+    "LIMITED", "EXCLUSIVE",
+    # Часто встречаются в Bithumb/Upbit заголовках на корейском
+    # транслите/английском, но не тикеры:
+    "EVENT", "EVENTS", "CELEBRATION", "CELEBRATE",
 }
 
 # ── Кэш цен ──────────────────────────────────────────────────────
@@ -710,6 +755,53 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
         with _delist_exchange_lock:
             _delist_exchange[ticker_name] = "gate"
     return amount, fill_price
+
+
+# ── Chain warmup (PEP-659 specialization) ────────────────────────
+# Аналог listing_api.warmup_chain — прогрев adaptive interpreter
+# для market_open_short. Подробности — см. listing_api.warmup_chain.
+
+def warmup_chain(n: int = 30) -> int:
+    """
+    Прогоняет ТОТ ЖЕ Python-путь, что и market_open_short, N раз —
+    без реальных ордеров. Возвращает число успешных итераций.
+
+    BTC — гарантированно в price_cache и preloaded lot steps.
+    """
+    sample_ticker = "BTC"
+    sample_margin = 10.0
+    symbol = f"{sample_ticker}USDT"
+    ok = 0
+
+    for _ in range(n):
+        try:
+            bybit_price = get_price(sample_ticker)
+            if not bybit_price:
+                continue
+            raw_qty = (sample_margin / bybit_price) * LEVERAGE
+            try:
+                step = _get_qty_step(symbol)
+            except QtyStepUnavailable:
+                continue
+            amount_tokens = _round_qty(raw_qty, step)
+            if amount_tokens <= 0:
+                continue
+            qty_str = str(amount_tokens)
+            order_link_id = _new_order_link_id()
+            ws_args = {
+                "category":    "linear",
+                "symbol":      symbol,
+                "side":        "Sell",
+                "orderType":   "Market",
+                "qty":         qty_str,
+                "positionIdx": 2,
+                "orderLinkId": order_link_id,
+            }
+            _ws_place_order(ws_args, _warmup_mode=True)
+            ok += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return ok
 
 
 def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) -> str:

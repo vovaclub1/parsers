@@ -68,6 +68,37 @@ LISTING_KEYWORDS = [
     "listed on upbit", "upbit will list",
     "listed on bithumb", "bithumb will list",
     "new market", "new listing", "will add to spot",
+    # FIX: корейские форматы — Bithumb/Upbit пушат на корейском
+    # ("[마켓 추가] 빌리언즈(BILL) 원화 마켓 추가"). Английские
+    # keywords не матчатся, и сигнал пропускался полностью.
+    # Инцидент 2026-05-28: BILL не зашёл через TOA по этой причине.
+    "마켓 추가",   # market added
+    "원화 마켓",   # KRW market
+    "상장",        # listing
+    "신규",        # new
+]
+
+# FIX: расширенный negative-filter под Binance Earn / Launchpool /
+# HODLer Airdrop промо. Без него Earn-промо вроде
+# "Binance Earn New Listing Special Offer: Subscribe to GENIUS and
+# OPG Locked Products to Enjoy 200% APR for 7 Days" триггерило
+# открытие лонгов на названиях Earn-продуктов (инцидент 2026-05-28
+# 04:00:03 — GENIUS/OPG/APR). Эти фразы НЕ встречаются в реальных
+# листингах, поэтому риск false-negative по легитимному листингу
+# минимальный.
+_EARN_PROMO_NEG = [
+    "earn",
+    "locked product", "locked products",
+    "flexible product", "flexible products",
+    "simple earn",
+    "subscribe to", "subscribe and",
+    "special offer",
+    "launchpool",
+    "% apr", "apr for",
+    "% apy", "apy for",
+    "promotion", "promotional",
+    "rewards pool",
+    "staking pool",
 ]
 
 # FIX: negative-filter — те же фразы, что в parser_delist.TG_DELIST_NEG /
@@ -87,6 +118,9 @@ LISTING_NEG = [
     "postponed", "cancelled", "canceled",
     "alpha will remove", "from the featuring list",
     "hodler airdrop",
+    # FIX: Earn / Launchpool / promo — раскрываем в общий LISTING_NEG
+    # чтобы не дублировать сравнение в _classify.
+    *_EARN_PROMO_NEG,
 ]
 
 
