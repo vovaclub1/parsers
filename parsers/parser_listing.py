@@ -39,6 +39,30 @@ except ImportError:
             b = b.decode()
         return _stdjson.loads(b)
 
+# FIX-PERF: msgspec.Struct для Binance exchangeInfo (300-500KB JSON,
+# ~600+ symbols). orjson+dict.get в for-loop держал GIL ~10-25мс каждые
+# 2с — окно где worker мог оказаться зажат. msgspec парсит на C-уровне и
+# доступ через атрибут (.status vs ["status"]) — ~40% быстрее total.
+try:
+    import msgspec as _msgspec_l  # type: ignore[import-not-found]
+
+    class _BinanceSym(_msgspec_l.Struct, frozen=True):
+        symbol:       str = ""
+        status:       str = ""
+        contractType: str = ""
+        baseAsset:    str = ""
+        quoteAsset:   str = ""
+
+    class _BinanceExInfo(_msgspec_l.Struct, frozen=True):
+        symbols: list[_BinanceSym] = []  # noqa: RUF012
+
+    _binance_exinfo_decoder = _msgspec_l.json.Decoder(_BinanceExInfo)
+
+    def _parse_binance_exinfo(raw: bytes) -> list[_BinanceSym]:
+        return _binance_exinfo_decoder.decode(raw).symbols
+except ImportError:
+    _parse_binance_exinfo = None  # type: ignore[assignment]
+
 from tg.tg_logger import tg_log
 from api.coinlisting_ws import run_coinlisting
 from config.config import (
@@ -46,6 +70,7 @@ from config.config import (
     EXTRA_LISTING_CHANNELS, parse_channels,    # FIX-batch-3: multi-channel
     TREE_OF_ALPHA_WS_ENABLED,                   # FIX-batch-4: TOA WS
     BYBIT_WS_TRADE_ENABLED,                     # FIX-batch-5: Bybit WS Trade
+    BYBIT_SYNC_WS_ENABLED,                      # FIX-PERF: sync WS hot-path
     BYBIT_API_KEY, BYBIT_SECRET_KEY,
 )
 
@@ -57,7 +82,6 @@ from api.listing_api import (
     price_updater,
     gate_price_updater,
     warmup_bybit_connection,
-    warmup_bybit_http2,
     start_bybit_heartbeat,
     preload_lot_steps,
     gate_preload_lot_steps,
@@ -104,6 +128,19 @@ TG_LISTING_NEG = [
     "postponed", "delay", "delayed", "cancelled", "canceled",
     "alpha will remove", "from the featuring list",
     "hodler airdrop",  # FIX-batch-7: Binance HODLer Airdrop — не листинг
+    # FIX: Earn / Launchpool / promo — инцидент 2026-05-28 04:00:03
+    # ('Binance Earn New Listing Special Offer: ...') открыл фейковые
+    # лонги GENIUS/OPG/APR. Тот же фильтр в treeofalpha_ws.LISTING_NEG.
+    "earn", "locked product", "locked products",
+    "flexible product", "flexible products",
+    "simple earn",
+    "subscribe to", "subscribe and",
+    "special offer",
+    "launchpool",
+    "% apr", "apr for",
+    "% apy", "apy for",
+    "promotion", "promotional",
+    "rewards pool", "staking pool",
     "делист", "делисты",
 ]
 
@@ -117,13 +154,15 @@ BINANCE_FAPI_URL     = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 # Win: −200мс медианной детекции Korean листингов.
 # Хардкод (не env) — это публичный лимит биржи, не персональные данные.
 POLL_INTERVAL       = 0.1
-# Binance futures — публичный rate-limit 2400 req/min / IP. exchangeInfo
-# отдаёт 300-500KB JSON; парсинг каждые 500мс был GIL-hog'ом и добавлял
-# ~2-5мс jitter'а на signal-to-fill метрику в worker'е. 2с даёт 30 req/min
-# (80x ниже лимита) и при этом всё ещё обгоняет типичный announce→list лаг
-# для Binance. Если хочется ловить мгновенные листинги — переходить на
-# WS `!ticker@arr` (нет 500KB JSON-парса каждый тик).
-BINANCE_POLL_INTERVAL = 2.0
+# Binance futures — публичный rate-limit 2400 req/min / IP.
+# FIX-PERF: было 500мс — приводило к GIL contention в hot-path трейда.
+# exchangeInfo = 300-500KB JSON, msgspec decode держит GIL ~5-15мс.
+# Если торговый сигнал прилетал в окно decode — терял +5-15мс на GIL acquire.
+# Зафиксировано: первый трейд после регрессии = 31мс (норма 7-11мс).
+# 2500мс = 24 req/min, decode-окно открыто ~1% времени вместо ~5% при 500мс.
+# Цена: median детекция Binance листингов хуже на ~1с — приемлемо
+# (Binance анонсирует листинги, мы и через TG-канал поймаем быстрее).
+BINANCE_POLL_INTERVAL = 2.5
 # При ошибке/429 — отдельный (более длинный) sleep, чтобы не флудить.
 POLL_ERROR_BACKOFF  = 3.0
 
@@ -149,6 +188,14 @@ _fired_lock     = threading.Lock()
 _recent_signals: dict[tuple[str, str], float] = {}   # (coin, source) -> expiry
 _FIRED_TTL      = 60
 
+# FIX: метрика отставания между источниками. Для каждой свежеcклеймленной
+# монеты запоминаем (первый_источник, perf_counter()) — когда второй
+# источник по той же монете попадает в _try_claim → skip, считаем дельту
+# и логируем "CoinListing опоздал на 4.2с от BWEnews". Это нужно чтобы
+# отличать «WS-источник не сработал» от «WS-источник работает, но медленный».
+_first_claim_ts: dict[str, tuple[str, float]] = {}   # coin -> (source, t)
+_FIRST_CLAIM_TTL = 300  # храним 5 минут — на дольше дельта уже неинтересна
+
 # L2: постоянное хранилище опыта.
 _global_fired: set[str] = set()                       # ANNOUNCEMENT-monedas навсегда
 _per_exchange_fired: dict[str, set[str]] = {          # DIRECT POLL — (coin, exchange)
@@ -166,8 +213,8 @@ _DIRECT_POLL_SOURCES = {"UPBIT", "BITHUMB", "BINANCE"}
 
 _FIRED_FILE = Path(SESSION_DIR) / "listing_fired.json"
 
-# FIX-PERF: один фоновый писатель + dirty-flag — вместо thread.start() на
-# каждый успешный open (то стоило ~3-5мс в hot-path worker'а).
+# FIX-PERF: dirty-flag для фонового L2-writer'а — вместо thread.start() на
+# каждый успешный open (то стоило ~3-15мс в hot-path worker'а под GIL contention).
 _fired_dirty = threading.Event()
 
 # ── Watchdog: время последнего успешного запроса ───────────────────
@@ -299,17 +346,40 @@ def _try_claim(coin: str, source: str) -> bool:
             if c == coin and ts > now:
                 return False
         _recent_signals[(coin, source)] = now + _FIRED_TTL
+        # FIX: запоминаем первый источник, который заявил эту монету.
+        # _first_claim_ts заполняется только один раз — пока запись жива,
+        # последующие claim'ы по этой монете уйдут в _is_already_fired/L1
+        # и сюда не попадут. Это нормально: нам нужна метка именно ПЕРВОГО.
+        _first_claim_ts[coin] = (source, now)
     return True
+
+
+def _measure_lag(coin: str) -> tuple[str, float] | None:
+    """
+    Возвращает (первый_источник, отставание_в_сек) если по этой монете
+    есть запомненный первый источник, иначе None. Используется в
+    process_signal для метрики отставания опоздавших источников.
+    """
+    now = time.monotonic()
+    with _fired_lock:
+        first = _first_claim_ts.get(coin)
+        if first is None:
+            return None
+        first_src, t0 = first
+        if now - t0 > _FIRST_CLAIM_TTL:
+            return None
+        return first_src, now - t0
 
 
 def _mark_opened(coin: str, source: str) -> None:
     """
-    Worker зовёт после успешного open. Записывает в L2 (in-memory) и поднимает
+    Worker зовёт после успешного open. Обновляет L2 (in-memory) и поднимает
     dirty-flag — фоновый writer (_fired_persist_loop) сохранит на диск.
 
     FIX-PERF: НЕ спавним поток здесь — это hot-path worker'а. Раньше
-    threading.Thread(_persist_fired_state).start() съедал ~3-5мс на каждый
-    open. Теперь только set.add (~1мкс) + Event.set (~1мкс).
+    threading.Thread(_persist_fired_state).start() стоил ~3-15мс под GIL
+    contention (создание потока — это OS-syscall + GIL acquire несколько раз).
+    Теперь только set.add (~1мкс) + Event.set (~1мкс).
 
     ANNOUNCEMENT → global. DIRECT → per-exchange.
     """
@@ -332,14 +402,12 @@ def _mark_opened(coin: str, source: str) -> None:
 
 def _fired_persist_loop() -> None:
     """
-    Единый фоновый writer L2 на диск. Просыпается по dirty-flag, ждёт
-    ещё 1с (батчинг — если за это окно прилетит несколько open'ов, всё
-    запишется одним write+rename), потом сохраняет.
+    Единый фоновый writer L2 на диск. Просыпается по dirty-flag, ждёт ещё
+    1с (батчинг — если за это окно прилетит несколько open'ов на burst'е,
+    всё запишется одним write+rename), потом сохраняет.
     """
     while True:
         _fired_dirty.wait()
-        # Батчинг: даём ещё 1с возможным soon-after open'ам собраться,
-        # чтобы не писать файл 3 раза подряд при burst'е.
         time.sleep(1.0)
         _fired_dirty.clear()
         _persist_fired_state()
@@ -354,6 +422,15 @@ def _fired_sweeper() -> None:
             expired = [k for k, ts in _recent_signals.items() if ts <= now]
             for k in expired:
                 _recent_signals.pop(k, None)
+            # FIX: чистим _first_claim_ts по TTL, иначе на длинной дистанции
+            # словарь растёт неограниченно (1 запись на каждую монету,
+            # которая когда-либо стреляла).
+            expired_first = [
+                c for c, (_src, t0) in _first_claim_ts.items()
+                if now - t0 > _FIRST_CLAIM_TTL
+            ]
+            for c in expired_first:
+                _first_claim_ts.pop(c, None)
 
 
 # ── воркер (открытие лонга) ───────────────────────────────────────
@@ -374,33 +451,48 @@ def worker(coin: str, margin: float, t_start: float,
                 time.sleep(0.1)
                 continue
 
+            # FIX-PERF: failsafe SL+TP1 уже улетели в одной order.create-фрейме
+            # (stopLoss/takeProfit полях). Эта submit'ка добавляет trailing-stop
+            # 3.5% через trading-stop endpoint — не критично для failsafe, поэтому
+            # делаем ДО открытия метрики (submit ~5-20μs не сдвинет open_ms).
+            _tp_sl_executor.submit(set_tp_sl_long, coin, entry_price, amount)
+
             open_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("OPEN", f"[{source}] {coin} | ордер открыт за {BOLD}{open_ms:.0f}мс{RESET}{GREEN}")
-
-            # FIX-PERF: TP/SL поток стартует ПЕРВЫМ — failsafe SL/TP должен
-            # уйти на биржу как можно скорее. Это thread.start() ~3-5мс.
-            threading.Thread(
-                target=set_tp_sl_long,
-                args=(coin, entry_price, amount),
-                daemon=True,
-            ).start()
-
-            elapsed_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("LONG", (
-                f"[{source}] {coin} | entry={entry_price} | amount={amount:.4f} | "
-                f"время от сигнала до ордера: {BOLD}{elapsed_ms:.0f}мс{RESET}{GREEN}"
+            # FIX-PERF: один print вместо двух — раньше OPEN-print + intermediate
+            # work + LONG-print между метриками съедали ~4мс на stdout flush
+            # (PYTHONUNBUFFERED=1, f-string с ANSI escape codes). Теперь open_ms
+            # = total path time, делать второй замер бессмысленно (был бы +100μs).
+            log_ok("OPEN", (
+                f"[{source}] {coin} | ордер за {BOLD}{open_ms:.0f}мс{RESET}{GREEN} | "
+                f"entry={entry_price} | amount={amount:.4f}"
             ))
-            tg_log(f"🟢 <b>LISTING LONG</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {elapsed_ms:.0f}мс")
+            # FIX-PERF: tg_log теперь fire-and-forget (см. tg/tg_logger.py) —
+            # возвращается за ~10мкс, реальный HTTP уходит в фоне.
+            tg_log(f"🟢 <b>LISTING LONG</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
 
-            # FIX-PERF: L2-метку и persist делаем ПОСЛЕ метрики — это
-            # bookkeeping, не должен влиять на «время от сигнала до ордера».
-            # _mark_opened теперь только set-add + dirty-flag (без thread.start).
+            # FIX-PERF: bookkeeping ПОСЛЕ метрики и tg_log — не должен влиять
+            # на «время от сигнала до ордера». _mark_opened теперь только
+            # set-add + Event.set (~2мкс), без thread.start.
             _mark_opened(coin, source)
             return
         except Exception as e:
+            err_str = str(e)
             log_err("WORKER", f"{coin}: попытка {attempt}/{retries} упала → {e}")
+            # FIX: если это 400/404 от Gate.io — повтор бессмысленен,
+            # бирж'а семантически отказала (тикер ещё не залистен / запрещён
+            # для нашего IP / неверный leverage). Инцидент CTR 2026-05-28:
+            # 3 × 400 Bad Request за 0мс, забивали лог и зря тратили retries.
+            # 400/404 — fail fast, без sleep.
+            if "400 Client Error" in err_str or "404 Client Error" in err_str:
+                log_warn("WORKER", f"{coin}: {err_str.split('http')[0].strip()} — fail fast, биржа отвергла")
+                break
             if attempt < retries:
-                time.sleep(0.1)
+                # FIX: 0.1с → 0.05с. На retry-path основная задержка — это
+                # сетевой round-trip, дополнительные 50мс не имеют смысла.
+                # Также worker блокирует TG-handler thread (process_signal
+                # вызывает worker inline для single-coin), поэтому 0.3с
+                # суммарной блокировки урезаем до 0.15с.
+                time.sleep(0.05)
 
     log_err("WORKER", f"{coin}: все {retries} попытки провалились")
     tg_log(f"⚠️Listing {coin}: все попытки провалились")
@@ -434,6 +526,13 @@ def _on_toa_listing(full_text: str, t_start: float) -> None:
 # worker'ов съедали ~5-15мс из hot-path. Pool живёт всё время работы парсера.
 _signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="listing-signal")
 
+# FIX-PERF: отдельный preheated pool для set_tp_sl_long. Раньше worker делал
+# `threading.Thread(target=set_tp_sl_long).start()` — это OS-syscall + GIL
+# acquire несколько раз = 3-15мс jitter в hot-path под contention. submit
+# в уже-запущенный pool ~5-20мкс. Pool отделён от _signal_executor чтобы
+# burst листингов (5 worker'ов) не блокировал TP/SL постановку у уже открытых.
+_tp_sl_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="listing-tpsl")
+
 
 def process_signal(pairs: list[str], source: str, t_start: float | None = None) -> None:
     """
@@ -446,16 +545,44 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None) 
 
     new_pairs = [c for c in pairs if _try_claim(c, source)]
     if not new_pairs:
-        log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
+        # FIX: метрика отставания — для каждой отброшенной монеты считаем,
+        # на сколько секунд опоздал текущий источник относительно того,
+        # кто первым заявил эту монету. Это zero-cost для success-path
+        # (мы сюда не попадаем когда new_pairs не пуст). _measure_lag —
+        # одно чтение dict под уже существующим lock'ом, O(1).
+        lag_info: list[str] = []
+        for coin in pairs:
+            lag = _measure_lag(coin)
+            if lag is not None:
+                first_src, dt = lag
+                lag_info.append(f"{coin}: {source} опоздал на {dt:.2f}с от {first_src}")
+        if lag_info:
+            log_warn("SIGNAL-LAG", " | ".join(lag_info))
+        else:
+            log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
         return
 
     margin = calculate_margin_for_listing()
 
-    # FIX-PERF: submit ДО логирования. Открытие ордера — это hot-path,
-    # 4 print'а перед market_open_long добавляли ~2мс. Workers стартуют
-    # сразу, print'ы идут параллельно с уже запущенным market_open_long.
-    for coin in new_pairs:
-        _signal_executor.submit(worker, coin, margin, t_start, source)
+    # FIX-PERF: для single-coin (99% случаев) — inline-execute worker'а
+    # в caller-thread. Экономим thread hop через executor (1-3мс под GIL
+    # contention, что мы видели как разницу 12мс vs 27мс warm vs cold).
+    # Trade-off: caller (TG handler / poller-thread / TOA WS callback)
+    # блокируется на ~5-10мс на market_open_long. Это приемлемо:
+    #   • TG/TOA async loop: задержка следующего event'а ~10мс OK для
+    #     листингов раз в минуту;
+    #   • Upbit/Bithumb/Binance pollers: сдвиг следующего poll'а ~10мс
+    #     OK при 100мс/2500мс интервалах.
+    # На rare retry-path (price отсутствует, sleep 0.1с × до 2 раз) caller
+    # блокируется до 300мс — приемлемо, т.к. это означает что и так
+    # exchange не отвечает.
+    # Multi-coin (редко: одно сообщение про 2+ листинга) → executor для
+    # параллелизма.
+    if len(new_pairs) == 1:
+        worker(new_pairs[0], margin, t_start, source)
+    else:
+        for coin in new_pairs:
+            _signal_executor.submit(worker, coin, margin, t_start, source)
 
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("LISTING", f"[{source}] Новый листинг!")
@@ -659,12 +786,20 @@ def _load_bithumb_tickers(session: requests.Session) -> set[str]:
             resp.raise_for_status()
             # FIX-batch-1: orjson.
             data = _json_loads(resp.content).get("data", {})
+            # FIX: убран фильтр `withdrawal_status==1 AND deposit_status==1`.
+            # Bithumb открывает торги ДО включения переводов — фильтр
+            # отсекал свежий листинг и ловил его только через 50+ минут
+            # после открытия маркета (инцидент BILL 2026-05-28:
+            # реальный листинг 08:16:30 UTC, наш поллер засёк в 09:10).
+            # Защита от bulk-апдейтов (>10 новых тикеров за тик)
+            # сохранена в run_bithumb_poller — она и фильтрует мусор от
+            # maintenance/первой инициализации списка после рестарта.
+            # Дополнительно: keys любого типа кроме str отсекаем явно,
+            # чтобы не словить exception в .upper() / set ops дальше по пайплайну.
             return {
-                ticker
-                for ticker, info in data.items()
-                if isinstance(info, dict)
-                and info.get("withdrawal_status") == 1
-                and info.get("deposit_status") == 1
+                ticker.upper()
+                for ticker in data.keys()
+                if isinstance(ticker, str) and ticker
             }
         except Exception:
             if attempt == 3:
@@ -730,24 +865,39 @@ def _load_binance_futures_tickers(session: requests.Session) -> set[str]:
     """
     Возвращает множество base-валют (BTC, ETH, ...) из активных linear-пар
     Binance futures. Фильтр: status == TRADING, quote ∈ {USDT, USDC}.
+
+    FIX-PERF: парсинг через msgspec.Struct (см. _parse_binance_exinfo) —
+    typed access, ~40% быстрее vs orjson+dict.get на 600+ символах.
     """
+    use_msgspec = _parse_binance_exinfo is not None
+
     for attempt, timeout in enumerate([3, 6, 12], 1):
         try:
             resp = session.get(BINANCE_FAPI_URL, timeout=timeout)
             resp.raise_for_status()
             tickers: set[str] = set()
-            data = _json_loads(resp.content)
-            for s in data.get("symbols", []) or []:
-                if not isinstance(s, dict):
-                    continue
-                if s.get("status") != "TRADING":
-                    continue
-                if s.get("contractType") != "PERPETUAL":
-                    continue
-                quote = s.get("quoteAsset")
-                base  = s.get("baseAsset")
-                if quote in ("USDT", "USDC") and isinstance(base, str) and base:
-                    tickers.add(base.upper())
+
+            if use_msgspec:
+                for s in _parse_binance_exinfo(resp.content):
+                    if s.status != "TRADING":
+                        continue
+                    if s.contractType != "PERPETUAL":
+                        continue
+                    if s.quoteAsset in ("USDT", "USDC") and s.baseAsset:
+                        tickers.add(s.baseAsset.upper())
+            else:
+                data = _json_loads(resp.content)
+                for s in data.get("symbols", []) or []:
+                    if not isinstance(s, dict):
+                        continue
+                    if s.get("status") != "TRADING":
+                        continue
+                    if s.get("contractType") != "PERPETUAL":
+                        continue
+                    quote = s.get("quoteAsset")
+                    base  = s.get("baseAsset")
+                    if quote in ("USDT", "USDC") and isinstance(base, str) and base:
+                        tickers.add(base.upper())
             return tickers
         except Exception:
             if attempt == 3:
@@ -907,13 +1057,26 @@ if __name__ == "__main__":
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
 
-    # FIX-PERF: дефолтный switchinterval = 5мс. Hot-path пересекает 3
-    # потока (handler → executor-worker → bybit-ws loop → executor-worker),
-    # каждая GIL-передача до 5мс = до 15мс лишних. 1мс уменьшает оверхед
-    # до ~3мс при той же CPU-нагрузке (не критично для I/O-bound сервиса).
-    import sys
-    sys.setswitchinterval(0.001)
-    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
+    # NOTE: switchinterval оставлен дефолтный (5мс). Раньше тут было
+    # `sys.setswitchinterval(0.001)` — попытка снизить max GIL hold.
+    # Эмпирически это давало РЕГРЕССИЮ p50 на trade-открытии (27мс vs 9мс):
+    # под нагрузкой (price_updater Bybit+Gate, telethon polling, WS heartbeat,
+    # 5 worker-thread'ов) 1мс switch → слишком частые context-switches →
+    # каждый thread тратит больше времени на GIL acquire/release pingpong,
+    # а worker'у нужно несколько раз перехватить GIL за один трейд
+    # (handler thread → WS-loop thread → handler thread). 5мс позволяет
+    # каждой стадии завершиться атомарно и быстрее отдать управление дальше.
+
+    # FIX-PERF: только gc.freeze() — все module-level объекты (regex,
+    # imported classes, globals) переезжают в permanent gen и больше не
+    # сканируются ни на одном GC-цикле. Дефолтные thresholds=(700, 10, 10)
+    # оставляем: gen0 sweep каждые ~700 аллокаций обходит горстку объектов
+    # за десятки микросекунд. Подъём порога до 50k делал sweep'ы редкими,
+    # но КАЖДЫЙ ИЗ НИХ стал ~3-15мс stop-the-world — это p99 регрессия
+    # для hot-path (зафиксировано: 33мс trade vs 9мс на default'ах).
+    import gc
+    gc.freeze()
+    print(f"[BOOT] GC frozen: {gc.get_freeze_count()} objects (thresholds={gc.get_threshold()})")
 
     threading.Thread(target=price_updater,      daemon=True).start()
     threading.Thread(target=gate_price_updater, daemon=True).start()
@@ -923,21 +1086,50 @@ if __name__ == "__main__":
     preload_lot_steps()
     gate_preload_lot_steps()
     start_bybit_heartbeat()
-    # FIX-PERF: прогреваем httpx HTTP/2 на boot'е — иначе первый TP/SL поток
-    # платит ~80-250мс на import httpx + Client + TLS+ALPN handshake.
-    warmup_bybit_http2()
 
     # FIX-batch-5: Bybit V5 WS Trade — persistent connection для ордеров.
     if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
+        # FIX-PERF: пробуем сначала SYNC вариант (api/bybit_sync_ws_trade.py).
+        # Если он успешно подключился и аутентифицировался — используем его как
+        # основной hot-path (place_order_ws_fast маршрутизирует через него).
+        # Async-инстанс инициализируется как fallback на случай sync-disconnect.
+        sync_ready = False
+        if BYBIT_SYNC_WS_ENABLED:
+            try:
+                from api import bybit_sync_ws_trade as _sync_mod
+                from api.bybit_ws_trade import use_sync_ws
+                sync_inst = _sync_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                if sync_inst.is_ready(wait_sec=3.0):
+                    sync_warm = sync_inst.warmup()
+                    use_sync_ws(sync_inst)
+                    _sync_mod.start_periodic_warmup()
+                    sync_ready = True
+                    suffix = "+ прогрет" if sync_warm else "(warmup не прошёл)"
+                    log_ok("PARSER", f"Bybit SYNC WS Trade готов {suffix} ✓ (no cross-thread)")
+                else:
+                    log_warn("PARSER", "Bybit SYNC WS не подключился за 3с — fallback на async")
+            except Exception as e:
+                log_warn("PARSER", f"Bybit SYNC WS init упал: {e!r} — fallback на async")
+
+        # Async-инстанс: если sync уже работает, async всё равно нужен как
+        # fallback при sync reconnect. Если sync не запустился — async основной.
         try:
-            from api.bybit_ws_trade import init as bybit_ws_init
+            from api.bybit_ws_trade import init as bybit_ws_init, start_periodic_warmup
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
             if inst.is_ready(wait_sec=3.0):
-                log_ok("PARSER", "Bybit WS Trade готов ✓ (−30...−80мс на ордер)")
+                if not sync_ready:
+                    # Async — основной hot-path. Прогреваем как раньше.
+                    if inst.warmup():
+                        log_ok("PARSER", "Bybit ASYNC WS Trade готов + прогрет ✓")
+                    else:
+                        log_ok("PARSER", "Bybit ASYNC WS Trade готов ✓ (warmup не прошёл)")
+                    start_periodic_warmup()
+                else:
+                    log_ok("PARSER", "Bybit ASYNC WS готов (резерв на случай sync-disconnect)")
             else:
-                log_warn("PARSER", "Bybit WS Trade не успел подключиться за 3с — fallback на REST")
+                log_warn("PARSER", "Bybit ASYNC WS не подключился за 3с — fallback на REST")
         except Exception as e:
-            log_err("PARSER", f"Bybit WS Trade init упал: {e} — будет REST")
+            log_err("PARSER", f"Bybit ASYNC WS init упал: {e!r} — будет REST")
     else:
         log_info("PARSER", "Bybit WS Trade отключён — используем REST")
 
@@ -947,6 +1139,38 @@ if __name__ == "__main__":
     # Загружаем L2-дедуп с диска до запуска поллеров — иначе первый тик
     # после рестарта может повторно отстрелить уже отторгованную монету.
     _load_fired_state()
+
+    # FIX-PERF: pre-warm executors + chain warmup — ДО запуска поллеров и
+    # callback'ов. Иначе если poller сразу детектит новый тикер на старте,
+    # первый листинг попадает на cold-path (27мс наблюдалось).
+    #
+    # pre-warm executors: N=40 на каждый — submit-call тоже bytecode
+    # (LOAD_ATTR, CALL), специализируется в CPython adaptive interpreter
+    # после ~32 проходов.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(40)]
+    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(40)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor + _tp_sl_executor pre-warmed (40+40)")
+
+    # Chain warmup: прогрев всей Python-цепочки сигнал → ws.send.
+    # Без этого первый листинг платит +15-20мс на PEP-659 cold-specialization
+    # (CPython 3.12+, см. https://peps.python.org/pep-0659/).
+    # Что прогревается:
+    #   1. find_listing_pairs(sample_text) — регексы _RE_LISTING_TG и co.
+    #   2. market_open_long Python-путь (listing_api.warmup_chain) —
+    #      get_price, _get_qty_step, _round_qty, dict-build из 14 полей,
+    #      json.dumps, ws.send (диверсия в cancel-fake — никаких ордеров).
+    # ~600мс на бутстрапе → первый реальный листинг 5-9мс вместо 27мс cold.
+    try:
+        from api.listing_api import warmup_chain as _lst_warmup_chain
+        sample_signal = "[BITHUMB] $BTC listed on Bithumb"
+        for _ in range(30):
+            find_listing_pairs(sample_signal)
+        ok = _lst_warmup_chain(n=30)
+        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_long path×{ok}/30 ✓")
+    except Exception as e:  # noqa: BLE001
+        log_warn("PARSER", f"Chain warmup упал: {e!r} — первый листинг будет медленнее")
 
     # Регистрируем CoinListing-сигналы в общем дедупе (он шёл мимо).
     try:
@@ -974,16 +1198,9 @@ if __name__ == "__main__":
 
     # FIX-PERF: глобальный sweeper вместо thread-per-claim (см. _try_claim).
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
-    # FIX-PERF: единый фоновый L2-writer вместо thread.start на каждый open.
+    # FIX-PERF: единый фоновый L2-writer (dirty-flag + 1с batching) вместо
+    # thread.start на каждый _mark_opened в hot-path.
     threading.Thread(target=_fired_persist_loop, daemon=True, name="fired-persist").start()
-
-    # FIX-PERF: pre-warm executor — ThreadPoolExecutor создаёт worker-thread
-    # лениво на первый submit (~3-5мс). На первом листинге не хотим платить
-    # этот налог. Сабмитим N=max_workers no-op задач, ждём их завершения.
-    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
-    for f in _warm:
-        f.result()
-    log_ok("PARSER", "_signal_executor pre-warmed (5 worker'ов готовы)")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:

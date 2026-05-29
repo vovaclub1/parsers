@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import List, Optional
 from config.config import BYBIT_API_KEY, BYBIT_SECRET_KEY
 import requests
 
@@ -25,6 +25,39 @@ except ImportError:
         if isinstance(b, (bytes, bytearray)):
             b = b.decode()
         return json.loads(b)
+
+# FIX-PERF: msgspec.Struct для /v5/market/tickers (price_updater). Раньше
+# orjson возвращал dict с 1000+ tickers, потом for-loop делал .get() на
+# каждом элементе под GIL — 5-15мс на цикл = окно jitter'а для worker'а
+# когда сигнал прилетал в эту же миллисекунду. msgspec парсит сразу в
+# typed Struct (на C-уровне, частично освобождает GIL для больших payloads)
+# и доступ через атрибут (.symbol vs ["symbol"]) — суммарно ~30-50% быстрее.
+try:
+    import msgspec as _msgspec  # type: ignore[import-not-found]
+
+    class _BybitTicker(_msgspec.Struct, frozen=True):
+        symbol:    str = ""
+        lastPrice: str = ""
+
+    # Поле называется `list` (как в JSON), но в аннотации используем
+    # typing.List — иначе `from __future__ import annotations` превращает
+    # `list[_BybitTicker]` в строку, и msgspec при eval'е резолвит `list`
+    # в member_descriptor этого же поля (TypeError: not subscriptable).
+    class _BybitTickerList(_msgspec.Struct, frozen=True):
+        list: List[_BybitTicker] = []  # noqa: RUF012
+
+    class _BybitTickersResp(_msgspec.Struct, frozen=True):
+        result: _BybitTickerList | None = None
+
+    _bybit_tickers_decoder = _msgspec.json.Decoder(_BybitTickersResp)
+
+    def _parse_bybit_tickers(raw: bytes) -> list[_BybitTicker]:
+        resp = _bybit_tickers_decoder.decode(raw)
+        if resp.result is None:
+            return []
+        return resp.result.list
+except ImportError:
+    _parse_bybit_tickers = None  # type: ignore[assignment]
 
 # ── DNS кэш с TTL (убирает повторные DNS-запросы) ────────────────
 _original_getaddrinfo = socket.getaddrinfo
@@ -62,7 +95,7 @@ try:
     from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
-    def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
+    def _ws_place_order(args: dict, _warmup_mode: bool = False) -> dict | None:  # type: ignore[misc]
         return None
     class WSOrderRejected(Exception):  # type: ignore[no-redef]
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
@@ -115,6 +148,51 @@ EXCLUDED_TOKENS = {
     # FIX: убрана "USDⓈ" — regex [A-Z0-9] её никогда не вернёт (Ⓢ U+24C8 не ASCII).
     "USDS",  # Binance liquid staking
     "ANNOUNCEMENT", "ANNOUNCEMENTS",
+    # FIX: ложные срабатывания на «margin trading pairs» нотисах
+    # (см. инцидент 2026-05-25: матчилось 'FOLLOWING' и 'AT',
+    # последнее реально шортилось как тикер AT). Расширяем список
+    # самыми частыми «английскими словами длиной 2-8», которые могут
+    # появиться в теле уведомления и пройти regex [A-Z0-9]{2,10}.
+    "AT", "AS", "BY", "OR", "OF", "IT", "IF", "SO", "DO",
+    "FOLLOWING", "FOLLOWED", "FOLLOWS",
+    "PLEASE", "NOTE", "NOTED", "NOTES",
+    "EFFECTIVE", "STARTING", "BEGINNING", "ENDING", "ENDS",
+    "DATE", "TIME", "TIMES", "HOUR", "HOURS",
+    "USERS", "USER", "CLIENTS", "CLIENT",
+    "WITHDRAWAL", "WITHDRAWALS", "WITHDRAW",
+    "DEPOSIT", "DEPOSITS",
+    "ORDER", "ORDERS", "POSITION", "POSITIONS",
+    "BALANCE", "BALANCES", "ACCOUNT", "ACCOUNTS",
+    "FUND", "FUNDS", "FUNDING",
+    "ISOLATED", "CROSS", "LEVERAGE", "LEVERAGED",
+    "CONVERT", "CONVERTED", "CONVERTING",
+    "COPY", "BOT", "BOTS",
+    "REGION", "REGIONS", "COUNTRY", "COUNTRIES",
+    "SUBJECT", "TERMS", "AGREEMENT", "POLICY", "POLICIES",
+    "DUE", "PER", "VIA", "INTO", "OUT", "AFTER", "BEFORE",
+    "ABOVE", "BELOW", "BETWEEN",
+    "DETAILS", "DETAIL", "MORE", "LESS", "ABOUT",
+    # FIX: словарные английские слова из Binance Earn / Launchpool /
+    # promo-заголовков. Метод 5 (fallback по known_coins) в
+    # find_listing_pairs выдирает любые \b[A-Z0-9]{2,8}\b слова и
+    # отсеивает по EXCLUDED_TOKENS + known_coins. На длинных промо-
+    # текстах ('Subscribe to ... Locked Products ... Enjoy 200% APR
+    # for 7 Days') проходило APR/DAYS/etc. Все они тут.
+    "APR", "APY",
+    "DAYS", "DAY", "WEEK", "WEEKS", "MONTH", "MONTHS", "YEAR", "YEARS",
+    "SPECIAL", "OFFER", "OFFERS",
+    "SUBSCRIBE", "SUBSCRIPTION",
+    "LOCKED", "FLEXIBLE",
+    "ENJOY", "ENJOYS", "ENJOYED",
+    "REWARD", "REWARDS",
+    "PROMO", "PROMOTION", "PROMOTIONAL",
+    "STAKE", "STAKING", "STAKED",
+    "LAUNCHPOOL", "MEGADROP", "AIRDROPS",
+    "BONUS", "BONUSES",
+    "LIMITED", "EXCLUSIVE",
+    # Часто встречаются в Bithumb/Upbit заголовках на корейском
+    # транслите/английском, но не тикеры:
+    "EVENT", "EVENTS", "CELEBRATION", "CELEBRATE",
 }
 
 # ── Кэш цен ──────────────────────────────────────────────────────
@@ -318,31 +396,6 @@ def _get_httpx_client():
             return None
 
 
-def warmup_bybit_http2() -> None:
-    """
-    Прогрев httpx HTTP/2 клиента: импортирует httpx, создаёт Client(http2=True),
-    делает один GET /v5/market/time чтобы установить TLS+HTTP/2 connection и
-    добавить его в keepalive-pool.
-
-    Зачем: без прогрева ПЕРВЫЙ _post_http2 в TP/SL потоке платит:
-      • import httpx       ~30-80мс (Rust extensions + h2)
-      • Client(http2=True) ~5-20мс
-      • TLS+ALPN handshake ~50-150мс
-    Это видно как лог `[BYBIT-HTTP2] httpx http2-client готов` между LONG
-    и `[TP/SL SET LONG]`. После прогрева — лог появляется в boot'е, а TP/SL
-    идёт за ~30мс по уже горячему HTTP/2 stream'у.
-
-    Безопасно вызывать многократно (Client кешируется).
-    """
-    client = _get_httpx_client()
-    if client is None:
-        return
-    try:
-        client.get(BYBIT_BASE_URL + "/v5/market/time", timeout=3)
-    except Exception as e:  # noqa: BLE001
-        print(f"[BYBIT-HTTP2] warmup request упал: {e!r} (не критично)")
-
-
 def _post_http2(endpoint: str, params: dict, retries: int = 2) -> dict:
     """
     HTTP/2 версия _post — мультиплексирует параллельные TP-постановки.
@@ -450,9 +503,16 @@ def price_updater() -> None:
     Каждые ~2с тянет все linear-тикеры с Bybit и обновляет price_cache.
     Заменяет ccxt.fetch_tickers() — без overhead ccxt.
     Использует clear() + update() чтобы удалять делистингованные монеты.
+
+    FIX-PERF: парсит через msgspec.Struct (см. _parse_bybit_tickers) — на
+    1000+ tickers экономит ~5-10мс GIL hold time vs orjson+dict. Это окно
+    в котором worker может оказаться зажат если сигнал придёт прямо на
+    JSON-parse. Fallback на orjson+dict если msgspec не установлен.
     """
     url     = BYBIT_BASE_URL + "/v5/market/tickers"
     session = requests.Session()
+
+    use_msgspec = _parse_bybit_tickers is not None
 
     while True:
         try:
@@ -462,19 +522,33 @@ def price_updater() -> None:
                 timeout=4,
             )
             resp.raise_for_status()
-            items = _json_loads(resp.content).get("result", {}).get("list", [])  # FIX-batch-1
 
             new_cache: dict[str, float] = {}
             new_known: set[str] = set()
 
-            for item in items:
-                symbol     = item.get("symbol", "")       # BTCUSDT
-                last_price = item.get("lastPrice")
-                if last_price and symbol.endswith("USDT"):
-                    price = float(last_price)
-                    key = symbol[:-4] + "/USDT:USDT"
-                    new_cache[key] = price
-                    new_known.add(symbol[:-4])
+            if use_msgspec:
+                # FIX-PERF: typed Struct, attribute access (.symbol vs ["symbol"]).
+                for tk in _parse_bybit_tickers(resp.content):
+                    symbol     = tk.symbol
+                    last_price = tk.lastPrice
+                    if last_price and symbol.endswith("USDT"):
+                        try:
+                            price = float(last_price)
+                        except ValueError:
+                            continue
+                        coin = symbol[:-4]
+                        new_cache[coin + "/USDT:USDT"] = price
+                        new_known.add(coin)
+            else:
+                items = _json_loads(resp.content).get("result", {}).get("list", [])
+                for item in items:
+                    symbol     = item.get("symbol", "")
+                    last_price = item.get("lastPrice")
+                    if last_price and symbol.endswith("USDT"):
+                        price = float(last_price)
+                        key = symbol[:-4] + "/USDT:USDT"
+                        new_cache[key] = price
+                        new_known.add(symbol[:-4])
 
             with cache_lock:
                 price_cache.clear()
@@ -681,6 +755,53 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
         with _delist_exchange_lock:
             _delist_exchange[ticker_name] = "gate"
     return amount, fill_price
+
+
+# ── Chain warmup (PEP-659 specialization) ────────────────────────
+# Аналог listing_api.warmup_chain — прогрев adaptive interpreter
+# для market_open_short. Подробности — см. listing_api.warmup_chain.
+
+def warmup_chain(n: int = 30) -> int:
+    """
+    Прогоняет ТОТ ЖЕ Python-путь, что и market_open_short, N раз —
+    без реальных ордеров. Возвращает число успешных итераций.
+
+    BTC — гарантированно в price_cache и preloaded lot steps.
+    """
+    sample_ticker = "BTC"
+    sample_margin = 10.0
+    symbol = f"{sample_ticker}USDT"
+    ok = 0
+
+    for _ in range(n):
+        try:
+            bybit_price = get_price(sample_ticker)
+            if not bybit_price:
+                continue
+            raw_qty = (sample_margin / bybit_price) * LEVERAGE
+            try:
+                step = _get_qty_step(symbol)
+            except QtyStepUnavailable:
+                continue
+            amount_tokens = _round_qty(raw_qty, step)
+            if amount_tokens <= 0:
+                continue
+            qty_str = str(amount_tokens)
+            order_link_id = _new_order_link_id()
+            ws_args = {
+                "category":    "linear",
+                "symbol":      symbol,
+                "side":        "Sell",
+                "orderType":   "Market",
+                "qty":         qty_str,
+                "positionIdx": 2,
+                "orderLinkId": order_link_id,
+            }
+            _ws_place_order(ws_args, _warmup_mode=True)
+            ok += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return ok
 
 
 def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) -> str:

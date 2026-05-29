@@ -20,7 +20,6 @@ from api.delist_api import (
     EXCLUDED_TOKENS,
     price_updater,
     warmup_bybit_connection,
-    warmup_bybit_http2,      # FIX-PERF: прогрев httpx HTTP/2 до первого TP/SL
     start_bybit_heartbeat,   # FIX: TLS pool heartbeat
     preload_lot_steps,
     QtyStepUnavailable,
@@ -43,7 +42,7 @@ try:
     from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
-    def _ws_place_order(args: dict) -> dict | None:  # type: ignore[misc]
+    def _ws_place_order(args: dict, _warmup_mode: bool = False) -> dict | None:  # type: ignore[misc]
         return None
     class WSOrderRejected(Exception):  # type: ignore[no-redef]
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
@@ -57,7 +56,6 @@ __all__ = [
     "price_updater",
     "gate_price_updater",
     "warmup_bybit_connection",
-    "warmup_bybit_http2",
     "start_bybit_heartbeat",
     "preload_lot_steps",
     "gate_preload_lot_steps",
@@ -116,12 +114,15 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 # дубль с retCode 30050, защита от double-position при WS
                 # ack timeout (см. post_order в delist_api).
                 order_link_id = new_order_link_id()
-                # FIX-PERF: order.create несёт ТОЛЬКО market-открытие. SL/TP/
-                # trailing идут отдельным /v5/position/trading-stop в фоновом
-                # потоке (HTTP/2-multiplexed, ~30-50мс). Bundle SL+TP в
-                # order.create экономил ~30мс на постановке SL, но платил
-                # ~3-5мс в hot-path (extra compute + larger TLS frame), что
-                # критичнее на signal-to-fill метрике.
+                # Bundle SL + TP1 в order.create — failsafe stop loss попадает
+                # на сервер в одной WS-фрейме с открытием, без зависимости от
+                # отдельного /v5/position/trading-stop (который добавляет
+                # trailing уже в фоне). Если open-frame пройдёт, а trading-stop
+                # задержится — SL уже стоит. trailingStop в order.create
+                # Bybit'ом не поддерживается, поэтому ставится отдельно.
+                sl_price  = round(bybit_price * 0.92, 8)   # -8%
+                tp1_price = round(bybit_price * 1.045, 8)  # +4.5%
+                tp1_qty   = _round_qty(amount_tokens * 0.30, step)
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
@@ -130,6 +131,12 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                     "qty":         qty_str,
                     "positionIdx": 1,
                     "orderLinkId": order_link_id,
+                    "stopLoss":    str(sl_price),
+                    "slTriggerBy": "LastPrice",
+                    "takeProfit":  str(tp1_price),
+                    "tpTriggerBy": "LastPrice",
+                    "tpslMode":    "Partial",
+                    "tpSize":      str(tp1_qty),
                 }
                 # FIX-PERF: WS Trade fire-and-forget (place_order_ws_fast).
                 # Возврат не-None означает «frame ушёл на провод»; ack от
@@ -177,21 +184,94 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
     return amount, fill_price
 
 
+# ── Chain warmup (PEP-659 specialization) ────────────────────────
+# Прогрев CPython adaptive interpreter'а: первый запуск любого
+# bytecode'а до specialization ~1.5-3x медленнее. На market_open_long
+# с её 14-полевым dict, function-call'ами get_price/_get_qty_step/
+# _round_qty/uuid это даёт +5-15мс на ПЕРВОМ листинге vs warm.
+# Прогоняем тот же путь N раз с диверсией финального ws.send в
+# cancel-fake (через _warmup_mode=True в place_order_ws_fast).
+
+def warmup_chain(n: int = 30) -> int:
+    """
+    Прогоняет ТОТ ЖЕ Python-путь, что и market_open_long, N раз —
+    без создания реальных ордеров. Возвращает число успешных итераций.
+
+    Прогревает:
+      • get_price → cache.get
+      • f-string symbol build
+      • _get_qty_step
+      • _round_qty (с Decimal precision cache)
+      • new_order_link_id (uuid4)
+      • round(price * coef, 8) — SL/TP вычисления
+      • dict-литерал из 14 полей (CPython BUILD_MAP)
+      • _ws_place_order routing → sync.warmup() (cancel-fake)
+      • json.dumps + ws.send (через warmup'овский payload)
+
+    BTC выбран потому что:
+      • Всегда в price_cache
+      • Шаг лота preloaded
+      • amount_tokens > 0 при margin=14 USDT
+    """
+    sample_ticker = "BTC"
+    sample_margin = 14.0
+    symbol = f"{sample_ticker}USDT"
+    ok = 0
+
+    for _ in range(n):
+        try:
+            bybit_price = get_price(sample_ticker)
+            if not bybit_price:
+                continue
+            raw_qty = (sample_margin / bybit_price) * LEVERAGE
+            try:
+                step = _get_qty_step(symbol)
+            except QtyStepUnavailable:
+                continue
+            amount_tokens = _round_qty(raw_qty, step)
+            if amount_tokens <= 0:
+                continue
+            qty_str = str(amount_tokens)
+            order_link_id = new_order_link_id()
+            sl_price  = round(bybit_price * 0.92, 8)
+            tp1_price = round(bybit_price * 1.045, 8)
+            tp1_qty   = _round_qty(amount_tokens * 0.30, step)
+            order_args = {
+                "category":    "linear",
+                "symbol":      symbol,
+                "side":        "Buy",
+                "orderType":   "Market",
+                "qty":         qty_str,
+                "positionIdx": 1,
+                "orderLinkId": order_link_id,
+                "stopLoss":    str(sl_price),
+                "slTriggerBy": "LastPrice",
+                "takeProfit":  str(tp1_price),
+                "tpTriggerBy": "LastPrice",
+                "tpslMode":    "Partial",
+                "tpSize":      str(tp1_qty),
+            }
+            # _warmup_mode=True → диверсия в cancel-fake. Никакого ордера.
+            _ws_place_order(order_args, _warmup_mode=True)
+            ok += 1
+        except Exception:  # noqa: BLE001
+            # Все ошибки игнорим — warmup best-effort, не должен валить bootstrap.
+            pass
+    return ok
+
+
 # ── TP/SL для лонга ───────────────────────────────────────────────
 
 def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет SL (-8%) + TP1 (+4.5% на 30%) + trailing stop 3.5% на 70% на
-    Bybit через /v5/position/trading-stop. Идёт по HTTP/2-multiplexed
-    клиенту (_post_http2) — несколько параллельных постановок шарят один
-    TLS-stream.
+    Добавляет trailing stop 3.5% на 70% позиции на Bybit. SL (-8%) и
+    TP1 (+4.5% на 30%) уже выставлены в момент открытия — они летят
+    в одном WS-фрейме с order.create (см. market_open_long). Эта функция
+    только добавляет trailing (Bybit не поддерживает trailingStop в
+    order.create — только через /v5/position/trading-stop).
 
-    FIX-PERF: ранее в batch-7 SL+TP1 бандлились в order.create вместе с
-    открытием, чтобы failsafe-SL уехал на сервер в одном фрейме с открытием.
-    Откатили: bundle добавлял ~3-5мс в hot-path market_open_long (extra
-    compute + larger TLS frame), а выигрыш в SL latency (~30мс) не стоил
-    деградации signal-to-fill. Сейчас полный TP/SL пакет уходит из фонового
-    потока worker'а сразу после OPEN-метки.
+    Если open прошёл через REST fallback и не нёс SL/TP — повторно
+    выставляем их через trading-stop здесь же (idempotent).
     """
     symbol = f"{ticker_name}USDT"
 

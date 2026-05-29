@@ -11,6 +11,37 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# FIX: Binance CDN (Akamai/CloudFront) фингерпринтит TLS-handshake
+# python-requests (JA3/JA4) и возвращает 400 на
+# /bapi/composite/v1/public/cms/article/list/query независимо от
+# headers. curl_cffi эмулирует реальный TLS Chrome через
+# libcurl-impersonate; API совместим с requests.Session
+# (.get/.headers/.proxies/raise_for_status). При отсутствии пакета —
+# graceful fallback на requests (400 продолжатся, но контейнер
+# не падает).
+try:
+    from curl_cffi import requests as _cffi_requests  # type: ignore[import-not-found]
+    # "chrome" — алиас на самый свежий поддерживаемый профиль
+    # (см. curl_cffi.requests.BrowserType). Переопределить точную
+    # версию можно через BINANCE_TLS_IMPERSONATE=chrome120 в .env.
+    _HTTP_IMPERSONATE = os.getenv("BINANCE_TLS_IMPERSONATE", "chrome")
+
+    def _new_http_session(proxy: str | None):
+        kwargs: dict = {"impersonate": _HTTP_IMPERSONATE}
+        if proxy:
+            kwargs["proxies"] = {"http": proxy, "https": proxy}
+        return _cffi_requests.Session(**kwargs)
+
+    _HTTP_BACKEND = "curl_cffi"
+except ImportError:
+    def _new_http_session(proxy: str | None):
+        s = requests.Session()
+        if proxy:
+            s.proxies = {"http": proxy, "https": proxy}
+        return s
+
+    _HTTP_BACKEND = "requests"
+
 # FIX-batch-1: orjson в хот path Binance article parsing (3-5x быстрее).
 try:
     import orjson as _orjson  # type: ignore[import-not-found]
@@ -72,6 +103,7 @@ from config.config import (
     EXTRA_DELIST_CHANNELS, parse_channels,    # FIX-batch-3: multi-channel
     TREE_OF_ALPHA_WS_ENABLED,                  # FIX-batch-4: TOA WS
     BYBIT_WS_TRADE_ENABLED,                    # FIX-batch-5: Bybit WS Trade
+    BYBIT_SYNC_WS_ENABLED,                     # FIX-PERF: sync WS hot-path
     BYBIT_API_KEY, BYBIT_SECRET_KEY,
 )
 from api.delist_api import (
@@ -81,7 +113,6 @@ from api.delist_api import (
     set_tp_sl,
     market_open_short,
     warmup_bybit_connection,
-    warmup_bybit_http2,
     start_bybit_heartbeat,
     preload_lot_steps,
     gate_price_updater,
@@ -103,17 +134,50 @@ BINANCE_API_URL    = "https://www.binance.com/bapi/composite/v1/public/cms/artic
 ARTICLE_DETAIL_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
 CATEGORY_ID        = 161
 
-# FIX-batch-8: 3с → 1с базового интервала.
-# С N=3 прокси и stagger даёт median детекции ~500мс вместо ~1500мс.
-# Хардкод (не env) — это публичный параметр поллера, не персональные данные.
-POLL_INTERVAL_BASE = 1.0
+# Базовый интервал между запросами одного поллера (секунды).
+# FIX: 1.0с давал 60 req/min на IP — Binance стабильно банил 429 в первые
+# ~15с (по логам: 14 запросов от direct → 429, потом каждый раз после
+# POLL_BACKOFF_429 паузы цикл повторялся). 3.0с даёт ~20 req/min на IP —
+# с запасом ниже наблюдаемого лимита /bapi/composite, при этом с 3-4
+# поллерами эффективный глобальный rate остаётся ~1 req/с (median
+# детекции ~500мс — приемлемо для делистинга).
+# Env DELIST_POLL_INTERVAL=Xс позволяет тюнить без передеплоя: уменьшить
+# если 3с надёжно держит и хочется быстрее, или увеличить если 3с всё
+# ещё ловит 429 (тогда Binance срезал лимиты — попробуй 5.0 или 6.0).
+POLL_INTERVAL_BASE = float(os.getenv("DELIST_POLL_INTERVAL", "3.0"))
+# Анти-стадо: добавляем ±jitter на каждый sleep, чтобы N поллеров,
+# стартовавших на одном CPU-тике, не били Binance синхронно.
+# 0.10 = ±10% — при 3с интервале это ±300мс, незаметно для детекции,
+# но размывает пики req/с на стороне Binance.
+POLL_INTERVAL_JITTER = 0.10
 # FIX-batch-8: per-poller адаптивный backoff при 429 — поллер, который
 # нарвался на rate limit, делает свой следующий запрос с увеличенным
 # интервалом, восстанавливается через POLL_BACKOFF_RECOVERY секунд.
 POLL_BACKOFF_429   = 30.0   # пауза при HTTP 429 (как раньше)
 POLL_BACKOFF_MULT  = 1.5    # после ошибки этот поллер замедляется в 1.5x
-POLL_BACKOFF_MAX   = 5.0    # потолок индивидуального интервала
+# FIX: при POLL_INTERVAL_BASE=3.0 потолок 5.0 = всего 1.7x запаса. Поднимаем
+# до 5× базового, чтобы backoff реально мог растянуться при флапающем
+# Binance/прокси (иначе MULT=1.5 упирается в потолок после первого bump'а).
+POLL_BACKOFF_MAX   = max(15.0, POLL_INTERVAL_BASE * 5)
 POLL_BACKOFF_RECOVERY = 60.0  # секунд до возврата к POLL_INTERVAL_BASE
+
+# FIX: «постоянные» отказы (мёртвый прокси: Connection refused,
+# timeout на handshake) поднимают интервал до DEAD_INTERVAL, иначе
+# лог захлёбывается 1 ошибкой в секунду на каждый dead proxy.
+# Триггер — N подряд connection error'ов. Любой успешный ответ —
+# выход из DEAD-режима. Логируем редко (раз в N тиков), чтобы
+# проблема была видна, но не спамила.
+POLL_DEAD_THRESHOLD     = 5      # подряд connection-error'ов = «прокси мёртв»
+POLL_DEAD_INTERVAL      = 60.0   # интервал retry для «мёртвого» поллера
+POLL_DEAD_LOG_EVERY     = 30     # лог только каждый N-й тик пока мёртвый
+
+# Heartbeat: раз в N успешных циклов поллер логирует «alive ✓ K pollов».
+# Это видимое подтверждение что Binance отдаёт 200 (после fix `_t`) и
+# парсер крутится — иначе после `первый запуск — запомнили K статей`
+# логи молчат пока не появится новая статья (что бывает раз в часы/сутки).
+# 60 × ~1с = ~60с между heartbeat'ами на каждый живой поллер → 3-4
+# строки в минуту суммарно, не спам.
+POLL_HEARTBEAT_EVERY    = 60
 
 DELIST_KEYWORDS    = ["Will Delist", "Delisting Notice", "Binance Will Delist"]
 
@@ -152,6 +216,22 @@ TG_DELIST_NEG = [
     "alpha removal",
     "from alpha",
     "delisting postponed",  # отменили
+    # FIX: "Notice of Removal of Margin Trading Pairs" ≠ делистинг токена.
+    # Снимаются только margin-пары; на spot/perp монета остаётся, шорт
+    # открывать нельзя (получаем ложный сигнал на случайный тикер из
+    # текста, см. инцидент с FOLLOWING/AT 2026-05-25).
+    "margin trading pairs",
+    "margin trading pair",
+    "removal of margin",
+    "margin pairs",
+    "isolated margin",
+    "cross margin",
+    # Аналогичные «не-делисты»: leveraged token shutdowns, copy-trading
+    # ограничения и т.п. — это не уход монеты с биржи.
+    "leveraged tokens",
+    "copy trading",
+    "convert pairs",
+    "convert pair",
 ]
 
 # Watchdog
@@ -211,19 +291,55 @@ def _parse_proxies(raw: str) -> list[str | None]:
 
 PROXIES: list[str | None] = _parse_proxies(DELIST_PROXIES)
 
-# ── дедупликация сигналов ────────────────────────────────────────
+# ── дедупликация сигналов: L1 (TTL) + L2 (persistent) ─────────────
+# L1 — короткоживущая защита от near-simultaneous дублей (несколько каналов
+#      пишут об одном делистинге).
+# L2 — постоянная память: «эту монету уже шортили». Защищает от повторного
+#      открытия после рестарта контейнера / получения той же статьи через
+#      разные источники (TG, BINANCE poller, TOA).
+# L2 пишется только после УСПЕШНОГО open (worker callback), чтобы провалившийся
+# open не сделал монету «забытой».
 _fired_lock    = threading.Lock()
 _fired_coins:  set[str] = set()
 _fired_expiry: dict[str, float] = {}
-_FIRED_TTL     = 60   # секунд до снятия блокировки монеты
+_FIRED_TTL     = 60   # L1: секунд до снятия блокировки монеты
+
+# L2: постоянное хранилище отстрелянных монет (любой источник).
+_global_fired: set[str] = set()
+_FIRED_FILE = Path(SESSION_DIR) / "delist_fired.json"
+
+# FIX-PERF: dirty-flag для фонового L2-writer'а — вместо thread.start() на
+# каждый успешный open (то стоило ~3-15мс в hot-path worker'а под GIL contention).
+_fired_dirty = threading.Event()
 
 seen_ids: set[int] = set()
 seen_lock = threading.Lock()
 
-_BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    "Accept": "application/json",
+# FIX: Binance API gateway требует Binance-специфичные хедера
+# (clienttype/lang/Referer/Origin). Браузерные UA/Accept/Sec-* при
+# наличии curl_cffi подставляет сам через impersonate-профиль —
+# дублировать их нельзя, иначе перетрём «реальный» Chrome-набор и
+# Akamai снова увидит несоответствие JA3 ↔ headers.
+# В fallback-режиме (requests) добавляем минимальный набор браузерных
+# заголовков — TLS-fingerprint всё равно выдаст python-requests, и
+# 400 продолжатся, но хотя бы headers будут не «пустые».
+_BINANCE_API_HEADERS = {
+    "clienttype": "web",
+    "lang": "en",
+    "Referer": "https://www.binance.com/en/support/announcement-list/",
+    "Origin": "https://www.binance.com",
 }
+_BASE_HEADERS_FALLBACK = {
+    **_BINANCE_API_HEADERS,
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_BASE_HEADERS = _BINANCE_API_HEADERS if _HTTP_BACKEND == "curl_cffi" else _BASE_HEADERS_FALLBACK
 
 # ── Watchdog timestamps ───────────────────────────────────────────
 _poller_last_ts: dict[int, float] = {}        # {session_idx: timestamp}
@@ -240,13 +356,15 @@ _poller_intervals: dict[int, float] = {}
 _poller_last_bump_ts: dict[int, float] = {}
 _poller_intervals_lock = threading.Lock()
 
-# Создаём отдельную сессию для каждого прокси
-_sessions: list[requests.Session] = []
+# Создаём отдельную сессию для каждого прокси.
+# FIX: при наличии curl_cffi — используем его (TLS-impersonation
+# Chrome). Headers всё равно ставим — это hint для CDN'а
+# (User-Agent логируется), но решающий фактор для Akamai —
+# JA3/JA4 fingerprint.
+_sessions: list = []
 for proxy in PROXIES:
-    s = requests.Session()
+    s = _new_http_session(proxy)
     s.headers.update(_BASE_HEADERS)
-    if proxy:
-        s.proxies = {"http": proxy, "https": proxy}
     _sessions.append(s)
 
 # Инициализируем timestamps для watchdog + интервалы для backoff
@@ -256,45 +374,152 @@ for _i in range(len(_sessions)):
     # 0 = ни одного bump'а ещё не было → нет смысла ресетить
     _poller_last_bump_ts[_i] = 0.0
 
+# Startup-probe: сессии (прокси), которые не прошли первичный health-check.
+# Поллер для них стартует сразу в DEAD-режиме (60с интервал), чтобы:
+#   • не выпускать burst из 5 одинаковых ошибок в первые 15с,
+#   • не молотить TCP connect() в воду 1× в секунду по мёртвому endpoint'у,
+#   • DEAD-режим всё равно переодически перепроверяет — если прокси
+#     поднимется, поллер сам выйдет из DEAD на первом 200.
+# Заполняется ниже в _probe_proxy_health() (после построения сессий, до
+# запуска поток-поллеров main()).
+_poller_initial_dead: set[int] = set()
+
+
+def _probe_proxy_health() -> None:
+    """
+    Быстрая проверка каждой сессии: 1 запрос к реальному Binance endpoint
+    с коротким timeout. Сессии, которые мгновенно падают (мёртвый прокси:
+    Connection refused / DNS-фейл / SOCKS handshake error) сразу помечаются
+    как DEAD и стартуют поллер в DEAD-режиме.
+
+    Это не валидация раз и навсегда: DEAD-режим перепроверяет с интервалом
+    POLL_DEAD_INTERVAL (60с), так что временно недоступный прокси сам
+    воскреснет на первом 200. Цель — убрать лог-шум на старте.
+
+    Запускается в N параллельных потоках, чтобы probe не растягивался на
+    N×timeout секунд (для 4 прокси с 3с timeout — 12с старта → 3с).
+    """
+    if not _sessions:
+        return
+
+    # FIX-INCIDENT: форсим pageSize=max, чтобы probe-ответ принёс полный
+    # набор актуальных статей — этим набором pre-fill'ним seen_ids ДО
+    # старта поллеров. Иначе первый запрос поллера может попасть на
+    # random pageSize=5, в seen_ids уйдут 5 ID, а следующий запрос с
+    # pageSize=20 принесёт 15 «новых» (исторических) → mass open shorts.
+    test_url = _build_binance_url(force_page_size=max(BINANCE_PAGE_SIZES))
+    results: dict[int, str] = {}
+    results_lock = threading.Lock()
+    prefilled_ids: list[int] = []
+    prefilled_lock = threading.Lock()
+
+    def _probe_one(idx: int) -> None:
+        sess = _sessions[idx]
+        label = f"proxy[{idx}]" if idx > 0 else "direct"
+        try:
+            r = sess.get(test_url, timeout=3)
+            r.raise_for_status()
+            with results_lock:
+                results[idx] = f"[{label}] OK ({r.status_code})"
+            # FIX-INCIDENT: pre-fill seen_ids из ответа любой живой сессии.
+            # Несколько сессий могут отдать пересекающиеся наборы — set'у
+            # пофиг на дубликаты. Берём всё что распарсилось; ошибка
+            # парсинга не валит probe — мы здесь не для этого.
+            try:
+                if _parse_binance_articles is not None:
+                    arts = _parse_binance_articles(r.content)
+                else:
+                    d = _json_loads(r.content).get("data", {})
+                    cats = d.get("catalogs") or [{}]
+                    arts = d.get("articles") or (
+                        cats[0].get("articles", []) if isinstance(cats[0], dict) else []
+                    )
+                with prefilled_lock:
+                    for a in arts:
+                        aid = a.get("id")
+                        if aid is not None:
+                            prefilled_ids.append(aid)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001
+            with results_lock:
+                results[idx] = f"[{label}] DEAD: {e!r}"
+            # Помечаем как DEAD только при connection-уровне ошибке
+            # или HTTP 4xx-блоке (это не лечится в коде; нужны другие IP).
+            if _is_connection_error(e) or _is_http_block(e):
+                _poller_initial_dead.add(idx)
+
+    threads = []
+    for i in range(len(_sessions)):
+        t = threading.Thread(target=_probe_one, args=(i,), daemon=True,
+                             name=f"probe-{i}")
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=5)
+
+    alive = len(_sessions) - len(_poller_initial_dead)
+    print(f"[PROXY-PROBE] {alive}/{len(_sessions)} сессий живы:", flush=True)
+    for idx in sorted(results):
+        marker = "✗" if idx in _poller_initial_dead else "✓"
+        print(f"  {marker} {results[idx]}", flush=True)
+
+    # FIX-INCIDENT: pre-fill seen_ids ДО старта поллеров. После этого даже
+    # если у поллера random выдаст pageSize=5 на первом запросе — все 5
+    # ID уже в seen_ids (из probe c pageSize=20), и логика "новые статьи"
+    # сработает корректно (0 новых → 0 process_article).
+    if prefilled_ids:
+        with seen_lock:
+            seen_ids.update(prefilled_ids)
+        print(
+            f"[PROXY-PROBE] seen_ids pre-filled: {len(set(prefilled_ids))} "
+            f"уникальных статей забанено до старта поллеров",
+            flush=True,
+        )
+
+
+# Probe вызывается из main(), перед запуском поллер-потоков —
+# к тому моменту все вспомогательные функции (_build_binance_url,
+# _is_connection_error, _is_http_block) уже определены ниже по модулю.
+
 # Циклический итератор по сессиям
 _session_cycle = itertools.cycle(enumerate(_sessions))
 _session_lock  = threading.Lock()
 
 
-def _next_session() -> tuple[int, requests.Session]:
+def _next_session() -> tuple[int, object]:
     with _session_lock:
         return next(_session_cycle)
 
 
 # ── FIX-batch-8: cache-busting URL builder ────────────────────────
 
-def _build_binance_url() -> str:
+def _build_binance_url(force_page_size: int | None = None) -> str:
     """
-    Собирает URL к Binance article API так, чтобы CloudFront cache key
-    был уникальным на каждом запросе. Иначе разные edge'ы могут вернуть
-    stale (10-30с задержки от момента публикации статьи).
+    Собирает URL к Binance article API.
 
-    Что делаем:
-      1. pageSize крутим из whitelist BINANCE_PAGE_SIZES — все эти значения
-         валидны для API. Меняя его, попадаем на разные cache key.
-      2. _t=<ms-timestamp> — гарантированный uniqueness каждого запроса.
-      3. Перемешиваем порядок параметров — у некоторых CDN порядок учитывается.
+    FIX: убран `_t=<ms-timestamp>` cache-busting параметр. Binance WAF
+    отбивает HTTP 400 любой запрос с неизвестным query-параметром (whitelist:
+    только type/catalogId/pageNo/pageSize). Был воспроизведён `curl` без
+    кук/headers — с `_t` → 400, без `_t` → 200. Это и было настоящей причиной
+    «delist parser ничего не получает» (а не TLS/JA3/IP-блок, как казалось).
 
-    FIX: убран дополнительный rnd_name=rnd_val — _t уже даёт уникальный
-    cache key, второй random был избыточен (не вреден, но шум).
+    Cache-busting на стороне CloudFront остаётся через ротацию pageSize ∈
+    {5,10,15,20} — это 4 разных cache key, чего достаточно при interval=1с,
+    учитывая что у нас несколько поллеров (direct + N proxies).
+
+    FIX-INCIDENT: force_page_size форсит конкретное значение pageSize. Нужно
+    для первого запроса поллера: если на нём попадёт случайно pageSize=5,
+    в seen_ids уйдёт только 5 ID, и на следующем запросе с pageSize=20 ещё
+    15 «старых» статей будут считаться новыми → массовый process_article →
+    шорты по всем подряд тикерам. Поллер обязан на старте взять max(20)
+    чтобы гарантированно набрать полный «бан-лист» исторических статей.
     """
-    page_sz = random.choice(BINANCE_PAGE_SIZES)
-
-    params = [
-        ("type", "1"),
-        ("pageNo", "1"),
-        ("pageSize", str(page_sz)),
-        ("catalogId", str(CATEGORY_ID)),
-        ("_t", str(int(time.time() * 1000))),  # ms timestamp — гарантированный uniqueness
-    ]
-    random.shuffle(params)
-    qs = "&".join(f"{k}={v}" for k, v in params)
-    return f"{BINANCE_API_URL}?{qs}"
+    page_sz = force_page_size if force_page_size is not None else random.choice(BINANCE_PAGE_SIZES)
+    return (
+        f"{BINANCE_API_URL}"
+        f"?type=1&catalogId={CATEGORY_ID}&pageNo=1&pageSize={page_sz}"
+    )
 
 
 # ── Heartbeat для docker healthcheck ──────────────────────────────
@@ -324,15 +549,62 @@ def log_err(tag: str, msg: str):   _log(tag, RED,    msg)
 
 # ── Дедупликация сигналов ─────────────────────────────────────────
 
+def _load_fired_state() -> None:
+    """Подгружает L2 с диска. Безопасно к отсутствию файла / битым данным."""
+    try:
+        if not _FIRED_FILE.exists():
+            return
+        raw = _FIRED_FILE.read_bytes()
+        if not raw.strip():
+            return
+        try:
+            import orjson as _oj  # type: ignore[import-not-found]
+            data = _oj.loads(raw)
+        except ImportError:
+            import json as _stdj
+            data = _stdj.loads(raw.decode())
+        gf = data.get("global", [])
+        with _fired_lock:
+            if isinstance(gf, list):
+                _global_fired.update(str(c) for c in gf if isinstance(c, str))
+        log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)}")
+    except Exception as e:  # noqa: BLE001
+        log_warn("DEDUP", f"L2 load failed: {e!r} — стартуем с пустого")
+
+
+def _persist_fired_state() -> None:
+    """Атомарный сейв L2 (write+rename). Вызывается фоновым writer'ом."""
+    try:
+        with _fired_lock:
+            snapshot = {"global": sorted(_global_fired)}
+        try:
+            import orjson as _oj  # type: ignore[import-not-found]
+            payload = _oj.dumps(snapshot, option=_oj.OPT_INDENT_2)
+        except ImportError:
+            import json as _stdj
+            payload = _stdj.dumps(snapshot, indent=2).encode()
+        _FIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _FIRED_FILE.with_suffix(".json.tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(_FIRED_FILE)
+    except Exception as e:  # noqa: BLE001
+        log_warn("DEDUP", f"L2 persist failed: {e!r}")
+
+
 def _try_claim(coin: str) -> bool:
     """
     Возвращает True если монета ещё не в работе и блокирует её на _FIRED_TTL секунд.
     Защищает от двойного открытия одной монеты.
+    L2 (_global_fired) — проверка «уже шортили эту монету когда-либо».
     FIX-PERF: было — на каждый claim спавнили sleep-thread для TTL-cleanup.
     threading.Thread.start() ≈ 3-5мс на coin (для 5 монет = 15-25мс в hot-path).
     Теперь один фоновый sweeper (_fired_sweeper) подметает по таймстампу.
     """
     with _fired_lock:
+        # L2: уже шортили эту монету (навсегда) → skip.
+        if coin in _global_fired:
+            return False
+        # L1: монета сейчас обрабатывается (TTL) → skip.
         if coin in _fired_coins:
             return False
         _fired_coins.add(coin)
@@ -340,8 +612,38 @@ def _try_claim(coin: str) -> bool:
     return True
 
 
+def _mark_opened(coin: str) -> None:
+    """
+    Worker зовёт после успешного open. Обновляет L2 (in-memory) и поднимает
+    dirty-flag — фоновый writer (_fired_persist_loop) сохранит на диск.
+
+    FIX-PERF: НЕ спавним поток здесь — это hot-path worker'а. Только set.add
+    (~1мкс) + Event.set (~1мкс).
+    """
+    dirty = False
+    with _fired_lock:
+        if coin not in _global_fired:
+            _global_fired.add(coin)
+            dirty = True
+    if dirty:
+        _fired_dirty.set()
+
+
+def _fired_persist_loop() -> None:
+    """
+    Единый фоновый writer L2 на диск. Просыпается по dirty-flag, ждёт ещё
+    1с (батчинг — если за это окно прилетит несколько open'ов на burst'е,
+    всё запишется одним write+rename), потом сохраняет.
+    """
+    while True:
+        _fired_dirty.wait()
+        time.sleep(1.0)
+        _fired_dirty.clear()
+        _persist_fired_state()
+
+
 def _fired_sweeper() -> None:
-    """FIX-PERF: единый поток для TTL-cleanup _fired_coins."""
+    """FIX-PERF: единый поток для TTL-cleanup L1 _fired_coins. L2 — навсегда."""
     while True:
         time.sleep(5)
         now = time.monotonic()
@@ -412,22 +714,24 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
                 time.sleep(0.1)
                 continue
 
+            # FIX-PERF: TP/SL submit ДО метрики (~5-20μs, не сдвинет open_ms).
+            # Один print вместо двух — экономия ~4мс на intermediate stdout flush.
+            # См. parser_listing.py для деталей.
+            _tp_sl_executor.submit(set_tp_sl, coin, entry_price, amount)
+
             open_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("OPEN", f"[{source}] {coin} | ордер открыт за {BOLD}{open_ms:.0f}мс{RESET}{GREEN}")
-
-            threading.Thread(
-                target=set_tp_sl,
-                args=(coin, entry_price, amount),
-                daemon=True,
-            ).start()
-
-            elapsed_ms = (time.perf_counter() - t_start) * 1000
-            log_ok("SHORT", (
-                f"[{source}] {coin} | entry={entry_price} | amount={amount:.4f} | "
-                f"время от статьи до ордера: {BOLD}{elapsed_ms:.0f}мс{RESET}{GREEN}"
+            log_ok("OPEN", (
+                f"[{source}] {coin} | ордер за {BOLD}{open_ms:.0f}мс{RESET}{GREEN} | "
+                f"entry={entry_price} | amount={amount:.4f}"
             ))
+            # FIX-PERF: tg_log fire-and-forget (см. tg/tg_logger.py).
             tg_log(
-                f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {elapsed_ms:.0f}мс")
+                f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
+
+            # FIX-PERF: bookkeeping L2 ПОСЛЕ метрики и tg_log — не влияет
+            # на «время от сигнала до ордера». _mark_opened только set.add +
+            # Event.set (~2мкс), без thread.start (см. _fired_persist_loop).
+            _mark_opened(coin)
             return
         except Exception as e:
             log_err("WORKER", f"{coin}: попытка {attempt}/{retries} упала → {e}")
@@ -460,23 +764,39 @@ def _on_toa_delist(full_text: str, t_start: float) -> None:
 # __exit__ блокировал до завершения всех worker'ов — +5-15мс overhead.
 _signal_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="delist-signal")
 
+# FIX-PERF: отдельный preheated pool для set_tp_sl. Замена thread.start
+# (~3-15мс под GIL contention) на submit (~5-20мкс) в hot-path после OPEN.
+_tp_sl_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="delist-tpsl")
 
-def process_signal(pairs: list[str], source: str, t_start: float) -> None:
+
+def process_signal(pairs: list[str], source: str, t_start: float | None = None) -> None:
     """
     Общая функция обработки сигнала делистинга.
-    Фильтрует дубли через _try_claim, открывает шорты.
+    Фильтрует дубли через _try_claim (L1 TTL + L2 persistent), открывает шорты.
+
+    FIX: t_start теперь опционален. Если None — замеряем сами (бэк-совместимость).
+    Если передан (из TOA WS / TG handler / poller) — используем точный момент
+    прихода сигнала, чтобы метрики OPEN в логах отражали полный путь.
     """
+    if t_start is None:
+        t_start = time.perf_counter()
+
     new_pairs = [c for c in pairs if _try_claim(c)]
     if not new_pairs:
-        log_warn("SIGNAL", f"[{source}] все монеты уже в работе: {pairs}")
+        log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
         return
 
     margin = calculate_margin_for_delist()
 
-    # FIX-PERF: submit ДО логирования — открытие ордера в hot-path,
-    # print/log идут параллельно с уже запущенным market_open_short.
-    for coin in new_pairs:
-        _signal_executor.submit(worker, coin, margin, t_start, source)
+    # FIX-PERF: для single-coin (99%) — inline worker, экономим executor
+    # hop (~1-3мс под GIL contention). Multi-coin → executor для параллелизма.
+    # Trade-off: caller блокируется на ~5-10мс на market_open_short.
+    # Подробности — см. parser_listing.process_signal.
+    if len(new_pairs) == 1:
+        worker(new_pairs[0], margin, t_start, source)
+    else:
+        for coin in new_pairs:
+            _signal_executor.submit(worker, coin, margin, t_start, source)
 
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("DELIST", f"[{source}] Новый делистинг!")
@@ -620,11 +940,69 @@ def _get_interval(session_idx: int) -> float:
         return _poller_intervals.get(session_idx, POLL_INTERVAL_BASE)
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """
+    True если ошибка похожа на «прокси/сеть мертва» (Connection refused,
+    timeout на handshake, ProxyError). Используется для перехода в
+    DEAD-режим с длинным интервалом — иначе мёртвый прокси спамит
+    1 ошибкой в секунду.
+
+    FIX: добавлены curl_cffi-паттерны — раньше ловили только requests'ы
+    стиль ('Connection refused', 'Max retries exceeded'), а curl_cffi
+    шлёт другие сообщения ('Failed to perform, curl: (7) ...',
+    'Resolving timed out after ...'). Без этого DEAD-режим не
+    срабатывал и логи захлёбывались 1 ошибкой/сек.
+    """
+    s = repr(exc)
+    return (
+        isinstance(exc, (ConnectionError, TimeoutError))
+        # requests/urllib3 стиль
+        or "ProxyError" in s
+        or "Connection refused" in s
+        or "Failed to establish a new connection" in s
+        or "Max retries exceeded" in s
+        or "timed out" in s
+        or "Connection reset" in s
+        # curl_cffi стиль (libcurl error messages)
+        or "Failed to perform" in s
+        or "Failed to connect to" in s
+        or "Could not connect to server" in s
+        or "Resolving timed out" in s
+        or "Could not resolve host" in s
+        or "curl: (7)" in s   # CURLE_COULDNT_CONNECT
+        or "curl: (28)" in s  # CURLE_OPERATION_TIMEDOUT
+        or "curl: (6)" in s   # CURLE_COULDNT_RESOLVE_HOST
+        or "curl: (35)" in s  # CURLE_SSL_CONNECT_ERROR
+        or "curl: (56)" in s  # CURLE_RECV_ERROR
+    )
+
+
+def _is_http_block(exc: BaseException) -> bool:
+    """
+    True если ошибка — устойчивый HTTP-блок (400/403). Это не транзиентка
+    и не сетевая дыра, а WAF/IP-блок на стороне Binance: дальнейшие
+    запросы 100% дадут то же самое. Лечится только сменой egress IP
+    (другой прокси / резидентные прокси / VPN), кодом — никак.
+    Используется тем же DEAD-режимом, чтобы не спамить лог 400-ми.
+
+    Распознаём по тексту, потому что:
+      • requests шлёт HTTPError с '400 Client Error' / '403 Forbidden'
+      • curl_cffi (через .raise_for_status()) шлёт 'HTTP Error 400:'
+    """
+    s = repr(exc)
+    return (
+        "HTTP Error 400" in s
+        or "HTTP Error 403" in s
+        or "400 Client Error" in s
+        or "403 Client Error" in s
+    )
+
+
 def poller(session_idx: int) -> None:
     label   = f"proxy[{session_idx}]" if session_idx > 0 else "direct"
     session = _sessions[session_idx]
 
-    log_ok("POLLER", f"[{label}] запущен (interval={POLL_INTERVAL_BASE}с base)")
+    log_ok("POLLER", f"[{label}] запущен (interval={POLL_INTERVAL_BASE}с base, http={_HTTP_BACKEND})")
 
     first_run = True
     # FIX-4: счётчик циклов с повышенным интервалом — раз в N циклов
@@ -633,15 +1011,48 @@ def poller(session_idx: int) -> None:
     elevated_cycles = 0
     _ELEVATED_WARN_EVERY = 60
 
+    # FIX: трекинг подряд connection-error'ов → переход в DEAD-режим
+    # (60с интервал, лог раз в N тиков). Любой успех — сброс.
+    conn_err_streak = 0
+    # Если startup-probe пометил эту сессию мёртвой — стартуем сразу в DEAD,
+    # чтобы не выпускать burst из 5 ошибок подряд в логи в первые 15с.
+    dead_mode       = session_idx in _poller_initial_dead
+    dead_log_skip   = 0
+    if dead_mode:
+        log_warn(
+            "POLLER",
+            f"[{label}] стартую сразу в DEAD-режиме (startup-probe не прошёл), "
+            f"интервал {POLL_DEAD_INTERVAL:.0f}с"
+        )
+
+    # FIX: heartbeat для видимости — после первого запуска поллер логирует
+    # только при появлении новых статей (line с `if new_count > 0`). Это
+    # правильно (не спамить каждую секунду), но создаёт иллюзию что система
+    # «висит». Раз в POLL_HEARTBEAT_EVERY успешных циклов печатаем «alive» —
+    # тогда пользователь видит что Binance отдаёт 200 и парсер крутится.
+    success_count = 0
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         while True:
             try:
                 # FIX-batch-8: cache-busting URL — на каждый запрос новый cache key.
-                url = _build_binance_url()
+                # FIX-INCIDENT: на первом запросе ФОРСИМ pageSize=max(BINANCE_PAGE_SIZES).
+                # Иначе если random выдаст pageSize=5, в seen_ids уйдёт всего 5 ID,
+                # а следующий запрос с pageSize=20 принесёт 15 «новых» (на самом деле
+                # старых) статей → массовый process_article → шорты пачкой. См. инцидент
+                # 2026-05-25: 5 → 20 пейдж-сайз скачок открыл позиции по 30+ тикерам.
+                url = _build_binance_url(
+                    force_page_size=max(BINANCE_PAGE_SIZES) if first_run else None
+                )
                 resp = session.get(url, timeout=4)
                 if resp.status_code == 429:
                     log_warn("POLLER", f"[{label}] 429 — пауза {POLL_BACKOFF_429}с + замедление")
                     _bump_interval(session_idx)
+                    # FIX: обновляем watchdog timestamp — поток жив и делает
+                    # прогресс. Иначе после нескольких 429 watchdog ложно
+                    # считал поток zombie.
+                    with _poller_ts_lock:
+                        _poller_last_ts[session_idx] = time.monotonic()
                     time.sleep(POLL_BACKOFF_429)
                     continue
                 resp.raise_for_status()
@@ -671,6 +1082,25 @@ def poller(session_idx: int) -> None:
                 with _poller_ts_lock:
                     _poller_last_ts[session_idx] = time.monotonic()
                 _reset_interval_if_recovered(session_idx)
+
+                # FIX: успех — выходим из DEAD-режима, обнуляем streak.
+                if dead_mode or conn_err_streak > 0:
+                    if dead_mode:
+                        log_ok("POLLER", f"[{label}] восстановилось ✓ выходим из DEAD-режима")
+                    dead_mode = False
+                    conn_err_streak = 0
+                    dead_log_skip = 0
+
+                # Heartbeat: видимое подтверждение что поллер живой и Binance
+                # отдаёт 200. Печатаем РЕДКО (раз в POLL_HEARTBEAT_EVERY циклов),
+                # чтобы не спамить, но достаточно часто чтобы быть полезным.
+                success_count += 1
+                if not first_run and success_count % POLL_HEARTBEAT_EVERY == 0:
+                    log_ok(
+                        "POLLER",
+                        f"[{label}] alive ✓ {success_count} успешных pollов, "
+                        f"последний ответ — {len(articles) if articles else 0} статей"
+                    )
 
                 if articles:
                     if first_run:
@@ -705,8 +1135,48 @@ def poller(session_idx: int) -> None:
                     log_warn("POLLER", f"[{label}] статей нет или пустой ответ")
 
             except Exception as e:
-                log_err("POLLER", f"[{label}] ошибка: {e}")
-                _bump_interval(session_idx)
+                # FIX: классифицируем ошибку.
+                #   • connection error (прокси/DNS/handshake умер) → DEAD
+                #   • HTTP 400/403 (IP/ASN-блок Binance WAF) → тоже DEAD,
+                #     потому что кодом не лечится: нужны другие egress IP
+                #     (резидентные прокси) или другой источник. Лог раз в
+                #     N тиков, иначе захлёбываемся 1 ошибкой/сек × 4 поллера.
+                #   • прочее (HTTP 5xx, schema-mismatch и т.п.) → обычный
+                #     bump (cap 5с) — это транзиентка, должно само пройти.
+                is_conn  = _is_connection_error(e)
+                is_block = _is_http_block(e)
+                if is_conn or is_block:
+                    conn_err_streak += 1
+                else:
+                    conn_err_streak = 0
+
+                if dead_mode:
+                    # В DEAD-режиме логируем только каждый N-й тик.
+                    if dead_log_skip == 0:
+                        log_warn("POLLER", f"[{label}] DEAD ({conn_err_streak} подряд): {e}")
+                    dead_log_skip = (dead_log_skip + 1) % POLL_DEAD_LOG_EVERY
+                else:
+                    log_err("POLLER", f"[{label}] ошибка: {e}")
+                    if (is_conn or is_block) and conn_err_streak >= POLL_DEAD_THRESHOLD:
+                        dead_mode = True
+                        dead_log_skip = 0
+                        reason = "IP/ASN-блок (HTTP 400/403)" if is_block else "сеть/прокси мертва"
+                        log_warn("POLLER", f"[{label}] → DEAD-режим: {reason}, интервал {POLL_DEAD_INTERVAL:.0f}с (лог раз в {POLL_DEAD_LOG_EVERY} тика)")
+                    else:
+                        _bump_interval(session_idx)
+
+                # FIX: обновляем watchdog timestamp даже на ошибке — поток
+                # жив и делает прогресс, просто API/прокси отвечает плохо.
+                # Без этого watchdog ложно считал поток «zombie» и слал TG
+                # алерты каждые 90с (на постоянно отдающем 400 endpoint'е).
+                with _poller_ts_lock:
+                    _poller_last_ts[session_idx] = time.monotonic()
+
+            if dead_mode:
+                # FIX: длинный интервал → меньше шума в логах + меньше
+                # бессмысленных connect()'ов на мёртвый прокси.
+                time.sleep(POLL_DEAD_INTERVAL)
+                continue
 
             cur_interval = _get_interval(session_idx)
             # FIX-4: видимость деградации — если интервал давно не сбрасывался,
@@ -717,7 +1187,11 @@ def poller(session_idx: int) -> None:
                     log_warn("POLLER", f"[{label}] интервал {cur_interval:.1f}с уже {elevated_cycles} циклов — нестабильное соединение?")
             else:
                 elevated_cycles = 0
-            time.sleep(cur_interval)
+            # ±jitter чтобы поллеры не били Binance синхронно (анти-стадо).
+            # Без jitter'а 3 stagger'нутых поллера сходятся в фазе через
+            # несколько циклов и создают пики req/с на стороне Binance.
+            jitter = cur_interval * POLL_INTERVAL_JITTER * (2 * random.random() - 1)
+            time.sleep(cur_interval + jitter)
 
 
 # ── Watchdog ──────────────────────────────────────────────────────
@@ -900,12 +1374,18 @@ if __name__ == "__main__":
     except ImportError:
         print("[BOOT] uvloop не установлен, использую стандартный asyncio")
 
-    # FIX-PERF: дефолтный switchinterval = 5мс — это до 5мс jitter на
-    # каждом cross-thread context switch'е (handler → executor → bybit-ws).
-    # 1мс — компромисс между latency и CPU-нагрузкой для I/O-bound кода.
-    import sys
-    sys.setswitchinterval(0.001)
-    print("[BOOT] sys.setswitchinterval(0.001) — снижен GIL-jitter")
+    # NOTE: switchinterval оставлен дефолтный (5мс). См. parser_listing.py
+    # для деталей: 1мс эмпирически давал регрессию p50 на trade-открытии
+    # из-за избыточного GIL pingpong'а между handler/WS-loop/worker thread'ами.
+
+    # FIX-PERF: только gc.freeze() — module-level объекты выезжают в
+    # permanent gen и не сканируются. Дефолтные thresholds=(700, 10, 10)
+    # оставляем: каждый gen0 sweep остаётся в десятках микросекунд.
+    # Подъём порога до 50k превращал паузы в редкие, но крупные (3-15мс)
+    # stop-the-world окна — p99 регрессия для hot-path.
+    import gc
+    gc.freeze()
+    print(f"[BOOT] GC frozen: {gc.get_freeze_count()} objects (thresholds={gc.get_threshold()})")
 
     # ── Прогрев бирж ─────────────────────────────────────────────
     threading.Thread(target=price_updater,      daemon=True).start()
@@ -917,29 +1397,84 @@ if __name__ == "__main__":
     preload_lot_steps()
     gate_preload_lot_steps()
     start_bybit_heartbeat()
-    # FIX-PERF: прогреваем httpx HTTP/2 на boot'е — иначе первый TP/SL поток
-    # платит ~80-250мс на import httpx + Client + TLS+ALPN handshake.
-    warmup_bybit_http2()
 
     # FIX-batch-5: инициализация Bybit V5 WS Trade (persistent connection).
     if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
+        # FIX-PERF: sync WS как основной hot-path; async как резерв.
+        # См. parser_listing.py — та же логика.
+        sync_ready = False
+        if BYBIT_SYNC_WS_ENABLED:
+            try:
+                from api import bybit_sync_ws_trade as _sync_mod
+                from api.bybit_ws_trade import use_sync_ws
+                sync_inst = _sync_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                if sync_inst.is_ready(wait_sec=3.0):
+                    sync_warm = sync_inst.warmup()
+                    use_sync_ws(sync_inst)
+                    _sync_mod.start_periodic_warmup()
+                    sync_ready = True
+                    suffix = "+ прогрет" if sync_warm else "(warmup не прошёл)"
+                    log_ok("PARSER", f"Bybit SYNC WS Trade готов {suffix} ✓ (no cross-thread)")
+                else:
+                    log_warn("PARSER", "Bybit SYNC WS не подключился за 3с — fallback на async")
+            except Exception as e:
+                log_warn("PARSER", f"Bybit SYNC WS init упал: {e!r} — fallback на async")
+
         try:
-            from api.bybit_ws_trade import init as bybit_ws_init
+            from api.bybit_ws_trade import init as bybit_ws_init, start_periodic_warmup
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
             if inst.is_ready(wait_sec=3.0):
-                log_ok("PARSER", "Bybit WS Trade готов ✓ (−30...−80мс на ордер)")
+                if not sync_ready:
+                    if inst.warmup():
+                        log_ok("PARSER", "Bybit ASYNC WS Trade готов + прогрет ✓")
+                    else:
+                        log_ok("PARSER", "Bybit ASYNC WS Trade готов ✓ (warmup не прошёл)")
+                    start_periodic_warmup()
+                else:
+                    log_ok("PARSER", "Bybit ASYNC WS готов (резерв на случай sync-disconnect)")
             else:
-                log_warn("PARSER", "Bybit WS Trade не успел подключиться за 3с — fallback на REST до коннекта")
+                log_warn("PARSER", "Bybit ASYNC WS не подключился за 3с — fallback на REST до коннекта")
         except Exception as e:
-            log_err("PARSER", f"Bybit WS Trade init упал: {e} — будет REST")
+            log_err("PARSER", f"Bybit ASYNC WS init упал: {e!r} — будет REST")
     else:
         log_info("PARSER", "Bybit WS Trade отключён (BYBIT_WS_TRADE_ENABLED=0 или нет ключей) — используем REST")
 
     log_ok("PARSER", "Ждём 5с пока price_cache наполнится...")
     time.sleep(5)
 
+    # Загружаем L2-дедуп с диска ДО запуска поллеров — иначе первый тик
+    # после рестарта может повторно отстрелить уже отшорченную монету.
+    _load_fired_state()
+
+    # FIX-PERF: pre-warm + chain warmup ДО запуска поллеров. Иначе если
+    # poller сразу детектит свежую статью на старте — первый делистинг
+    # попадает на cold-path (видели 27мс на listing'е аналогично).
+    # См. parser_listing.py для деталей PEP-659 motivation.
+    _warm = [_signal_executor.submit(lambda: None) for _ in range(40)]
+    _warm += [_tp_sl_executor.submit(lambda: None) for _ in range(40)]
+    for f in _warm:
+        f.result()
+    log_ok("PARSER", "_signal_executor + _tp_sl_executor pre-warmed (40+40)")
+
+    try:
+        from api.delist_api import warmup_chain as _del_warmup_chain
+        sample_signal = "Binance Will Delist BTC"
+        for _ in range(30):
+            find_pairs(sample_signal)
+        ok = _del_warmup_chain(n=30)
+        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_short path×{ok}/30 ✓")
+    except Exception as e:  # noqa: BLE001
+        log_warn("PARSER", f"Chain warmup упал: {e!r} — первый делистинг будет медленнее")
+
     tg_log(f"🚀 <b>DELIST парсер запущен</b>\nПоллеры: {len(_sessions)}\nБиржи: Bybit + Gate.io (fallback)")
-    log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами")
+    log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → base={POLL_INTERVAL_BASE:.1f}с, jitter=±{POLL_INTERVAL_JITTER*100:.0f}%, ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами глобально")
+
+    # Startup proxy health-probe — отсеиваем заведомо мёртвые прокси
+    # (Connection refused / DNS-фейл / 4xx-блок), чтобы не молотить TCP-connect
+    # 1× в секунду по dead endpoint'у и не наполнять лог 5-ю одинаковыми
+    # ошибками за первые 15с. Помеченные DEAD поллеры стартуют в DEAD-режиме
+    # (60с интервал) и сами восстанавливаются на первом 200.
+    _probe_proxy_health()
 
     # FIX: поллеры — daemon=True. Если main thread (TG listener) умирает,
     # Docker должен иметь возможность перезапустить контейнер.
@@ -956,15 +1491,11 @@ if __name__ == "__main__":
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
 
-    # FIX-PERF: глобальный sweeper для _fired_coins вместо thread-per-claim.
+    # FIX-PERF: глобальный sweeper для L1 _fired_coins вместо thread-per-claim.
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
-
-    # FIX-PERF: pre-warm executor — иначе первый submit платит ~3-5мс
-    # на создание worker-thread'а.
-    _warm = [_signal_executor.submit(lambda: None) for _ in range(5)]
-    for f in _warm:
-        f.result()
-    log_ok("PARSER", "_signal_executor pre-warmed")
+    # FIX-PERF: единый фоновый L2-writer (dirty-flag + 1с batching) вместо
+    # thread.start на каждый _mark_opened в hot-path.
+    threading.Thread(target=_fired_persist_loop, daemon=True, name="fired-persist").start()
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:
