@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -206,7 +207,17 @@ _per_exchange_fired: dict[str, set[str]] = {          # DIRECT POLL — (coin, e
 
 # Источники, по которым coin помечается ГЛОБАЛЬНО (anywhere fired).
 # Все TG-каналы (включая extra) — это анонсы. TOA/CoinListing — тоже анонсы.
-_ANNOUNCEMENT_SOURCE_PREFIXES = ("TG:", "TOA-", "COINLISTING-")
+_ANNOUNCEMENT_SOURCE_PREFIXES = (
+    "TG:",
+    "TOA-",
+    "COINLISTING-",
+    # FIX: новые announcement-поллеры Upbit/Bithumb. Это тоже анонсы
+    # (биржа сначала публикует, потом включает рынок), поэтому глобальный
+    # L2 — если уже стреляли по этому source-каналу, дубли через market-
+    # poller или TG-канал должны skip'аться.
+    "UPBIT-NOTICE",
+    "BITHUMB-NOTICE",
+)
 
 # Источники прямого детектора листингов (без анонса).
 _DIRECT_POLL_SOURCES = {"UPBIT", "BITHUMB", "BINANCE"}
@@ -857,6 +868,274 @@ def run_bithumb_poller() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
+# ИСТОЧНИК 3a: Bithumb Announcements — polling notice-feed API.
+# Ловит листинг ИЗ АНОНСА (биржа сначала анонсирует, потом включает
+# торговлю — успеваем войти раньше, чем market poller заметит новый
+# тикер в /assetsstatus). Дополняет run_bithumb_poller, не заменяет.
+# ══════════════════════════════════════════════════════════════════
+BITHUMB_NOTICES_URL = "https://api.bithumb.com/v1/notices"
+
+# Категории-стопы (поле "categories" в JSON). Bithumb сам помечает анонс.
+_BITHUMB_NOTICE_NEG_CATEGORIES = {
+    "거래지원종료",  # делистинг
+    "입출금",        # depo/withdraw (не торговля)
+    "안내",          # общая инфа
+    "점검",          # тех. работы
+    "이벤트",        # event/promo
+}
+
+# Та же логика, что в coinlisting_ws._BITHUMB_NEG_KEYWORDS — на случай
+# если категория пустая/незнакомая, защищаемся по тексту title.
+_BITHUMB_NOTICE_NEG_KEYWORDS = (
+    "종료", "중단", "유의", "상장폐지", "해제",
+    "연기", "일시", "점검", "재개",
+)
+
+# Тикер в title: 코인이름(TICKER) ... — тот же паттерн, что в Upbit.
+_BITHUMB_NOTICE_TICKER_RE = re.compile(r"\(([A-Z][A-Z0-9]{1,9})\)")
+
+# В каталоге id'ы из pc_url: https://feed.bithumb.com/notice/1653467
+_BITHUMB_NOTICE_ID_RE = re.compile(r"/notice/(\d+)")
+
+# 200мс — медиана детекции ~100мс после публикации. Bithumb-feed
+# не имеет публичного rate-limit на этот endpoint (открытый, без auth),
+# но держим интервал щадящим.
+BITHUMB_NOTICE_POLL_INTERVAL = 0.2
+
+_BITHUMB_NOTICE_BANNED = {
+    "KRW", "BTC", "ETH", "USD", "USDT", "USDC", "BUSD", "DAI",
+    "NFT", "KST", "UTC", "API", "VIP",
+    "MARKET", "MARKETS", "LIST",
+    "UPBIT", "BITHUMB", "BINANCE", "COINBASE",
+}
+
+
+def _extract_bithumb_notice_tickers(title: str, categories: list[str]) -> list[str]:
+    """
+    Возвращает список тикеров из title, если notice — листинг.
+    Возвращает [] для делиста, service-нотисов, warning'ов.
+    """
+    for cat in categories:
+        if cat in _BITHUMB_NOTICE_NEG_CATEGORIES:
+            return []
+    for kw in _BITHUMB_NOTICE_NEG_KEYWORDS:
+        if kw in title:
+            return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for tok in _BITHUMB_NOTICE_TICKER_RE.findall(title):
+        token = tok.upper()
+        if token in _BITHUMB_NOTICE_BANNED or token in seen:
+            continue
+        seen.add(token)
+        found.append(token)
+    return found
+
+
+def run_bithumb_announcement_poller() -> None:
+    session = requests.Session()
+    session.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    })
+
+    log_ok("BITHUMB-NOTICE", f"Старт (poll {BITHUMB_NOTICE_POLL_INTERVAL*1000:.0f}мс)")
+
+    # Инициализация: загружаем текущий список, помечаем все id как уже
+    # виденные (иначе на старте откроем кучу старых листингов).
+    seen_ids: set[str] = set()
+    try:
+        resp = session.get(BITHUMB_NOTICES_URL, timeout=4)
+        resp.raise_for_status()
+        for item in _json_loads(resp.content):
+            url = (item or {}).get("pc_url", "")
+            m = _BITHUMB_NOTICE_ID_RE.search(url)
+            if m:
+                seen_ids.add(m.group(1))
+        log_ok("BITHUMB-NOTICE", f"Инициализирован, известно {len(seen_ids)} нотисов")
+    except Exception as e:
+        log_err("BITHUMB-NOTICE", f"Ошибка инициализации: {e}")
+
+    while True:
+        try:
+            time.sleep(BITHUMB_NOTICE_POLL_INTERVAL)
+            t_send = time.perf_counter()
+            resp = session.get(BITHUMB_NOTICES_URL, timeout=2)
+            resp.raise_for_status()
+            t_recv = time.perf_counter()
+
+            items = _json_loads(resp.content)
+            if not isinstance(items, list):
+                continue
+
+            # Новые id (от первого = свежайшего к последнему).
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("pc_url", "") or ""
+                m = _BITHUMB_NOTICE_ID_RE.search(url)
+                if not m:
+                    continue
+                notice_id = m.group(1)
+                if notice_id in seen_ids:
+                    continue
+                seen_ids.add(notice_id)
+
+                title = item.get("title") or ""
+                categories = item.get("categories") or []
+                if not isinstance(categories, list):
+                    categories = []
+
+                tickers = _extract_bithumb_notice_tickers(title, categories)
+                if not tickers:
+                    log_info(
+                        "BITHUMB-NOTICE",
+                        f"skip [{','.join(categories)}] {title[:80]}",
+                    )
+                    continue
+
+                fetch_ms = (t_recv - t_send) * 1000
+                log_ok(
+                    "BITHUMB-NOTICE",
+                    f"LISTING {tickers} ({fetch_ms:.0f}мс fetch) | {title[:80]}",
+                )
+                process_signal(tickers, "BITHUMB-NOTICE", t_start=t_send)
+
+        except Exception as e:
+            log_err("BITHUMB-NOTICE", f"poll error: {e}")
+            time.sleep(POLL_ERROR_BACKOFF)
+
+
+# ══════════════════════════════════════════════════════════════════
+# ИСТОЧНИК 3b: Upbit Announcements — polling по next_id.
+# Upbit list-endpoint защищён, но api-manager.upbit.com/api/v1/announcements/{id}
+# для отдельной статьи открыт и отдаёт JSON с title типа "...(IO) KRW 마켓...".
+# Стратегия: знаем последний известный id; раз в 200мс пробуем next_id,
+# next_id+1, next_id+2 — если ответ success=true, парсим title и инкрементим.
+# Это даёт ~100мс медианной детекции против ~1-2с у CoinListing-MASKED-path.
+# ══════════════════════════════════════════════════════════════════
+UPBIT_ANNOUNCEMENT_URL = "https://api-manager.upbit.com/api/v1/announcements/{id}"
+
+# Стартовый id: захардкоден на дату коммита (2026-05-29, последний
+# известный id = 6255 — это листинг IO). На проде поллер быстро
+# доберётся до текущего за несколько итераций. Если id уже занят
+# (success=true) — инкрементим без задержки; если 404 — ждём интервал.
+UPBIT_ANNOUNCEMENT_START_ID = 6256
+
+# 200мс на цикл проверки. Если за этот тик найдено несколько новых id —
+# обрабатываем все без задержки (in-burst), потом снова sleep.
+UPBIT_ANNOUNCEMENT_POLL_INTERVAL = 0.2
+
+# Сколько id'ов вперёд пробовать за один тик (защита от прыжков id'ов
+# через служебные категории, которые мы пропускаем).
+UPBIT_ANNOUNCEMENT_LOOKAHEAD = 3
+
+# Категории, которые ВЕДУТ к торговле. У Upbit поле "category" в JSON:
+# наблюдали "거래" для трейд-нотисов (включая листинги, делисты, изменения).
+_UPBIT_NOTICE_TRADE_CATEGORIES = {"거래"}
+
+# Те же корейские стопы, что и для Bithumb.
+_UPBIT_NOTICE_NEG_KEYWORDS = _BITHUMB_NOTICE_NEG_KEYWORDS
+
+_UPBIT_NOTICE_TICKER_RE = _BITHUMB_NOTICE_TICKER_RE
+_UPBIT_NOTICE_BANNED = _BITHUMB_NOTICE_BANNED
+
+
+def _try_fetch_upbit_announcement(
+    session: requests.Session,
+    notice_id: int,
+) -> tuple[str | None, str | None]:
+    """
+    Возвращает (title, category) если id существует и листинг,
+    или (None, None) если 404 / делист / служебное.
+    """
+    try:
+        url = UPBIT_ANNOUNCEMENT_URL.format(id=notice_id)
+        resp = session.get(url, timeout=2)
+        if resp.status_code == 404:
+            return None, None
+        resp.raise_for_status()
+        data = _json_loads(resp.content)
+    except Exception:
+        return None, None
+
+    if not isinstance(data, dict) or not data.get("success"):
+        return None, None
+    payload = data.get("data") or {}
+    title = payload.get("title") or ""
+    category = payload.get("category") or ""
+    return title, category
+
+
+def run_upbit_announcement_poller() -> None:
+    session = requests.Session()
+    session.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    })
+
+    next_id = UPBIT_ANNOUNCEMENT_START_ID
+    log_ok("UPBIT-NOTICE", f"Старт с id={next_id} (poll {UPBIT_ANNOUNCEMENT_POLL_INTERVAL*1000:.0f}мс)")
+
+    while True:
+        try:
+            advanced = False
+            for offset in range(UPBIT_ANNOUNCEMENT_LOOKAHEAD):
+                probe_id = next_id + offset
+                t_send = time.perf_counter()
+                title, category = _try_fetch_upbit_announcement(session, probe_id)
+                t_recv = time.perf_counter()
+
+                if title is None:
+                    # 404 — id ещё не выпущен. Без lookahead'а — стоп.
+                    if offset == 0:
+                        break
+                    continue
+
+                # id существует. Двигаемся вперёд независимо от того,
+                # листинг это или нет.
+                next_id = probe_id + 1
+                advanced = True
+
+                # Фильтры: категория должна быть "거래", и title без
+                # негативных корейских ключей.
+                if category not in _UPBIT_NOTICE_TRADE_CATEGORIES:
+                    log_info("UPBIT-NOTICE", f"skip id={probe_id} cat={category} | {title[:60]}")
+                    continue
+                if any(kw in title for kw in _UPBIT_NOTICE_NEG_KEYWORDS):
+                    log_info("UPBIT-NOTICE", f"skip id={probe_id} negative | {title[:60]}")
+                    continue
+
+                tickers: list[str] = []
+                seen: set[str] = set()
+                for tok in _UPBIT_NOTICE_TICKER_RE.findall(title):
+                    t = tok.upper()
+                    if t in _UPBIT_NOTICE_BANNED or t in seen:
+                        continue
+                    seen.add(t)
+                    tickers.append(t)
+
+                if not tickers:
+                    log_warn("UPBIT-NOTICE", f"id={probe_id} нет тикеров в title | {title[:80]}")
+                    continue
+
+                fetch_ms = (t_recv - t_send) * 1000
+                log_ok(
+                    "UPBIT-NOTICE",
+                    f"LISTING id={probe_id} {tickers} ({fetch_ms:.0f}мс) | {title[:80]}",
+                )
+                process_signal(tickers, "UPBIT-NOTICE", t_start=t_send)
+
+            if not advanced:
+                # Не нашли новых id — обычная пауза.
+                time.sleep(UPBIT_ANNOUNCEMENT_POLL_INTERVAL)
+
+        except Exception as e:
+            log_err("UPBIT-NOTICE", f"poll error: {e}")
+            time.sleep(POLL_ERROR_BACKOFF)
+
+
+# ══════════════════════════════════════════════════════════════════
 # ИСТОЧНИК 4: Binance Futures — polling новых linear-пар
 # Ловит листинг БЕЗ анонса (например Binance листит сразу без notice).
 # ══════════════════════════════════════════════════════════════════
@@ -1190,8 +1469,26 @@ if __name__ == "__main__":
     _bithumb_thread.start()
     _binance_thread.start()
     threading.Thread(target=run_coinlisting, daemon=True, name="coinlisting-ws").start()
+
+    # FIX: announcement-поллеры — собственный быстрый аналог CoinListing
+    # для двух корейских бирж. Дёргают anouncement-каталоги напрямую:
+    #   Bithumb — api.bithumb.com/v1/notices (готовый list)
+    #   Upbit   — api-manager.upbit.com/api/v1/announcements/{id} (по next_id)
+    # Цель: −1-2с до сигнала против MASKED-path CoinListing.
+    threading.Thread(
+        target=run_bithumb_announcement_poller,
+        daemon=True,
+        name="bithumb-notice-poller",
+    ).start()
+    threading.Thread(
+        target=run_upbit_announcement_poller,
+        daemon=True,
+        name="upbit-notice-poller",
+    ).start()
+
     log_ok("PARSER", f"Upbit/Bithumb ({POLL_INTERVAL*1000:.0f}мс) + Binance futures "
-                     f"({BINANCE_POLL_INTERVAL*1000:.0f}мс) + CoinListing WS запущены")
+                     f"({BINANCE_POLL_INTERVAL*1000:.0f}мс) + CoinListing WS + "
+                     f"Notice-поллеры ({BITHUMB_NOTICE_POLL_INTERVAL*1000:.0f}мс) запущены")
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
