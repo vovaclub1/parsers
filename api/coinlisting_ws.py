@@ -63,20 +63,13 @@ def log_err(tag, msg):  _log(tag, RED,    msg)
 
 # ── Настройки ─────────────────────────────────────────────────────
 # FIX: API_KEY больше не захардкожен — берём из .env через config.
-# FIX: WARN → ERR при пустом ключе. Раньше уведомление терялось среди
-# обычных логов, и юзер не видел, что CoinListing вообще не работает.
 if not COINLISTING_API_KEY:
-    log_err("CL", "COINLISTING_API_KEY НЕ ЗАДАН в .env — CoinListing WS не подключится. "
-                  "Получите ключ на https://coinlisting.pro и пропишите в .env.")
+    log_warn("CL", "COINLISTING_API_KEY не задан в .env — WS не подключится")
 
 URL_SEOUL = f"wss://seoul.coinlisting.pro/listings?key={COINLISTING_API_KEY}"
 URL_TOKYO = f"wss://tokyo.coinlisting.pro/listings?key={COINLISTING_API_KEY}"
 
-# FIX: prefix-match вместо exact-match. Сервер шлёт source как
-# "BITHUMB", "BITHUMB_KR", "Bithumb", "UPBIT-KRW" и т.п. Старый
-# фильтр `source.upper() in {"UPBIT","BITHUMB"}` молча отбрасывал
-# любые вариации. Теперь сравниваем по startswith — все варианты ловятся.
-TRADE_SOURCE_PREFIXES = ("UPBIT", "BITHUMB")
+TRADE_SOURCES = {"UPBIT", "BITHUMB"}
 
 COOLDOWN_SEC = 120
 
@@ -136,15 +129,9 @@ async def get_http_session() -> aiohttp.ClientSession:
             return _http_session
 
         timeout = aiohttp.ClientTimeout(
-            # FIX: total 2 → 6, sock_read 1 → 4. Bithumb feed
-            # (feed.bithumb.com) на корейских CDN-узлах часто отвечает
-            # медленно — в логе видели Connection timeout ровно через
-            # 1-2с при реальном листинге BILL 2026-05-28 08:16:37.
-            # 6с — компромисс: достаточно чтобы дотянуться сквозь медленный
-            # TLS handshake, и не настолько долго, чтобы блокировать handler.
-            total=6,
-            connect=2,
-            sock_read=4,
+            total=2,
+            connect=1,
+            sock_read=1,
         )
 
         connector = aiohttp.TCPConnector(
@@ -212,12 +199,80 @@ _UPBIT_NOTICE_RE = re.compile(
     r"^https?://(?:www\.)?upbit\.com/service_center/notice\?id=(\d+)\b"
 )
 
+# FIX: Bithumb-нотисы (feed.bithumb.com/notice/{id}) — Next.js SPA.
+# Тикер в чистом виде лежит в <h2 class="NoticeDetailContent_detail__title__...">
+# в формате "코인이름(TICKER) ..." — например:
+#   <h2>오키드(OXT) 거래지원 종료</h2>          ← делист
+#   <h2>아이오넷(IO) KRW 마켓 디지털 자산 추가</h2> ← листинг
+# Просто матчить (TICKER) опасно: парсер найдёт OXT и бот откроет лонг
+# на делисте. Поэтому: парсим title целиком и режем, если в нём есть
+# корейские негативные ключевые слова.
+_BITHUMB_NOTICE_RE = re.compile(rb'<h2\s+class="NoticeDetailContent_detail__title[^"]*"[^>]*>([^<]+)</h2>')
+
+# Корейские стоп-слова в title, при которых сигнал — НЕ листинг:
+#   거래지원 종료 — поддержка торгов прекращена (делист)
+#   거래지원 중단 — приостановка торгов
+#   유의 종목   — warning / monitoring
+#   상장폐지   — делистинг (буквально)
+#   거래 종료   — окончание торгов
+#   입출금     — depo/withdraw (служебное, не торговля)
+#   거래지원 일시 — временная приостановка
+#   해제       — снятие/отмена
+#   연기       — отложен/перенос
+_BITHUMB_NEG_KEYWORDS = (
+    "종료",       # окончание (покрывает 거래지원 종료, 거래 종료)
+    "중단",       # приостановка
+    "유의",       # warning
+    "상장폐지",  # делистинг
+    "해제",       # снятие
+    "연기",       # отложено
+    "일시",       # временная
+    "점검",       # тех. работы
+)
+
+
+def _is_bithumb_notice(url: str) -> bool:
+    return "feed.bithumb.com/notice/" in url
+
 
 def _rewrite_url_to_api(url: str) -> str:
     m = _UPBIT_NOTICE_RE.match(url)
     if m:
         return f"https://api-manager.upbit.com/api/v1/announcements/{m.group(1)}"
     return url
+
+
+def _extract_bithumb_tokens(html: bytes) -> list[str]:
+    """
+    Парсинг Bithumb-нотиса:
+      1. Ищем <h2 class="NoticeDetailContent_detail__title__..."> ... </h2>
+      2. Если в title есть негативный корейский ключ — возвращаем []
+         (фоллбэк find_listing_pairs тоже ничего не найдёт в MASKED title,
+          ордер не откроется — это и нужно).
+      3. Иначе — экстрактим (TICKER) из title.
+    """
+    m = _BITHUMB_NOTICE_RE.search(html)
+    if not m:
+        return []
+    title_bytes = m.group(1)
+    try:
+        title = title_bytes.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return []
+    for kw in _BITHUMB_NEG_KEYWORDS:
+        if kw in title:
+            log_warn("FAST", f"Bithumb negative keyword '{kw}' в title — skip: {title}")
+            return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for tok in TOKEN_REGEX.findall(title_bytes):
+        token = tok.decode().upper()
+        if token in BANNED:
+            continue
+        if token not in seen:
+            seen.add(token)
+            found.append(token)
+    return found
 
 
 async def _parse_tokens_from_article_fast(url: str) -> list[str]:
@@ -229,21 +284,60 @@ async def _parse_tokens_from_article_fast(url: str) -> list[str]:
       ✓ regex on bytes
     """
     started = time.perf_counter()
+    original_url = url
     url = _rewrite_url_to_api(url)
 
     try:
-        session = await get_http_session()
+        # FIX: жёсткий 500мс бюджет на весь fetch+parse. Bithumb-нотисы
+        # (feed.bithumb.com/notice/{id}) — Next.js-SPA, тикер лежит в
+        # <h2 class="NoticeDetailContent_detail__title__...">. Без таймаута
+        # парсер 2.6с молча качал HTML и только потом отдавал управление
+        # фоллбэку find_listing_pairs (который и так находит тикер из
+        # текста WS-сообщения). Видели на BTH-листинге 2026-05-29 06:00:
+        # "no tokens found (2616.5ms)". 500мс достаточно для cold-connect
+        # к Upbit-API (~250-400мс с TLS handshake), и в 5x быстрее текущего
+        # провала на Bithumb-SPA. У warm-сессии Upbit отдаёт за 50-100мс.
+        return await asyncio.wait_for(
+            _parse_tokens_streaming(url, started, _is_bithumb_notice(original_url)),
+            timeout=0.5,
+        )
+    except asyncio.TimeoutError:
+        elapsed = (time.perf_counter() - started) * 1000
+        log_warn("FAST", f"timeout after {elapsed:.1f}ms — fallback to text-parser")
+        return []
+    except Exception as e:
+        log_err("FAST", f"parse error: {e}")
+        return []
 
-        async with session.get(url) as resp:
 
-            found: list[str] = []
-            seen: set[str] = set()
-            buffer = b""
+async def _parse_tokens_streaming(url: str, started: float, is_bithumb: bool) -> list[str]:
+    session = await get_http_session()
 
-            async for chunk in resp.content.iter_chunked(2048):
+    async with session.get(url) as resp:
 
-                buffer += chunk
+        found: list[str] = []
+        seen: set[str] = set()
+        buffer = b""
 
+        async for chunk in resp.content.iter_chunked(2048):
+
+            buffer += chunk
+
+            # Bithumb-нотис: ищем <h2 class="NoticeDetailContent_detail__title__...">
+            # с фильтром негативных корейских ключей (종료, 중단, 유의, etc).
+            if is_bithumb:
+                found = _extract_bithumb_tokens(buffer)
+                if found:
+                    elapsed = (time.perf_counter() - started) * 1000
+                    log_ok("FAST", f"Bithumb title parsed in {elapsed:.1f}ms | {found}")
+                    return found
+                # Если нашли <h2> но токенов нет (негативный ключ) — сразу выходим
+                if _BITHUMB_NOTICE_RE.search(buffer):
+                    elapsed = (time.perf_counter() - started) * 1000
+                    log_warn("FAST", f"Bithumb title found but filtered ({elapsed:.1f}ms)")
+                    return []
+            else:
+                # Upbit-API / другие: стандартный regex \(TICKER\)
                 matches = TOKEN_REGEX.findall(buffer)
                 for m in matches:
                     token = m.decode().upper()
@@ -258,24 +352,20 @@ async def _parse_tokens_from_article_fast(url: str) -> list[str]:
                     log_ok("FAST", f"article parsed in {elapsed:.1f}ms | {found}")
                     return found
 
-                if len(buffer) > 15000:
-                    # FIX: оставляем больший хвост (5000 был мало для длинных
-                    # HTML-блоков с тикерами в конце; токены до 12 байт включая
-                    # скобки — 5000 безопасно для разделения, но мало для
-                    # переменных-длины структур). Главное — сохраняем последние
-                    # 64 байта точно, чтобы `(SOMETOKEN)` на границе не терялся.
-                    buffer = buffer[-5000:]
+            if len(buffer) > 15000:
+                # FIX: оставляем больший хвост (5000 был мало для длинных
+                # HTML-блоков с тикерами в конце; токены до 12 байт включая
+                # скобки — 5000 безопасно для разделения, но мало для
+                # переменных-длины структур). Главное — сохраняем последние
+                # 64 байта точно, чтобы `(SOMETOKEN)` на границе не терялся.
+                buffer = buffer[-5000:]
 
-            elapsed = (time.perf_counter() - started) * 1000
-            if found:
-                log_ok("FAST", f"parsed in {elapsed:.1f}ms | {found}")
-            else:
-                log_warn("FAST", f"no tokens found ({elapsed:.1f}ms)")
-            return found
-
-    except Exception as e:
-        log_err("FAST", f"parse error: {e}")
-        return []
+        elapsed = (time.perf_counter() - started) * 1000
+        if found:
+            log_ok("FAST", f"parsed in {elapsed:.1f}ms | {found}")
+        else:
+            log_warn("FAST", f"no tokens found ({elapsed:.1f}ms)")
+        return found
 
 
 # ── External signal sink ─────────────────────────────────────────
@@ -378,9 +468,7 @@ async def _handle(msg: dict) -> None:
     # Универсально: (msg.get(...) or "") как защита от None.
     source = (msg.get("source") or "").upper()
 
-    # FIX: prefix-match. Поддерживает "BITHUMB", "BITHUMB_KR", "UPBIT-KRW"
-    # и пр. вариации. Раньше "BITHUMB_KR" молча выкидывался.
-    if not any(source.startswith(p) for p in TRADE_SOURCE_PREFIXES):
+    if source not in TRADE_SOURCES:
         return
 
     title = msg.get("title") or ""
