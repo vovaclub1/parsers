@@ -565,12 +565,57 @@ async def _listen(url: str, label: str) -> None:
         delay = min(delay * 2, _WS_BACKOFF_MAX)
 
 
+# ── Connection pre-warming ───────────────────────────────────────
+# FIX: на cold-connect к Upbit-API уходит 250-400мс на TLS handshake
+# (см. эксперимент в _parse_tokens_from_article_fast). Если между
+# листингами проходит >60-90с — keep-alive дропается, и СЛЕДУЮЩИЙ
+# MASKED-сигнал платит за рукопожатие заново. Удерживаем TLS-сессию
+# горячей: раз в 60с дёргаем HEAD к обоим хостам через ту же
+# aiohttp.ClientSession (важно: connection pool общий с боевым
+# парсером, только так warm-up имеет смысл).
+_PREWARM_HOSTS = (
+    "https://api-manager.upbit.com/",
+    "https://feed.bithumb.com/",
+)
+_PREWARM_INTERVAL = 60.0
+
+
+async def _prewarm_loop() -> None:
+    # Маленькая задержка чтобы не конкурировать с WS-handshake на старте.
+    await asyncio.sleep(2.0)
+    while True:
+        try:
+            session = await get_http_session()
+            for host in _PREWARM_HOSTS:
+                try:
+                    # allow_redirects=False: 301/302 в порядке, нам нужен
+                    # только живой TLS-tunnel, тело не интересует.
+                    # timeout 2с с запасом, чтобы случайный медленный CDN
+                    # не съел весь интервал.
+                    async with session.head(
+                        host,
+                        allow_redirects=False,
+                        timeout=aiohttp.ClientTimeout(total=2),
+                    ) as resp:
+                        # Любой ответ (200/301/403/...) уже значит, что
+                        # TLS+TCP установлены и сидят в пуле keep-alive.
+                        resp.release()
+                except Exception:
+                    # Молча игнорим — прогрев best-effort. Логировать
+                    # нет смысла, иначе при нестабильной сети флудим лог.
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(_PREWARM_INTERVAL)
+
+
 # ── Run ──────────────────────────────────────────────────────────
 async def _run() -> None:
 
     await asyncio.gather(
         _listen(URL_SEOUL, "SEOUL"),
         _listen(URL_TOKYO, "TOKYO"),
+        _prewarm_loop(),
     )
 
 
