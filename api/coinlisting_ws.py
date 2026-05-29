@@ -201,6 +201,25 @@ def _set_cooldown(ticker: str) -> None:
 
 
 # ── ULTRA FAST ARTICLE PARSER ────────────────────────────────────
+# FIX: upbit.com/service_center/notice — SPA-страница с 301 на www, тяжёлая
+# (~40KB), а в "плохих" сетевых условиях aiohttp нередко отдаёт пустое тело
+# раньше, чем regex успевает что-то найти (видели "no tokens found (217мс)"
+# на реальном IO-листинге 2026-05-29 09:00). У Upbit есть лёгкий JSON-эндпоинт
+# api-manager.upbit.com/api/v1/announcements/{id}: ~7KB, без редиректа, с
+# полем "title" типа "아이오넷(IO) KRW 마켓...". Та же regex по байтам ловит
+# (IO) сразу в первом чанке. Сокращает гэп до TG-фоллбэка на ~2с.
+_UPBIT_NOTICE_RE = re.compile(
+    r"^https?://(?:www\.)?upbit\.com/service_center/notice\?id=(\d+)\b"
+)
+
+
+def _rewrite_url_to_api(url: str) -> str:
+    m = _UPBIT_NOTICE_RE.match(url)
+    if m:
+        return f"https://api-manager.upbit.com/api/v1/announcements/{m.group(1)}"
+    return url
+
+
 async def _parse_tokens_from_article_fast(url: str) -> list[str]:
     """
     Ultra-fast HTML парсер:
@@ -210,6 +229,7 @@ async def _parse_tokens_from_article_fast(url: str) -> list[str]:
       ✓ regex on bytes
     """
     started = time.perf_counter()
+    url = _rewrite_url_to_api(url)
 
     try:
         session = await get_http_session()
