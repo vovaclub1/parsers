@@ -217,6 +217,7 @@ _ANNOUNCEMENT_SOURCE_PREFIXES = (
     # poller или TG-канал должны skip'аться.
     "UPBIT-NOTICE",
     "BITHUMB-NOTICE",
+    "BINANCE-NOTICE",
 )
 
 # Источники прямого детектора листингов (без анонса).
@@ -873,7 +874,10 @@ def run_bithumb_poller() -> None:
 # торговлю — успеваем войти раньше, чем market poller заметит новый
 # тикер в /assetsstatus). Дополняет run_bithumb_poller, не заменяет.
 # ══════════════════════════════════════════════════════════════════
-BITHUMB_NOTICES_URL = "https://api.bithumb.com/v1/notices"
+# count=20 vs дефолт=5: получаем 4× больше нотисов за один запрос
+# (~4.5KB vs 1.1KB). Защита от пропуска при бурсте, когда биржа
+# публикует несколько анонсов одновременно.
+BITHUMB_NOTICES_URL = "https://api.bithumb.com/v1/notices?count=20"
 
 # Категории-стопы (поле "categories" в JSON). Bithumb сам помечает анонс.
 _BITHUMB_NOTICE_NEG_CATEGORIES = {
@@ -897,10 +901,11 @@ _BITHUMB_NOTICE_TICKER_RE = re.compile(r"\(([A-Z][A-Z0-9]{1,9})\)")
 # В каталоге id'ы из pc_url: https://feed.bithumb.com/notice/1653467
 _BITHUMB_NOTICE_ID_RE = re.compile(r"/notice/(\d+)")
 
-# 200мс — медиана детекции ~100мс после публикации. Bithumb-feed
-# не имеет публичного rate-limit на этот endpoint (открытый, без auth),
-# но держим интервал щадящим.
-BITHUMB_NOTICE_POLL_INTERVAL = 0.2
+# 100мс — медиана детекции ~50мс после публикации. Bithumb-feed
+# не имеет публичного rate-limit на этот endpoint (открытый, без auth) —
+# 10 RPS endpoint точно вытянет. count=20 страхует от пропусков, если
+# биржа за один тик опубликует несколько анонсов.
+BITHUMB_NOTICE_POLL_INTERVAL = 0.1
 
 _BITHUMB_NOTICE_BANNED = {
     "KRW", "BTC", "ETH", "USD", "USDT", "USDC", "BUSD", "DAI",
@@ -1022,9 +1027,10 @@ UPBIT_ANNOUNCEMENT_URL = "https://api-manager.upbit.com/api/v1/announcements/{id
 # (success=true) — инкрементим без задержки; если 404 — ждём интервал.
 UPBIT_ANNOUNCEMENT_START_ID = 6256
 
-# 200мс на цикл проверки. Если за этот тик найдено несколько новых id —
-# обрабатываем все без задержки (in-burst), потом снова sleep.
-UPBIT_ANNOUNCEMENT_POLL_INTERVAL = 0.2
+# 150мс на цикл проверки. При lookahead=3 это 6.6-20 RPS пик —
+# в пределах Upbit public limit 10 req/s (api-manager). В обычном
+# режиме (нет новых id) делаем 1 probe + sleep = ~6.6 RPS.
+UPBIT_ANNOUNCEMENT_POLL_INTERVAL = 0.15
 
 # Сколько id'ов вперёд пробовать за один тик (защита от прыжков id'ов
 # через служебные категории, которые мы пропускаем).
@@ -1209,6 +1215,171 @@ def run_upbit_announcement_poller() -> None:
 
         except Exception as e:
             log_err("UPBIT-NOTICE", f"poll error: {e}")
+            time.sleep(POLL_ERROR_BACKOFF)
+
+
+# ══════════════════════════════════════════════════════════════════
+# ИСТОЧНИК 3c: Binance Announcements — polling catalogId=48.
+# bapi/composite/v1/public/cms/article/list/query?catalogId=48 — это
+# официальный фид "New Cryptocurrency Listing". Содержит и SPOT-листинги
+# ("Will List X"), и Futures-launch ("Will Launch XUSDT Perpetual Contract"),
+# и шум (HODLer Airdrops, Pre-IPO/TradFi, Margin/Earn service-нотисы).
+# Двухступенчатый фильтр (whitelist phrases + blacklist negatives) +
+# извлечение тикера из (TICKER) или из XUSDT/XUSDC.
+# Цель: −1-5с против TG-мирроров Binance (анонс приходит на bapi
+# одновременно или раньше публикации в TG-каналы).
+# ══════════════════════════════════════════════════════════════════
+BINANCE_NOTICE_URL = (
+    "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+    "?type=1&pageNo=1&pageSize=20&catalogId=48"
+)
+
+# Binance bapi выдерживает 1200 req/min на IP. 500мс = 2 RPS — с запасом.
+BINANCE_NOTICE_POLL_INTERVAL = 0.5
+
+# Phrases которые ДОЛЖНЫ быть в title для трейда. Lowercase-сравнение.
+_BINANCE_LISTING_POS = (
+    "will list",
+    "will launch",
+)
+
+# Если есть хоть один такой — skip (override whitelist). Lowercase.
+_BINANCE_LISTING_NEG = (
+    "hodler airdrops",       # promo с airdrop'ами, не настоящий листинг
+    "on earn",               # "Will Add X on Earn" — сервис, не листинг
+    "earn,",                 # вариант разделителя в той же фразе
+    "locked product",
+    "locked products",
+    "flexible product",
+    "pre-ipo",               # фьючерсы на акции до IPO — не крипта
+    "tradfi",                # TradFi-перпы на стоки — не крипта
+    "margin will add",       # margin pair add — не SPOT/Futures листинг
+    "trading bots",          # bot service
+    "convert",               # convert pair add
+    "buy crypto",            # service
+    "vip loan",              # service
+    "multiple usd",          # bulk-add нескольких TradFi за раз
+    "new trading pairs",     # service notification
+    "% apr",
+    "% apy",
+    "launchpool",
+    "subscribe",
+    "promotion",
+    "promotional",
+    "rewards pool",
+    "staking pool",
+    "simple earn",
+    "special offer",
+)
+
+_BINANCE_PAREN_RE = re.compile(r"\(([A-Z][A-Z0-9]{1,9})\)")
+# XUSDT / XUSDC — фьючерсный символ, где X = базовая валюта.
+_BINANCE_FUTURES_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9})(?:USDT|USDC)\b")
+
+_BINANCE_NOTICE_BANNED = _BITHUMB_NOTICE_BANNED
+
+
+def _extract_binance_notice_tickers(title: str) -> list[str]:
+    """
+    Возвращает тикеры из title если это настоящий листинг,
+    или [] для promo/service/pre-IPO.
+    """
+    lower = title.lower()
+    if not any(p in lower for p in _BINANCE_LISTING_POS):
+        return []
+    if any(n in lower for n in _BINANCE_LISTING_NEG):
+        return []
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    # Сначала из явных скобок (для SPOT-листингов).
+    for tok in _BINANCE_PAREN_RE.findall(title):
+        t = tok.upper()
+        if t in _BINANCE_NOTICE_BANNED or t in seen:
+            continue
+        seen.add(t)
+        found.append(t)
+
+    # Из XUSDT/XUSDC если в скобках не нашли (futures-launch).
+    if not found:
+        for tok in _BINANCE_FUTURES_RE.findall(title):
+            t = tok.upper()
+            if t in _BINANCE_NOTICE_BANNED or t in seen:
+                continue
+            seen.add(t)
+            found.append(t)
+
+    return found
+
+
+def run_binance_announcement_poller() -> None:
+    session = requests.Session()
+    session.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    })
+
+    log_ok("BINANCE-NOTICE", f"Старт (poll {BINANCE_NOTICE_POLL_INTERVAL*1000:.0f}мс)")
+
+    # Инициализация: max известный id, чтобы не отстреливать историю.
+    last_max_id = 0
+    try:
+        resp = session.get(BINANCE_NOTICE_URL, timeout=4)
+        resp.raise_for_status()
+        data = _json_loads(resp.content)
+        catalogs = (data.get("data") or {}).get("catalogs") or []
+        articles = catalogs[0].get("articles", []) if catalogs else []
+        if articles:
+            last_max_id = max(int(a.get("id", 0)) for a in articles)
+        log_ok("BINANCE-NOTICE", f"Инициализирован, max id={last_max_id} ({len(articles)} нотисов)")
+    except Exception as e:
+        log_err("BINANCE-NOTICE", f"Ошибка инициализации: {e}")
+
+    while True:
+        try:
+            time.sleep(BINANCE_NOTICE_POLL_INTERVAL)
+            t_send = time.perf_counter()
+            resp = session.get(BINANCE_NOTICE_URL, timeout=2)
+            resp.raise_for_status()
+            t_recv = time.perf_counter()
+
+            data = _json_loads(resp.content)
+            if data.get("code") != "000000":
+                continue
+            catalogs = (data.get("data") or {}).get("catalogs") or []
+            if not catalogs:
+                continue
+            articles = catalogs[0].get("articles", [])
+
+            new_max = last_max_id
+            for art in articles:
+                if not isinstance(art, dict):
+                    continue
+                aid = int(art.get("id", 0))
+                if aid <= last_max_id:
+                    continue
+                if aid > new_max:
+                    new_max = aid
+
+                title = art.get("title") or ""
+                tickers = _extract_binance_notice_tickers(title)
+
+                if not tickers:
+                    log_info("BINANCE-NOTICE", f"skip id={aid} | {title[:80]}")
+                    continue
+
+                fetch_ms = (t_recv - t_send) * 1000
+                log_ok(
+                    "BINANCE-NOTICE",
+                    f"LISTING id={aid} {tickers} ({fetch_ms:.0f}мс) | {title[:80]}",
+                )
+                process_signal(tickers, "BINANCE-NOTICE", t_start=t_send)
+
+            last_max_id = new_max
+
+        except Exception as e:
+            log_err("BINANCE-NOTICE", f"poll error: {e}")
             time.sleep(POLL_ERROR_BACKOFF)
 
 
@@ -1562,10 +1733,17 @@ if __name__ == "__main__":
         daemon=True,
         name="upbit-notice-poller",
     ).start()
+    threading.Thread(
+        target=run_binance_announcement_poller,
+        daemon=True,
+        name="binance-notice-poller",
+    ).start()
 
     log_ok("PARSER", f"Upbit/Bithumb ({POLL_INTERVAL*1000:.0f}мс) + Binance futures "
                      f"({BINANCE_POLL_INTERVAL*1000:.0f}мс) + CoinListing WS + "
-                     f"Notice-поллеры ({BITHUMB_NOTICE_POLL_INTERVAL*1000:.0f}мс) запущены")
+                     f"Notice-поллеры (Bithumb {BITHUMB_NOTICE_POLL_INTERVAL*1000:.0f}мс, "
+                     f"Upbit {UPBIT_ANNOUNCEMENT_POLL_INTERVAL*1000:.0f}мс, "
+                     f"Binance {BINANCE_NOTICE_POLL_INTERVAL*1000:.0f}мс) запущены")
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
