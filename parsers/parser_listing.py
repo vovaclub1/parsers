@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 import threading
 import time
@@ -1229,13 +1230,38 @@ def run_upbit_announcement_poller() -> None:
 # Цель: −1-5с против TG-мирроров Binance (анонс приходит на bapi
 # одновременно или раньше публикации в TG-каналы).
 # ══════════════════════════════════════════════════════════════════
-BINANCE_NOTICE_URL = (
+BINANCE_NOTICE_BASE_URL = (
     "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-    "?type=1&pageNo=1&pageSize=20&catalogId=48"
 )
+BINANCE_NOTICE_CATALOG_ID = 48
 
-# Binance bapi выдерживает 1200 req/min на IP. 500мс = 2 RPS — с запасом.
-BINANCE_NOTICE_POLL_INTERVAL = 0.5
+# FIX: 500мс (2 RPS) стабильно банило IP по 429 в первые ~24с после старта
+# (по логам: init-запрос 200 OK, потом ~48 поллов 500мс → 429 навсегда).
+# /bapi/composite — это WEB-фронт endpoint за анти-бот WAF (не документ.
+# REST API с лимитом 1200 req/min!), особенно жёсткий к datacenter-IP.
+# Тот же урок уже закодирован в parser_delist.py: безопасно ~3с = ~20 req/min.
+# Env BINANCE_NOTICE_POLL_INTERVAL=Xс позволяет тюнить без передеплоя.
+BINANCE_NOTICE_POLL_INTERVAL = float(os.getenv("BINANCE_NOTICE_POLL_INTERVAL", "3.0"))
+# Анти-стадо: ±jitter к каждому sleep, размывает пики req/с на стороне Binance.
+BINANCE_NOTICE_JITTER = 0.10
+# При HTTP 429 — длинная пауза, иначе долбёжка каждые 3с держит бан живым
+# (каждый запрос в окне бана продлевает окно). 30с даёт WAF разбаниться.
+BINANCE_NOTICE_BACKOFF_429 = float(os.getenv("BINANCE_NOTICE_BACKOFF_429", "30.0"))
+# Cache-busting: CloudFront кеширует по query-ключу. Ротация pageSize ∈ набора
+# даёт разные cache key. ВАЖНО: нельзя добавлять «левые» query-параметры
+# (_t/timestamp и т.п.) — WAF режет их в 400 (урок из delist-инцидента).
+# Разрешены только type/catalogId/pageNo/pageSize.
+BINANCE_NOTICE_PAGE_SIZES = (10, 15, 20)
+
+
+def _binance_notice_url() -> str:
+    """Cache-busting URL: ротация pageSize, только whitelisted query-параметры."""
+    page_sz = random.choice(BINANCE_NOTICE_PAGE_SIZES)
+    return (
+        f"{BINANCE_NOTICE_BASE_URL}"
+        f"?type=1&pageNo=1&pageSize={page_sz}&catalogId={BINANCE_NOTICE_CATALOG_ID}"
+    )
+
 
 # Phrases которые ДОЛЖНЫ быть в title для трейда. Lowercase-сравнение.
 _BINANCE_LISTING_POS = (
@@ -1315,17 +1341,26 @@ def _extract_binance_notice_tickers(title: str) -> list[str]:
 
 def run_binance_announcement_poller() -> None:
     session = requests.Session()
+    # Браузероподобные заголовки: голый "Mozilla/5.0" к /bapi/composite
+    # с datacenter-IP WAF режет охотнее. clientType/lang — то, что шлёт веб.
     session.headers.update({
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "clientType": "web",
+        "lang": "en",
+        "Referer": "https://www.binance.com/en/support/announcement/list/48",
     })
 
-    log_ok("BINANCE-NOTICE", f"Старт (poll {BINANCE_NOTICE_POLL_INTERVAL*1000:.0f}мс)")
+    log_ok("BINANCE-NOTICE", f"Старт (poll {BINANCE_NOTICE_POLL_INTERVAL:.1f}с)")
 
     # Инициализация: max известный id, чтобы не отстреливать историю.
     last_max_id = 0
     try:
-        resp = session.get(BINANCE_NOTICE_URL, timeout=4)
+        resp = session.get(_binance_notice_url(), timeout=4)
         resp.raise_for_status()
         data = _json_loads(resp.content)
         catalogs = (data.get("data") or {}).get("catalogs") or []
@@ -1338,9 +1373,19 @@ def run_binance_announcement_poller() -> None:
 
     while True:
         try:
-            time.sleep(BINANCE_NOTICE_POLL_INTERVAL)
+            # ±jitter, чтобы не бить Binance синхронно с другими поллерами.
+            jitter = BINANCE_NOTICE_POLL_INTERVAL * BINANCE_NOTICE_JITTER * (2 * random.random() - 1)
+            time.sleep(max(0.05, BINANCE_NOTICE_POLL_INTERVAL + jitter))
             t_send = time.perf_counter()
-            resp = session.get(BINANCE_NOTICE_URL, timeout=2)
+            resp = session.get(_binance_notice_url(), timeout=2)
+
+            # 429 ловим ДО raise_for_status: долбёжка каждые 3с держит бан
+            # живым, поэтому отступаем надолго — даём WAF разбаниться.
+            if resp.status_code == 429:
+                log_err("BINANCE-NOTICE", f"429 — пауза {BINANCE_NOTICE_BACKOFF_429:.0f}с")
+                time.sleep(BINANCE_NOTICE_BACKOFF_429)
+                continue
+
             resp.raise_for_status()
             t_recv = time.perf_counter()
 
@@ -1743,7 +1788,7 @@ if __name__ == "__main__":
                      f"({BINANCE_POLL_INTERVAL*1000:.0f}мс) + CoinListing WS + "
                      f"Notice-поллеры (Bithumb {BITHUMB_NOTICE_POLL_INTERVAL*1000:.0f}мс, "
                      f"Upbit {UPBIT_ANNOUNCEMENT_POLL_INTERVAL*1000:.0f}мс, "
-                     f"Binance {BINANCE_NOTICE_POLL_INTERVAL*1000:.0f}мс) запущены")
+                     f"Binance {BINANCE_NOTICE_POLL_INTERVAL:.1f}с) запущены")
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
