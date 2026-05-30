@@ -57,6 +57,13 @@ BYBIT_WS_TRADE_ENABLED = os.getenv("BYBIT_WS_TRADE_ENABLED", "1").lower() in ("1
 BYBIT_SYNC_WS_ENABLED = os.getenv("BYBIT_SYNC_WS_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 
 
+# Delist trailing stop strategy (native Bybit trailing)
+# FIX: нативный trailingStop вместо фиксированных TP — ловим «первую быструю свечу».
+DELIST_TRAILING_PCT = float(os.getenv("DELIST_TRAILING_PCT", "0.01"))   # 1.0% дистанция трейла
+DELIST_ACTIVE_PCT   = float(os.getenv("DELIST_ACTIVE_PCT", "0.01"))     # Активация после +1% в плюс
+DELIST_SL_PCT       = float(os.getenv("DELIST_SL_PCT", "0.05"))         # Аварийный SL +5%
+
+
 def parse_channels(csv: str) -> list[str | int]:
     """
     Парсит CSV каналов. Возвращает список — каждый элемент либо int (ID),

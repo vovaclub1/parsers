@@ -806,12 +806,17 @@ def warmup_chain(n: int = 30) -> int:
 
 def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет SL и 3 уровня TP для шорта на Bybit.
+    Выставляет нативный trailing stop 1.0% + аварийный SL 5% для шорта на Bybit.
+
+    Стратегия «первая быстрая свеча»:
+      - trailingStop 1% (тугой) — максимум фиксируем с пика дампа
+      - activePrice = entry × 0.99 — активация после +1% в плюс
+      - аварийный SL = entry × 1.05 — защита если цена сразу пошла против
+      - БЕЗ фиксированных TP — чистый трейлинг на всю позицию
+
+    Паттерн взят из listing_api.py (там trailing 3.5% на лонгах работает).
     """
-    sl  = round(entry_price * 1.05, 8)
-    tp1 = round(entry_price * 0.92, 8)
-    tp2 = round(entry_price * 0.85, 8)
-    tp3 = round(entry_price * 0.55, 8)
+    from config.config import DELIST_TRAILING_PCT, DELIST_ACTIVE_PCT, DELIST_SL_PCT
 
     symbol = f"{ticker_name}USDT"
     try:
@@ -820,54 +825,37 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
         print(f"[TP/SL SKIP] {e}")
         return "skip"
 
-    sl_size  = str(_round_qty(amount,       step))
-    tp1_size = str(_round_qty(amount * 0.2, step))
-    tp2_size = str(_round_qty(amount * 0.3, step))
-    tp3_size = str(_round_qty(amount * 0.5, step))
+    # Параметры стратегии (env-tunable)
+    sl_price = round(entry_price * (1 + DELIST_SL_PCT), 8)           # +5% аварийный стоп (цена ВЫШЕ входа для short)
+    trailing_distance = round(entry_price * DELIST_TRAILING_PCT, 8)  # 1% абсолютная дистанция в USDT
+    active_price = round(entry_price * (1 - DELIST_ACTIVE_PCT), 8)   # Активация после -1% (цена НИЖЕ входа для short)
 
-    def _place_tp(tp_price: str, tp_size: str) -> None:
-        """
-        Выставляет один уровень TP через trading-stop (http/2 — мультиплекс
-        3 параллельных TP-постановок через 1 connection).
-        :param tp_price: str - цена тейк-профита.
-        :param tp_size: str - размер в токенах.
-        """
-        _post_http2("/v5/position/trading-stop", {
-            "category":    "linear",
-            "symbol":      symbol,
-            "takeProfit":  tp_price,
-            "tpTriggerBy": "LastPrice",
-            "tpslMode":    "Partial",
-            "tpSize":      tp_size,
-            "positionIdx": 2,
-        })
+    sl_size = str(_round_qty(amount, step))  # Вся позиция
 
-    # SL ставим отдельно (один на всю позицию).
+    # Один вызов /v5/position/trading-stop с нативным trailing
     _post_http2("/v5/position/trading-stop", {
-        "category":    "linear",
-        "symbol":      symbol,
-        "stopLoss":    str(sl),
-        "slTriggerBy": "LastPrice",
-        "tpslMode":    "Partial",
-        "slSize":      sl_size,
-        "positionIdx": 2,
+        "category":     "linear",
+        "symbol":       symbol,
+        "positionIdx":  2,  # short-hedge
+
+        # Аварийный стоп (если цена пошла вверх против шорта)
+        "stopLoss":     str(sl_price),
+        "slTriggerBy":  "LastPrice",
+        "slSize":       sl_size,
+
+        # Нативный трейлинг (активируется после -1%)
+        "trailingStop": str(trailing_distance),
+        "activePrice":  str(active_price),
+
+        # tpslMode не указываем — trailing на всю позицию (Full mode по умолчанию)
     })
 
-    # TP ставим параллельно
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futures = [
-            ex.submit(_place_tp, str(tp1), tp1_size),
-            ex.submit(_place_tp, str(tp2), tp2_size),
-            ex.submit(_place_tp, str(tp3), tp3_size),
-        ]
-        for f in futures:
-            try:
-                f.result()
-            except Exception as e:
-                print(f"[TP PLACE ERR] {ticker_name}: {e}")
-
-    print(f"[TP/SL SET] {ticker_name} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
-    return "Выставил цели"
+    print(
+        f"[TP/SL SET SHORT] {ticker_name} | entry={entry_price:.2f} | "
+        f"SL={sl_price:.2f}(+{DELIST_SL_PCT*100:.0f}%) | "
+        f"Trailing={DELIST_TRAILING_PCT*100:.1f}% (active@{active_price:.2f})"
+    )
+    return "Выставил trailing stop"
 
 
 def set_tp_sl(ticker_name: str, entry_price: float, amount: float) -> str:
