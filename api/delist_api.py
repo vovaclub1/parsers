@@ -10,7 +10,13 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
-from config.config import BYBIT_API_KEY, BYBIT_SECRET_KEY
+from config.config import (
+    BYBIT_API_KEY,
+    BYBIT_SECRET_KEY,
+    DELIST_TRAILING_PCT,
+    DELIST_ACTIVE_PCT,
+    DELIST_SL_PCT,
+)
 import requests
 
 # FIX-batch-1: orjson для парсинга ответов Bybit (3-5x быстрее).
@@ -570,7 +576,10 @@ def get_price(coin: str) -> Optional[float]:
     :param coin: str - тикер монеты (например "BTC").
     :return: float | None - цена в USDT или None если монеты нет в кэше.
     """
-    return price_cache.get(f"{coin}/USDT:USDT")
+    # FIX: race condition — price_cache.clear() в price_updater может
+    # произойти между этим чтением и возвратом. Берём под lock.
+    with cache_lock:
+        return price_cache.get(f"{coin}/USDT:USDT")
 
 
 def calculate_margin_for_delist() -> float:
@@ -600,8 +609,14 @@ def preload_lot_steps() -> None:
                 symbol = item.get("symbol", "")
                 if symbol.endswith("USDT"):
                     coin = symbol[:-4]
-                    step = float(item["lotSizeFilter"]["qtyStep"])
-                    _lot_step_cache[coin] = step
+                    # FIX: защита от KeyError если структура ответа изменилась
+                    lot_filter = item.get("lotSizeFilter")
+                    if lot_filter and "qtyStep" in lot_filter:
+                        try:
+                            step = float(lot_filter["qtyStep"])
+                            _lot_step_cache[coin] = step
+                        except (ValueError, TypeError):
+                            continue  # Пропускаем некорректные данные
         print(f"[PRELOAD] Загружено {len(_lot_step_cache)} шагов лота")
     except Exception as e:
         print(f"[PRELOAD ERROR] {e}")
@@ -632,9 +647,18 @@ def _get_qty_step(symbol: str) -> float:
         return step
 
     try:
-        data       = _get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
-        lot_filter = data["result"]["list"][0]["lotSizeFilter"]
-        step       = float(lot_filter["qtyStep"])
+        data = _get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
+        # FIX: защита от KeyError если структура ответа изменилась
+        result = data.get("result", {})
+        items = result.get("list", [])
+        if not items:
+            raise QtyStepUnavailable(f"{symbol}: пустой список инструментов в ответе")
+        lot_filter = items[0].get("lotSizeFilter")
+        if not lot_filter or "qtyStep" not in lot_filter:
+            raise QtyStepUnavailable(f"{symbol}: отсутствует lotSizeFilter.qtyStep в ответе")
+        step = float(lot_filter["qtyStep"])
+    except QtyStepUnavailable:
+        raise  # Пробрасываем наше исключение как есть
     except Exception as e:
         raise QtyStepUnavailable(f"{symbol}: не получили шаг лота — {e}") from e
 
@@ -684,7 +708,8 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
     """
     bybit_price = get_price(ticker_name)
 
-    if bybit_price:
+    # FIX: проверка на 0 или отрицательную цену (защита от деления на ноль)
+    if bybit_price and bybit_price > 0:
         symbol  = f"{ticker_name}USDT"
         raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магическое число → константа
 
@@ -816,8 +841,6 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
 
     Паттерн взят из listing_api.py (там trailing 3.5% на лонгах работает).
     """
-    from config.config import DELIST_TRAILING_PCT, DELIST_ACTIVE_PCT, DELIST_SL_PCT
-
     symbol = f"{ticker_name}USDT"
     try:
         step = _get_qty_step(symbol)
@@ -831,6 +854,11 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
     active_price = round(entry_price * (1 - DELIST_ACTIVE_PCT), 8)   # Активация после -1% (цена НИЖЕ входа для short)
 
     sl_size = str(_round_qty(amount, step))  # Вся позиция
+
+    # FIX: если amount < step, _round_qty вернёт 0.0 → Bybit отклонит запрос
+    if sl_size == "0.0" or float(sl_size) <= 0:
+        print(f"[TP/SL SKIP] {ticker_name}: slSize={sl_size} (amount={amount}, step={step}) — слишком мало")
+        return "skip"
 
     # Один вызов /v5/position/trading-stop с нативным trailing
     _post_http2("/v5/position/trading-stop", {

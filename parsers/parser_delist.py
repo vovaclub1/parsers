@@ -710,9 +710,15 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
                 log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
             amount, entry_price = market_open_short(coin, margin)
             if not amount:
-                log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
-                time.sleep(0.1)
-                continue
+                # FIX: проверяем что это не последняя попытка, иначе зависнем
+                # в бесконечном цикле если market_open_short всегда возвращает 0.
+                if attempt < retries:
+                    log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
+                    time.sleep(0.1)
+                    continue
+                else:
+                    log_err("WORKER", f"{coin}: нет цены после {retries} попыток")
+                    break
 
             # FIX-PERF: TP/SL submit ДО метрики (~5-20μs, не сдвинет open_ms).
             # Один print вместо двух — экономия ~4мс на intermediate stdout flush.

@@ -318,39 +318,40 @@ class BybitSyncWsTrade:
           {"sent": True, "reqId": ...} — frame ушёл на провод; reject
               (если будет) логируется async в reader-thread.
         """
-        # Быстрый check (без lock'а — Event.is_set атомарен).
-        if not self._connected.is_set():
-            return None
+        # FIX: race condition — читаем self._ws под lock, чтобы reader-thread
+        # не мог сбросить его в None между проверкой и send. Без этого возможны
+        # дубликаты ордеров (WS частично отправлен, caller делает REST fallback).
+        with self._ws_lock:
+            if not self._connected.is_set():
+                return None
+            ws = self._ws
+            if ws is None:
+                return None
 
-        # Фиксируем локальную ссылку: reader-thread может сбросить self._ws
-        # между этой строкой и ws.send. ConnectionClosed мы поймаем.
-        ws = self._ws
-        if ws is None:
-            return None
+            req_id = str(uuid.uuid4())
+            ts_ms = str(int(time.time() * 1000))
+            symbol = args.get("symbol", "?")
+            payload = {
+                "reqId": req_id,
+                "op":    "order.create",
+                "header": {
+                    "X-BAPI-TIMESTAMP":   ts_ms,
+                    "X-BAPI-RECV-WINDOW": "5000",
+                    # NOTE: Bybit affiliate-code (см. bybit_ws_trade.py).
+                    "Referer":            "Parsers",
+                },
+                "args": [args],
+            }
+            payload_str = _json_dumps(payload)
 
-        req_id = str(uuid.uuid4())
-        ts_ms = str(int(time.time() * 1000))
-        symbol = args.get("symbol", "?")
-        payload = {
-            "reqId": req_id,
-            "op":    "order.create",
-            "header": {
-                "X-BAPI-TIMESTAMP":   ts_ms,
-                "X-BAPI-RECV-WINDOW": "5000",
-                # NOTE: Bybit affiliate-code (см. bybit_ws_trade.py).
-                "Referer":            "Parsers",
-            },
-            "args": [args],
-        }
-        payload_str = _json_dumps(payload)
-
-        try:
-            with self._send_lock:
-                ws.send(payload_str)
-        except Exception as e:
-            # ConnectionClosed, OSError, AttributeError — всё на REST fallback.
-            print(f"[BYBIT-SYNC-WS-FAST] send failed {symbol}: {type(e).__name__}: {e} — REST", flush=True)
-            return None
+            try:
+                # _send_lock уже внутри _ws_lock — держим ws валидным до конца send
+                with self._send_lock:
+                    ws.send(payload_str)
+            except Exception as e:
+                # ConnectionClosed, OSError, AttributeError — всё на REST fallback.
+                print(f"[BYBIT-SYNC-WS-FAST] send failed {symbol}: {type(e).__name__}: {e} — REST", flush=True)
+                return None
 
         return {"sent": True, "reqId": req_id}
 

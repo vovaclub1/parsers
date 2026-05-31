@@ -59,9 +59,23 @@ BYBIT_SYNC_WS_ENABLED = os.getenv("BYBIT_SYNC_WS_ENABLED", "1").lower() in ("1",
 
 # Delist trailing stop strategy (native Bybit trailing)
 # FIX: нативный trailingStop вместо фиксированных TP — ловим «первую быструю свечу».
-DELIST_TRAILING_PCT = float(os.getenv("DELIST_TRAILING_PCT", "0.01"))   # 1.0% дистанция трейла
-DELIST_ACTIVE_PCT   = float(os.getenv("DELIST_ACTIVE_PCT", "0.01"))     # Активация после +1% в плюс
-DELIST_SL_PCT       = float(os.getenv("DELIST_SL_PCT", "0.05"))         # Аварийный SL +5%
+try:
+    DELIST_TRAILING_PCT = float(os.getenv("DELIST_TRAILING_PCT", "0.01"))
+except ValueError:
+    print("[CONFIG WARN] Invalid DELIST_TRAILING_PCT, using default 0.01")
+    DELIST_TRAILING_PCT = 0.01
+
+try:
+    DELIST_ACTIVE_PCT = float(os.getenv("DELIST_ACTIVE_PCT", "0.01"))
+except ValueError:
+    print("[CONFIG WARN] Invalid DELIST_ACTIVE_PCT, using default 0.01")
+    DELIST_ACTIVE_PCT = 0.01
+
+try:
+    DELIST_SL_PCT = float(os.getenv("DELIST_SL_PCT", "0.05"))
+except ValueError:
+    print("[CONFIG WARN] Invalid DELIST_SL_PCT, using default 0.05")
+    DELIST_SL_PCT = 0.05
 
 
 def parse_channels(csv: str) -> list[str | int]:

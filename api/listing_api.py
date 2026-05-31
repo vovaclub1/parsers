@@ -289,6 +289,9 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
     # trailingStop = абсолютное расстояние в USDT от максимума до стопа.
     # 3.5% — потуже чем было (5.5%), чтобы меньше отдавать с пика.
     trailing_distance = round(entry_price * 0.035, 8)
+    # activePrice для лонга: активация когда цена поднимется на 3.5% (в плюс).
+    # Защита от входного шума — trailing не активен пока не зафиксируем профит.
+    active_price = round(entry_price * 1.035, 8)
 
     _post_http2("/v5/position/trading-stop", {
         "category":     "linear",
@@ -298,6 +301,7 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
         "takeProfit":   str(tp1),
         "tpTriggerBy":  "LastPrice",
         "trailingStop": str(trailing_distance),
+        "activePrice":  str(active_price),  # Активация после +3.5%
         "tpslMode":     "Partial",
         "tpSize":       tp1_size,
         "positionIdx":  1,
