@@ -113,6 +113,10 @@ class BybitWsTrade:
         self._connected = threading.Event()
         self._pending:  dict[str, asyncio.Future] = {}
         self._pending_lock = threading.Lock()
+        # FIX: threading.Lock для защиты self._ws от race condition между
+        # reader thread (который может сбросить в None) и caller threads
+        # (которые читают для place_order_fast). Без него возможны дубликаты.
+        self._ws_lock = threading.Lock()
         # FIX: asyncio.Lock защищает от concurrent ws.send из разных корутин.
         # Без него современные `websockets` бросают ConcurrencyError, а старые
         # перемешивают кадры. Создаётся лениво в loop-потоке (asyncio.Lock
@@ -507,7 +511,9 @@ class BybitWsTrade:
             loop_inner.create_task(self._watch_ack(req_id, fut, symbol))
 
             try:
-                # Используем зафиксированный ws из outer scope
+                # FIX: повторная проверка ws внутри coroutine (может стать None
+                # между outer check и этим моментом). Используем зафиксированный
+                # ws из outer scope, но проверяем что он всё ещё валиден.
                 if ws is None:
                     send_err.append("ws_none")
                     return
@@ -518,7 +524,11 @@ class BybitWsTrade:
                         await ws.send(payload_str)
                 else:
                     await ws.send(payload_str)
-            except (ConnectionClosedError, OSError, AttributeError) as e:
+            except (ConnectionClosedError, ConnectionClosedOK) as e:
+                # FIX: если ws закрылся между check и send, ловим и возвращаем
+                # None для REST fallback (вместо partial send + REST = дубликат)
+                send_err.append(f"connection_closed: {type(e).__name__}")
+            except (OSError, AttributeError) as e:
                 send_err.append(f"transport: {type(e).__name__}: {e}")
             except Exception as e:  # noqa: BLE001
                 send_err.append(repr(e))

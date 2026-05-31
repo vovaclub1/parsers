@@ -353,7 +353,8 @@ class BybitSyncWsTrade:
                 print(f"[BYBIT-SYNC-WS-FAST] send failed {symbol}: {type(e).__name__}: {e} — REST", flush=True)
                 return None
 
-        return {"sent": True, "reqId": req_id}
+            # FIX: return внутри _ws_lock блока, чтобы ws не закрылся между send и return
+            return {"sent": True, "reqId": req_id}
 
     def place_order(self, args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
         """
