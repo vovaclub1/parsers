@@ -313,7 +313,7 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 raise last_exc
             resp.raise_for_status()
             data = _json_loads(resp.content)
-            ret_code = data.get("retCode")
+            ret_code = data.get("retCode", -1)  # FIX: consistent default с остальными вызовами
             if ret_code == 0:
                 return data
             # FIX-7: дубль orderLinkId → нормализуем ответ к success-формату,

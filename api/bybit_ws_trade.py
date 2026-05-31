@@ -469,10 +469,15 @@ class BybitWsTrade:
           None       — WS не подключён ИЛИ transport-ошибка при send → REST fallback.
           dict       — frame ушёл на провод; ack ждём в фоне.
         """
-        if not self._connected.is_set():
-            return None
-        if self._loop is None or self._ws is None:
-            return None
+        # FIX: race condition — читаем self._ws под lock перед использованием
+        with self._ws_lock:
+            if not self._connected.is_set():
+                return None
+            if self._loop is None or self._ws is None:
+                return None
+            # Фиксируем локальные копии под lock
+            loop = self._loop
+            ws = self._ws
 
         req_id = str(uuid.uuid4())
         ts_ms  = str(int(time.time() * 1000))
@@ -493,16 +498,16 @@ class BybitWsTrade:
         send_err: list[str] = []
 
         async def _send_and_track() -> None:
-            loop = asyncio.get_running_loop()
+            loop_inner = asyncio.get_running_loop()
             # Регистрируем future, чтобы reader-loop (_dispatch) мог
             # доставить ack. _watch_ack ждёт его в фоне и логирует reject.
-            fut: asyncio.Future = loop.create_future()
+            fut: asyncio.Future = loop_inner.create_future()
             with self._pending_lock:
                 self._pending[req_id] = fut
-            loop.create_task(self._watch_ack(req_id, fut, symbol))
+            loop_inner.create_task(self._watch_ack(req_id, fut, symbol))
 
             try:
-                ws = self._ws
+                # Используем зафиксированный ws из outer scope
                 if ws is None:
                     send_err.append("ws_none")
                     return
@@ -520,7 +525,7 @@ class BybitWsTrade:
             finally:
                 send_done.set()
 
-        asyncio.run_coroutine_threadsafe(_send_and_track(), self._loop)
+        asyncio.run_coroutine_threadsafe(_send_and_track(), loop)
 
         # Ждём только окончания send (это ~1-5мс, локально), не ack.
         # 0.5с — потолок на случай зависшего loop'а; в норме сразу.
