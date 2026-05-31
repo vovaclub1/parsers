@@ -34,12 +34,19 @@ try:
         if isinstance(b, str):
             b = b.encode()
         return _orjson.loads(b)
+    def _json_dumps(obj, indent: bool = False):
+        opts = _orjson.OPT_INDENT_2 if indent else 0
+        return _orjson.dumps(obj, option=opts)
 except ImportError:
     import json as _stdjson
     def _json_loads(b: bytes | str):
         if isinstance(b, (bytes, bytearray)):
             b = b.decode()
         return _stdjson.loads(b)
+    def _json_dumps(obj, indent: bool = False):
+        if indent:
+            return _stdjson.dumps(obj, indent=2).encode()
+        return _stdjson.dumps(obj).encode()
 
 # FIX-PERF: msgspec.Struct для Binance exchangeInfo (300-500KB JSON,
 # ~600+ symbols). orjson+dict.get в for-loop держал GIL ~10-25мс каждые
@@ -289,11 +296,11 @@ def _load_fired_state() -> None:
         if not raw.strip():
             return
         try:
-            import orjson as _oj  # type: ignore[import-not-found]
-            data = _oj.loads(raw)
-        except ImportError:
-            import json as _stdj
-            data = _stdj.loads(raw.decode())
+            # FIX: используем уже импортированный _json_loads вместо дубликата
+            data = _json_loads(raw)
+        except Exception as e:
+            log_warn("DEDUP", f"L2 parse failed: {e!r}")
+            return
         gf = data.get("global", [])
         with _fired_lock:
             if isinstance(gf, list):
@@ -320,12 +327,8 @@ def _persist_fired_state() -> None:
                 "global": sorted(_global_fired),
                 "per_exchange": {k: sorted(v) for k, v in _per_exchange_fired.items()},
             }
-        try:
-            import orjson as _oj  # type: ignore[import-not-found]
-            payload = _oj.dumps(snapshot, option=_oj.OPT_INDENT_2)
-        except ImportError:
-            import json as _stdj
-            payload = _stdj.dumps(snapshot, indent=2).encode()
+        # FIX: используем уже импортированный _json_dumps вместо дубликата
+        payload = _json_dumps(snapshot, indent=True)
         _FIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _FIRED_FILE.with_suffix(".json.tmp")
         tmp.write_bytes(payload)
