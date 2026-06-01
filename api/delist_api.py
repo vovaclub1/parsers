@@ -967,7 +967,11 @@ def find_pairs(text: str) -> list[str]:
             return found
 
     all_tokens = _RE_ALL_TOKENS.findall(text_upper)
-    return [t for t in _filter_tokens(all_tokens) if t in known_coins]
+    # FIX: snapshot known_coins под lock — price_updater делает clear()+update(),
+    # между ними set пуст. Без snapshot fallback мог бы пропустить валидную монету.
+    with cache_lock:
+        known_snapshot = frozenset(known_coins)
+    return [t for t in _filter_tokens(all_tokens) if t in known_snapshot]
 
 
 def _filter_tokens(tokens: list[str]) -> list[str]:

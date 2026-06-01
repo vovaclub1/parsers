@@ -93,7 +93,8 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
     """
     bybit_price = get_price(ticker_name)
 
-    if bybit_price:
+    # FIX: явная проверка > 0 (защита от деления на ноль и отрицательных цен)
+    if bybit_price and bybit_price > 0:
         symbol  = f"{ticker_name}USDT"
         raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магия → константа
 
