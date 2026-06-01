@@ -31,7 +31,7 @@ import uuid
 from typing import Any
 
 import websockets
-from websockets.exceptions import ConnectionClosedError
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 try:
     import orjson as _orjson  # type: ignore[import-not-found]
