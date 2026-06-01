@@ -1250,6 +1250,14 @@ BINANCE_NOTICE_JITTER = 0.10
 # При HTTP 429 — длинная пауза, иначе долбёжка каждые 3с держит бан живым
 # (каждый запрос в окне бана продлевает окно). 30с даёт WAF разбаниться.
 BINANCE_NOTICE_BACKOFF_429 = float(os.getenv("BINANCE_NOTICE_BACKOFF_429", "30.0"))
+# FIX: адаптивная защита от стойкого IP-бана. После N подряд 429 поллер
+# уходит в длинный cooldown (даём WAF реально разбаниться). При каждом бане
+# базовый интервал растёт на STEP (5-10%) до потолка MAX; успешный ответ
+# сбрасывает интервал и счётчик банов к базовым значениям.
+BINANCE_NOTICE_BAN_THRESHOLD = int(os.getenv("BINANCE_NOTICE_BAN_THRESHOLD", "20"))   # N подряд 429 → cooldown
+BINANCE_NOTICE_COOLDOWN = float(os.getenv("BINANCE_NOTICE_COOLDOWN", "600.0"))         # длинная пауза (10 мин)
+BINANCE_NOTICE_INTERVAL_STEP = float(os.getenv("BINANCE_NOTICE_INTERVAL_STEP", "0.07"))  # +7% на каждый бан
+BINANCE_NOTICE_INTERVAL_MAX = float(os.getenv("BINANCE_NOTICE_INTERVAL_MAX", "30.0"))    # потолок интервала
 # Cache-busting: CloudFront кеширует по query-ключу. Ротация pageSize ∈ набора
 # даёт разные cache key. ВАЖНО: нельзя добавлять «левые» query-параметры
 # (_t/timestamp и т.п.) — WAF режет их в 400 (урок из delist-инцидента).
@@ -1374,23 +1382,49 @@ def run_binance_announcement_poller() -> None:
     except Exception as e:
         log_err("BINANCE-NOTICE", f"Ошибка инициализации: {e}")
 
+    # Адаптивное состояние: текущий интервал растёт при банах, счётчик
+    # подряд идущих 429 триггерит cooldown при достижении порога.
+    cur_interval = BINANCE_NOTICE_POLL_INTERVAL
+    ban_streak = 0
+
     while True:
         try:
             # ±jitter, чтобы не бить Binance синхронно с другими поллерами.
-            jitter = BINANCE_NOTICE_POLL_INTERVAL * BINANCE_NOTICE_JITTER * (2 * random.random() - 1)
-            time.sleep(max(0.05, BINANCE_NOTICE_POLL_INTERVAL + jitter))
+            jitter = cur_interval * BINANCE_NOTICE_JITTER * (2 * random.random() - 1)
+            time.sleep(max(0.05, cur_interval + jitter))
             t_send = time.perf_counter()
             resp = session.get(_binance_notice_url(), timeout=2)
 
-            # 429 ловим ДО raise_for_status: долбёжка каждые 3с держит бан
-            # живым, поэтому отступаем надолго — даём WAF разбаниться.
+            # 429 ловим ДО raise_for_status: долбёжка держит бан живым,
+            # поэтому отступаем надолго — даём WAF разбаниться.
             if resp.status_code == 429:
-                log_err("BINANCE-NOTICE", f"429 — пауза {BINANCE_NOTICE_BACKOFF_429:.0f}с")
-                time.sleep(BINANCE_NOTICE_BACKOFF_429)
+                ban_streak += 1
+                # Адаптивно растим базовый интервал (+STEP%) до потолка MAX.
+                cur_interval = min(cur_interval * (1 + BINANCE_NOTICE_INTERVAL_STEP),
+                                   BINANCE_NOTICE_INTERVAL_MAX)
+                if ban_streak >= BINANCE_NOTICE_BAN_THRESHOLD:
+                    # Стойкий бан — длинный cooldown, чтобы WAF реально снял
+                    # блок. После cooldown сбрасываем streak (но НЕ интервал —
+                    # пусть остаётся повышенным, мягче давим на IP).
+                    log_err("BINANCE-NOTICE",
+                            f"{ban_streak} подряд 429 → cooldown {BINANCE_NOTICE_COOLDOWN/60:.0f}мин "
+                            f"(интервал теперь {cur_interval:.1f}с)")
+                    time.sleep(BINANCE_NOTICE_COOLDOWN)
+                    ban_streak = 0
+                else:
+                    log_err("BINANCE-NOTICE",
+                            f"429 #{ban_streak} — пауза {BINANCE_NOTICE_BACKOFF_429:.0f}с "
+                            f"(интервал {cur_interval:.1f}с)")
+                    time.sleep(BINANCE_NOTICE_BACKOFF_429)
                 continue
 
             resp.raise_for_status()
             t_recv = time.perf_counter()
+
+            # Успех — сбрасываем бан-стейт к базовым значениям.
+            if ban_streak or cur_interval != BINANCE_NOTICE_POLL_INTERVAL:
+                ban_streak = 0
+                cur_interval = BINANCE_NOTICE_POLL_INTERVAL
 
             data = _json_loads(resp.content)
             if data.get("code") != "000000":
