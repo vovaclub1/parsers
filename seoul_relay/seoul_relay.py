@@ -47,6 +47,26 @@ except ImportError:
     _CurlAsyncSession = None  # type: ignore[assignment,misc]
     HAS_CURL_CFFI = False
 
+# orjson на сырых байтах быстрее aiohttp r.json() (stdlib json + проверка
+# content-type/charset). На Bithumb-нотисах (~5-10KB, poll каждые 50мс) и
+# на market/all это снимает заметный кусок parse-времени.
+try:
+    import orjson as _orjson  # type: ignore[import-not-found]
+    def _loads(b):
+        return _orjson.loads(b)
+    def _dumps(o) -> str:
+        return _orjson.dumps(o).decode()
+except ImportError:
+    def _loads(b):
+        return json.loads(b)
+    def _dumps(o) -> str:
+        return json.dumps(o, separators=(",", ":"))
+
+
+async def _aio_json(r):
+    """Парсит aiohttp-ответ через orjson по сырым байтам."""
+    return _loads(await r.read())
+
 # ── Конфиг ────────────────────────────────────────────────────────
 PORT          = int(os.environ.get("RELAY_PORT", "8765"))
 SECRET        = os.environ.get("RELAY_SECRET", "")
@@ -69,6 +89,16 @@ if not SECRET:
 
 if len(SECRET) < 16:
     print(f"[WARN] RELAY_SECRET слишком короткий ({len(SECRET)} символов) — лучше ≥32", file=sys.stderr)
+
+# Market-diff триггер: ловим новый ТОРГУЕМЫЙ рынок в момент появления в
+# /v1/market/all — это часто РАНЬШЕ (или одновременно) нотиса. Downstream
+# L2-дедуп по монете гарантирует, что market-сигнал и notice-сигнал не
+# откроют позицию дважды. Чисто аддитивный источник: если эндпоинт упадёт/
+# забанится — основной notice-поллинг не страдает.
+MARKET_DIFF_ENABLED = os.environ.get("MARKET_DIFF_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+MARKET_POLL_MS  = int(os.environ.get("MARKET_POLL_MS", "200"))
+UPBIT_MARKET_URL   = "https://api.upbit.com/v1/market/all"
+BITHUMB_MARKET_URL = "https://api.bithumb.com/v1/market/all?isDetails=false"
 
 BITHUMB_NOTICES_URL = "https://api.bithumb.com/v1/notices?count=20"
 UPBIT_NOTICES_URL_TEMPLATE = "https://api-manager.upbit.com/api/v1/announcements/{id}"
@@ -237,7 +267,7 @@ async def _broadcast(payload: dict) -> None:
     """
     if not _clients:
         return
-    msg = json.dumps(payload, separators=(",", ":"))
+    msg = _dumps(payload)
     dead = []
     for ws in list(_clients):
         try:
@@ -295,7 +325,7 @@ async def _poll_bithumb(http: aiohttp.ClientSession) -> None:
     try:
         async with http.get(BITHUMB_NOTICES_URL, timeout=aiohttp.ClientTimeout(total=4)) as r:
             r.raise_for_status()
-            items = await r.json()
+            items = await _aio_json(r)
         if isinstance(items, list):
             for item in items:
                 if not isinstance(item, dict):
@@ -316,7 +346,7 @@ async def _poll_bithumb(http: aiohttp.ClientSession) -> None:
         try:
             async with http.get(BITHUMB_NOTICES_URL, timeout=aiohttp.ClientTimeout(total=2)) as r:
                 r.raise_for_status()
-                items = await r.json()
+                items = await _aio_json(r)
         except Exception as e:
             _log("BITHUMB", f"poll err: {e!r}")
             await asyncio.sleep(2.0)  # backoff
@@ -550,6 +580,105 @@ async def _poll_upbit(sessions: list) -> None:
             await asyncio.sleep(2.0)
 
 
+# ── Market-diff pollers (самый быстрый триггер листинга) ─────────
+def _markets_to_bases(items) -> set[str]:
+    """Из ответа /v1/market/all → множество base-тикеров (KRW-XXX → XXX)."""
+    bases: set[str] = set()
+    if not isinstance(items, list):
+        return bases
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        code = it.get("market") or ""
+        if "-" not in code:
+            continue
+        base = code.split("-", 1)[1].upper()
+        # _BITHUMB_NOTICE_BANNED содержит KRW/BTC/USDT/... — не тикеры монет.
+        if base and base not in _BITHUMB_NOTICE_BANNED:
+            bases.add(base)
+    return bases
+
+
+async def _broadcast_new_market(exchange: str, coins: list, fetch_ms: float) -> None:
+    payload = {
+        "type":      "listing",
+        "source":    f"SEOUL-RELAY-{exchange}-MARKET",
+        "coins":     coins,
+        "title":     f"new {exchange} market: {','.join(coins)}",
+        "notice_id": 0,
+        "fetch_ms":  round(fetch_ms, 1),
+        "t_pub_ms":  int(time.time() * 1000),
+    }
+    _log(f"{exchange}-MKT", f"NEW MARKET {coins} ({fetch_ms:.0f}мс) → broadcast({len(_clients)})")
+    await _broadcast(payload)
+
+
+async def _poll_upbit_market(sessions: list) -> None:
+    """Диффит api.upbit.com/v1/market/all через curl_cffi сессии (round-robin)."""
+    if not sessions:
+        return
+    import itertools as _it
+    cyc = _it.cycle(sessions)
+    interval = MARKET_POLL_MS / 1000.0
+    known: set[str] = set()
+    try:
+        r = await next(cyc).get(UPBIT_MARKET_URL, timeout=4)
+        known = _markets_to_bases(r.json())
+        _log("UPBIT-MKT", f"init: {len(known)} рынков, poll {MARKET_POLL_MS}мс")
+    except Exception as e:
+        _log("UPBIT-MKT", f"init failed: {e!r}")
+
+    while True:
+        await asyncio.sleep(interval)
+        t_send = time.perf_counter()
+        try:
+            r = await next(cyc).get(UPBIT_MARKET_URL, timeout=3)
+            cur = _markets_to_bases(r.json())
+        except Exception as e:
+            _log("UPBIT-MKT", f"poll err: {e!r}")
+            await asyncio.sleep(2.0)
+            continue
+        if not cur:
+            continue
+        new = cur - known
+        # known растёт монотонно (union) — защита от false-positive при
+        # частичном/сбойном ответе (не считаем «исчезнувшие» монеты новыми).
+        if known and new:
+            await _broadcast_new_market("UPBIT", sorted(new), (time.perf_counter() - t_send) * 1000)
+        known |= cur
+
+
+async def _poll_bithumb_market(http: aiohttp.ClientSession) -> None:
+    """Диффит api.bithumb.com/v1/market/all (aiohttp)."""
+    interval = MARKET_POLL_MS / 1000.0
+    known: set[str] = set()
+    try:
+        async with http.get(BITHUMB_MARKET_URL, timeout=aiohttp.ClientTimeout(total=4)) as r:
+            r.raise_for_status()
+            known = _markets_to_bases(await _aio_json(r))
+        _log("BITHUMB-MKT", f"init: {len(known)} рынков, poll {MARKET_POLL_MS}мс")
+    except Exception as e:
+        _log("BITHUMB-MKT", f"init failed: {e!r}")
+
+    while True:
+        await asyncio.sleep(interval)
+        t_send = time.perf_counter()
+        try:
+            async with http.get(BITHUMB_MARKET_URL, timeout=aiohttp.ClientTimeout(total=2)) as r:
+                r.raise_for_status()
+                cur = _markets_to_bases(await _aio_json(r))
+        except Exception as e:
+            _log("BITHUMB-MKT", f"poll err: {e!r}")
+            await asyncio.sleep(2.0)
+            continue
+        if not cur:
+            continue
+        new = cur - known
+        if known and new:
+            await _broadcast_new_market("BITHUMB", sorted(new), (time.perf_counter() - t_send) * 1000)
+        known |= cur
+
+
 # ── Main ──────────────────────────────────────────────────────────
 async def main() -> None:
     _log("BOOT", f"Seoul relay starts on :{PORT}")
@@ -621,6 +750,12 @@ async def main() -> None:
             tasks = [_poll_bithumb(bithumb_session)]
             if upbit_sessions:
                 tasks.append(_poll_upbit(upbit_sessions))
+            # Market-diff: аддитивные параллельные триггеры (часто быстрее нотиса).
+            if MARKET_DIFF_ENABLED:
+                tasks.append(_poll_bithumb_market(bithumb_session))
+                if upbit_sessions:
+                    tasks.append(_poll_upbit_market(upbit_sessions))
+                _log("BOOT", f"market-diff триггеры ON (poll {MARKET_POLL_MS}мс)")
             await asyncio.gather(*tasks)
     finally:
         await bithumb_session.close()

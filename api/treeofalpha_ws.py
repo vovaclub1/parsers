@@ -22,6 +22,7 @@ import asyncio
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import websockets
@@ -47,6 +48,11 @@ _RECONNECT_DELAY_MIN = 1.0
 _RECONNECT_DELAY_MAX = 30.0
 _PING_INTERVAL       = 20.0
 _PING_TIMEOUT        = 10.0
+
+# S1: long-lived пул вместо threading.Thread(...).start() на каждое сообщение
+# (как уже сделано в parser_delist/parser_listing). Спавн нового OS-потока =
+# syscall + GIL ~50-200µs на сообщение; submit в тёплый пул ~5-20µs.
+_toa_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="toa-cb")
 
 
 # Keywords для классификации сообщений.
@@ -203,24 +209,14 @@ async def _listener(
                     short = title[:120].replace("\n", " ")
                     print(f"[TOA-WS] [{kind.upper()}] ({source}) {short}", flush=True)
 
-                    # Передаём в callback в отдельном thread — НЕ блокируем
-                    # WS loop никакими сетевыми запросами.
+                    # Передаём в callback через пул — НЕ блокируем WS loop
+                    # сетевыми запросами и не платим за спавн потока (S1).
                     if kind == "delist" and delist_callback:
-                        threading.Thread(
-                            target=delist_callback,
-                            args=(full_text, t_start),
-                            daemon=True,
-                            name="toa-delist-cb",
-                        ).start()
+                        _toa_executor.submit(delist_callback, full_text, t_start)
                     elif kind == "listing" and listing_callback:
-                        threading.Thread(
-                            target=listing_callback,
-                            # FIX 2026-06-02: прокидываем msg.source ("Binance"/
-                            # "Upbit"/"Bithumb") в callback — для per-exchange L2.
-                            args=(full_text, t_start, source),
-                            daemon=True,
-                            name="toa-listing-cb",
-                        ).start()
+                        # FIX 2026-06-02: прокидываем msg.source ("Binance"/
+                        # "Upbit"/"Bithumb") в callback — для per-exchange L2.
+                        _toa_executor.submit(listing_callback, full_text, t_start, source)
 
         except (ConnectionClosedError, OSError, asyncio.TimeoutError) as e:
             print(f"[TOA-WS] разрыв: {e} — переподключение через {delay:.0f}с", flush=True)
