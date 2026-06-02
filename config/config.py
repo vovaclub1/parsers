@@ -31,12 +31,38 @@ HYPERLIQUID_KEY = os.getenv("HYPERLIQUID_KEY")
 # Если переменной нет — используем только прямое подключение.
 DELIST_PROXIES = os.getenv("DELIST_PROXIES", "")
 
+# FIX-LATENCY (Patch #2): прокси для notice-поллеров parser_listing
+# (Bithumb-notice, Upbit-notice, Binance-notice). Тот же формат, что
+# DELIST_PROXIES. С 3-5 IP можно безопасно уплотнить poll до 30-50мс
+# cadence (каждый IP видит ~10 req/s, в пределах rate-limit бирж).
+# Если переменной нет — все поллеры идут одним прямым подключением.
+LISTING_PROXIES = os.getenv("LISTING_PROXIES", "")
+
+# FIX-LATENCY (Patch #1): Seoul edge-нода — отдельная VPS в Корее, которая
+# поллит api.bithumb.com и api.upbit.com с ~5мс RTT (vs 120мс из SG)
+# и пушит свежие нотисы через WS на main-сервер. SEOUL_RELAY_URL —
+# полный wss-эндпоинт с auth-токеном в query, например:
+#   wss://seoul.mydomain.com/relay?key=SECRET
+# Пустая строка отключает receiver. См. seoul_relay.py для серверной части.
+SEOUL_RELAY_URL = os.getenv("SEOUL_RELAY_URL", "")
+SEOUL_RELAY_KEY = os.getenv("SEOUL_RELAY_KEY", "")
+
 # FIX: API key для wss://*.coinlisting.pro — раньше был захардкожен.
 COINLISTING_API_KEY = os.getenv("COINLISTING_API_KEY", "")
 
 # FIX: путь к Telethon сессиям — раньше был захардкожен `/Parsers/...`,
 # теперь конфигурируется через env (по умолчанию /Parsers для Docker).
 SESSION_DIR = os.getenv("SESSION_DIR", "/Parsers")
+
+# FIX 2026-06-02: каталог для персистентного state (L2-дедуп listing_fired.json /
+# delist_fired.json, source_stats.json). Вынесен из SESSION_DIR, потому что в
+# Docker монтируется как volume-ДИРЕКТОРИЯ (а не пофайлово, как .session): иначе
+# атомарный tmp.replace() в _persist_fired_state ловит EXDEV через границу
+# bind-mount отдельного файла. Инцидент: SLX открылся повторно после
+# `docker compose up --force-recreate`, т.к. listing_fired.json не был
+# примонтирован и терялся. Дефолт = SESSION_DIR → локальный запуск без Docker
+# не ломается.
+STATE_DIR = os.getenv("STATE_DIR", SESSION_DIR)
 
 # FIX-batch-3: дополнительные TG-каналы для multi-source first-wins listener.
 # CSV: username каналов без @ или ID (число с -100...). Дубликаты сигналов

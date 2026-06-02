@@ -236,14 +236,18 @@ def _gate_set_leverage(contract: str, leverage: int = _LEVERAGE, cross: bool = T
         if resp.status_code == 200:
             with _leverage_lock:
                 _leverage_set_for.add(cache_key)
-            mode = "cross" if cross else "isolated"
-            print(f"{_tag('GATE LEV', CYAN)} {contract} → {leverage}x {mode} ✓")
+            # FIX-LOG: success-print убран — на старте gate_leverage_presetter
+            # делает 700+ вызовов, забивает stdout. Кэш виден в итоговом
+            # "GATE PRESET sweep#N ✓ ... новых в кэше=...".
             return True
         else:
-            print(
-                f"{_tag('GATE LEV ERR', RED)} {contract}: "
-                f"HTTP {resp.status_code} | {resp.text[:120]}"
-            )
+            # Тихо игнорим LEVERAGE_EXCEEDED — для некоторых контрактов
+            # Gate ограничивает плечо. Этих контрактов мало, ошибки не помогают.
+            if "LEVERAGE_EXCEEDED" not in resp.text:
+                print(
+                    f"{_tag('GATE LEV ERR', RED)} {contract}: "
+                    f"HTTP {resp.status_code} | {resp.text[:120]}"
+                )
             return False
     except Exception as e:
         print(f"{_tag('GATE LEV ERR', RED)} {contract}: {e}")
@@ -279,11 +283,8 @@ def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, f
     quanto    = _quanto_gate.get(ticker, 1.0)
     coins     = contracts * quanto
 
-    print(
-        f"{_tag('GATE CALC', CYAN)} {ticker} | "
-        f"margin={usdt_amount}$ × {_LEVERAGE}x = {contracts} контрактов "
-        f"(≈{coins:.4f} монет @ {price})"
-    )
+    # FIX-LOG: GATE CALC print убран — то же contracts/coins/price видно в
+    # GATE LONG ниже. Перед каждым ордером дублировал инфу.
 
     order_size = contracts if is_long else -contracts
     result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
@@ -353,11 +354,7 @@ def gate_open_short_by_contracts(
     quanto    = _quanto_gate.get(ticker, 1.0)
     coins     = contracts * quanto
 
-    print(
-        f"{_tag('GATE CALC', CYAN)} {ticker} | "
-        f"шорт {contracts} контрактов "
-        f"(≈{coins:.4f} монет @ {price})"
-    )
+    # FIX-LOG: GATE CALC шорт-print убран — дублирует GATE SHORT ниже.
 
     result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
         "contract":    contract,
@@ -438,11 +435,8 @@ def _run_trailing_stop(ticker: str, entry_price: float, contracts: int, trail_pc
 
         if price > max_price:
             max_price = price
-            print(
-                f"{_tag('GATE TRAIL', MAGENTA)} {ticker} | "
-                f"новый макс={max_price:.6f} | "
-                f"стоп будет на {max_price * (1 - trail_pct):.6f}"
-            )
+            # FIX-LOG: 'new max=' print убран — забивал логи на каждом тике
+            # роста цены. Старт trailing и выход уже логируются.
 
         stop_price = max_price * (1 - trail_pct)
 
@@ -620,3 +614,71 @@ def warmup_gate_connection() -> None:
         print(f"{_tag('GATE WARMUP', CYAN)} соединение прогрето")
     except Exception as e:
         print(f"{_tag('GATE WARMUP ERR', RED)} {e}")
+
+
+# ── Pre-set leverage sweep ────────────────────────────────────────
+# FIX-LATENCY: на cold ticker'е _gate_set_leverage делает HTTP POST
+# (100-200мс), который сидит в hot-path market_open_long → gate_open_long.
+# Кэш _leverage_set_for помогает только со 2-го листинга по той же
+# монете — а у нас каждый листинг это свежий тикер. Решение: фоновый
+# sweep, который проходит по gate_known_coins и пред-устанавливает
+# leverage для каждой. К моменту fresh-листинга кэш уже тёплый,
+# market_open_long пропускает 150мс.
+def gate_leverage_presetter(
+    throttle_ms: int = 50,
+    sweep_interval_sec: int = 3600,
+    init_wait_sec: float = 30.0,
+) -> None:
+    """
+    Фоновый sweep — для каждой монеты из gate_known_coins вызываем
+    _gate_set_leverage(coin_USDT, _LEVERAGE, cross=True).
+
+    Throttle 50мс/coin × ~300 контрактов ≈ 15с на полный sweep.
+    Sweep interval 1ч — Gate.io редко добавляет новые контракты.
+    На уже-кэшированных _gate_set_leverage отдаёт за ~1мкс (dict lookup),
+    поэтому повторные sweep'ы практически бесплатные по сети.
+
+    Ждём на старте, пока gate_price_updater наполнит gate_known_coins
+    (первый цикл = 3с). Если за init_wait_sec пусто — отменяем.
+    """
+    waited = 0.0
+    while not gate_known_coins and waited < init_wait_sec:
+        time.sleep(1.0)
+        waited += 1.0
+    if not gate_known_coins:
+        print(
+            f"{_tag('GATE PRESET', YELLOW)} gate_known_coins пуст после "
+            f"{waited:.0f}с — sweep отменён"
+        )
+        return
+
+    throttle = throttle_ms / 1000.0
+    sweep_no = 0
+    while True:
+        sweep_no += 1
+        snapshot = sorted(gate_known_coins)  # детерминированный порядок для логов
+        t0 = time.monotonic()
+        with _leverage_lock:
+            before = len(_leverage_set_for)
+        errors = 0
+        for i, coin in enumerate(snapshot, 1):
+            contract = f"{coin}_USDT"
+            try:
+                _gate_set_leverage(contract, _LEVERAGE, cross=True)
+            except Exception:  # noqa: BLE001
+                errors += 1
+            # throttle и для cached, и для cold — не вредно: фоновая нагрузка.
+            time.sleep(throttle)
+            # FIX-LOG: промежуточный print каждые 50 убран — забивал stdout.
+            # Прогресс смотреть в итоговом sweep#N ✓ сообщении внизу.
+        elapsed = time.monotonic() - t0
+        with _leverage_lock:
+            after = len(_leverage_set_for)
+        new_count = after - before
+        print(
+            f"{_tag('GATE PRESET', GREEN)} sweep#{sweep_no} ✓ "
+            f"{len(snapshot)} контрактов за {elapsed:.1f}с | "
+            f"новых в кэше={new_count} err={errors} | "
+            f"следующий через {sweep_interval_sec}с"
+        )
+        time.sleep(sweep_interval_sec)

@@ -106,7 +106,7 @@ except ImportError:  # graceful fallback на orjson-путь
     _parse_binance_articles = None  # type: ignore[assignment]
 
 from config.config import (
-    TG_API_ID, TG_API_HASH, DELIST_PROXIES, SESSION_DIR,
+    TG_API_ID, TG_API_HASH, DELIST_PROXIES, SESSION_DIR, STATE_DIR,
     EXTRA_DELIST_CHANNELS, parse_channels,    # FIX-batch-3: multi-channel
     TREE_OF_ALPHA_WS_ENABLED,                  # FIX-batch-4: TOA WS
     BYBIT_WS_TRADE_ENABLED,                    # FIX-batch-5: Bybit WS Trade
@@ -313,7 +313,7 @@ _FIRED_TTL     = 60   # L1: секунд до снятия блокировки 
 
 # L2: постоянное хранилище отстрелянных монет (любой источник).
 _global_fired: set[str] = set()
-_FIRED_FILE = Path(SESSION_DIR) / "delist_fired.json"
+_FIRED_FILE = Path(STATE_DIR) / "delist_fired.json"
 
 # FIX-PERF: dirty-flag для фонового L2-writer'а — вместо thread.start() на
 # каждый успешный open (то стоило ~3-15мс в hot-path worker'а под GIL contention).

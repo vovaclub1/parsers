@@ -230,6 +230,41 @@ _BITHUMB_NEG_KEYWORDS = (
     "점검",       # тех. работы
 )
 
+# FIX-FALSE-LISTING (Patch #5 risk): title-only-parse теперь идёт ПЕРЕД
+# article fetch. Раньше find_listing_pairs(title) срабатывал лишь как
+# last-resort после неуспешного article-parse, и delist-нотисы обычно
+# отфильтровывались самим парсером. Теперь — нужно явно блочить title'ы
+# с delist-маркерами, иначе откроем лонг на умирающую монету.
+# Korean уже в _BITHUMB_NEG_KEYWORDS, плюс английские/смешанные:
+_TITLE_DELIST_NEG_LOWER = (
+    "delist",         # покрывает "delisted", "delisting", "delists"
+    "will remove",
+    "removal of",
+    "removed from",
+    "trading will end",
+    "trading end",
+    "cease trading",
+    "discontinue",
+    "discontinued",
+    "monitoring tag",
+    "delistat",       # на всякий, опечатки
+)
+
+
+def _title_is_delist(title: str) -> bool:
+    """True если в title есть KR или EN-маркер delisting'а.
+    Используется чтобы early-title-parse не открыл лонг на delist-нотисе."""
+    if not title:
+        return False
+    for kw in _BITHUMB_NEG_KEYWORDS:
+        if kw in title:
+            return True
+    lower = title.lower()
+    for kw in _TITLE_DELIST_NEG_LOWER:
+        if kw in lower:
+            return True
+    return False
+
 
 def _is_bithumb_notice(url: str) -> bool:
     return "feed.bithumb.com/notice/" in url
@@ -491,25 +526,49 @@ async def _handle(msg: dict) -> None:
         _emit_signal(real, f"COINLISTING-{source}", t_signal)
         return
 
+    # ── EARLY TITLE PARSE (Patch #5) ────────────
+    # FIX-LATENCY: раньше title-парсер шёл ПОСЛЕ article fetch (0-500мс
+    # блокировка). На сообщениях, где coins замаскированы (█), но title
+    # содержит $TICKER или known_coin — это даёт мгновенный сигнал.
+    # Цена: ~1мкс на регекс. Risk false-positive: find_listing_pairs
+    # требует либо явный "$TICKER listed on X" формат, либо матч на
+    # known_coins Bybit — не сработает на голом "Bithumb Listing Notice".
+    #
+    # FIX-FALSE-LISTING: skip early-title-parse если в title есть delist-
+    # маркер. Без этого, например title "거래지원 종료 (XYZ)" → match
+    # на $XYZ → лонг на умирающую монету.
+    if title and not _title_is_delist(title):
+        title_tickers = find_listing_pairs(title)
+        if title_tickers:
+            log_ok("CL", f"TITLE-EARLY {title_tickers} (article fetch пропущен)")
+            _emit_signal(title_tickers, f"COINLISTING-{source}", t_signal)
+            # Дальше article-parse не нужен — title уже дал ответ, дубли
+            # отсеются в L1/L2 на стороне parser_listing.
+            return
+
     # ── MASKED → ARTICLE PARSE ──────────────────
     if not url:
-        log_warn("CL", "MASKED но url пустой — пробуем fallback")
-    else:
-        log_ok("CL", f"MASKED → article parse: {url}")
+        log_warn("CL", "MASKED но url пустой — fallback ничего не дал")
+        return
 
-    parsed = await _parse_tokens_from_article_fast(url) if url else []
+    log_ok("CL", f"MASKED → article parse: {url}")
+    parsed = await _parse_tokens_from_article_fast(url)
 
     if parsed:
         log_ok("CL", f"ARTICLE TOKENS {parsed}")
         _emit_signal(parsed, f"COINLISTING-{source}", t_signal)
         return
 
-    # ── FALLBACK ────────────────────────────────
-    tickers = find_listing_pairs(title)
-
-    if tickers:
-        log_warn("CL", f"FALLBACK {tickers}")
-        _emit_signal(tickers, f"COINLISTING-{source}", t_signal)
+    # ── LAST-RESORT: повтор title-парсера с возможно обновлённым known_coins
+    # Дёшево, бесполезно почти всегда (мы уже пробовали выше), но иногда
+    # gate_known_coins дозагрузился между этими двумя точками и теперь
+    # match сработал. Оставляем как cheap safety net.
+    # FIX-FALSE-LISTING: тот же delist-guard, что в early-path.
+    if title and not _title_is_delist(title):
+        tickers = find_listing_pairs(title)
+        if tickers:
+            log_warn("CL", f"FALLBACK-LATE {tickers}")
+            _emit_signal(tickers, f"COINLISTING-{source}", t_signal)
 
 
 # ── Websocket ────────────────────────────────────────────────────
@@ -574,8 +633,15 @@ async def _listen(url: str, label: str) -> None:
 # aiohttp.ClientSession (важно: connection pool общий с боевым
 # парсером, только так warm-up имеет смысл).
 _PREWARM_HOSTS = (
+    # Эти хосты использует CL article-parser через aiohttp ClientSession.
     "https://api-manager.upbit.com/",
     "https://feed.bithumb.com/",
+    # FIX-LATENCY-REVERTED: api.bithumb.com и api.upbit.com убраны —
+    # notice-поллеры в parser_listing.py используют `requests.Session`
+    # из _LISTING_PROXY_POOL, это ОТДЕЛЬНЫЙ TLS-пул от aiohttp. Прогрев
+    # тут keep-alive aiohttp-сессии им не помог бы. Поллеры держат свой
+    # keep-alive через poll cadence 40-60мс — handshake платится только
+    # один раз на старте.
 )
 _PREWARM_INTERVAL = 60.0
 

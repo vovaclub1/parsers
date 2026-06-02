@@ -121,6 +121,13 @@ LISTING_NEG = [
     # FIX: Earn / Launchpool / promo — раскрываем в общий LISTING_NEG
     # чтобы не дублировать сравнение в _classify.
     *_EARN_PROMO_NEG,
+    # FIX 2026-06-02: Pre-IPO / TradFi (Anthropic, OpenAI ... Perpetual
+    # Contract Pre-IPO Trading). Те же фильтры что в parser_listing.TG_LISTING_NEG.
+    "pre-ipo", "pre ipo",
+    "tradfi",
+    "perpetual contract pre",
+    "multiple usd",
+    "multiple usdⓈ",
 ]
 
 
@@ -149,12 +156,15 @@ def _classify(text: str) -> str | None:
 
 async def _listener(
     delist_callback: Callable[[str, float], None] | None,
-    listing_callback: Callable[[str, float], None] | None,
+    listing_callback: Callable[[str, float, str], None] | None,
 ) -> None:
     """
     Основной цикл WS-листенера. Reconnect с exp backoff.
-    Колбэки вызываются как (text, t_start). Они должны быть thread-safe
-    и БЫСТРЫЕ (не блокировать loop) — в идеале запускают threading.Thread.
+    Колбэки вызываются как delist_callback(text, t_start) и
+    listing_callback(text, t_start, source) — последний получает msg.source
+    ("Binance"/"Upbit"/...) для per-exchange L2-дедупа. Оба должны быть
+    thread-safe и БЫСТРЫЕ (не блокировать loop) — в идеале запускают
+    threading.Thread.
     """
     delay = _RECONNECT_DELAY_MIN
 
@@ -205,7 +215,9 @@ async def _listener(
                     elif kind == "listing" and listing_callback:
                         threading.Thread(
                             target=listing_callback,
-                            args=(full_text, t_start),
+                            # FIX 2026-06-02: прокидываем msg.source ("Binance"/
+                            # "Upbit"/"Bithumb") в callback — для per-exchange L2.
+                            args=(full_text, t_start, source),
                             daemon=True,
                             name="toa-listing-cb",
                         ).start()
@@ -221,7 +233,7 @@ async def _listener(
 
 def run_tree_of_alpha_listener(
     delist_callback: Callable[[str, float], None] | None = None,
-    listing_callback: Callable[[str, float], None] | None = None,
+    listing_callback: Callable[[str, float, str], None] | None = None,
 ) -> None:
     """
     Точка входа для запуска в отдельном thread.
