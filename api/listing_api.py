@@ -159,7 +159,10 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 if ws_ack is None:
                     # FIX-batch-8 #5: fast-path post_order вместо _post (f-string,
                     # -2..-5мс) + тот же orderLinkId — idempotency.
-                    post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id)
+                    # M5: SL+TP1 летят в теле fallback-ордера (защита на филле).
+                    post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id,
+                               stop_loss=str(sl_price), take_profit=str(tp1_price),
+                               tp_size=str(tp1_qty))
                 else:
                     placed_via = "WS-FAST"
 
@@ -315,13 +318,26 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
 def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
     """
     Роутер — выставляет TP/SL на той бирже где открыта позиция.
-    """
-    with _last_exchange_lock:
-        exchange = _last_exchange.get(ticker_name, "bybit")
 
-    if exchange == "gate":
-        return gate_set_tp_sl_long(ticker_name, entry_price, amount)
-    return _set_tp_sl_bybit(ticker_name, entry_price, amount)
+    M3: обёрнуто в try/except. На Bybit fast-path ордер мог быть ОТВЕРГНУТ
+    (reject логируется асинхронно в _watch_ack), а market_open_long всё равно
+    вернул "успех" — тогда позиции нет и /v5/position/trading-stop падает с
+    retCode≠0. Раньше это исключение тихо глохло в _tp_sl_executor. Теперь —
+    громкий лог, чтобы оператор знал о пропущенном/отвергнутом входе.
+    """
+    try:
+        with _last_exchange_lock:
+            exchange = _last_exchange.get(ticker_name, "bybit")
+
+        if exchange == "gate":
+            return gate_set_tp_sl_long(ticker_name, entry_price, amount)
+        return _set_tp_sl_bybit(ticker_name, entry_price, amount)
+    except Exception as e:
+        print(
+            f"[TP/SL FAIL] {ticker_name}: {e} — возможно ордер отвергнут "
+            f"биржей (позиции нет). ПРОВЕРЬ ПОЗИЦИЮ!"
+        )
+        return "error"
 
 
 # ── Парсинг тикера из TG-сообщения ───────────────────────────────

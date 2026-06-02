@@ -12,6 +12,8 @@ import hmac
 import json
 import time
 import threading
+from decimal import Decimal, ROUND_HALF_UP
+
 import requests
 
 from config.config import GATEIO_API_KEY, GATEIO_SECRET_KEY
@@ -190,7 +192,12 @@ def _gate_round_price(ticker: str, price: float) -> str:
     step = _price_steps_gate.get(ticker, 0.0001)
     if step <= 0:
         step = 0.0001
-    rounded  = round(round(price / step) * step, 10)
+    # M7: было round(round(price/step)*step, 10) — двойное округление с
+    # banker's rounding (round-half-to-even) на первом round() давало ±1 тик
+    # (напр. 100.005 при step=0.01 → 100.00 вместо 100.01). Decimal с
+    # ROUND_HALF_UP считает шаг точно, без float-погрешности.
+    _d_step  = Decimal(str(step))
+    rounded  = float((Decimal(str(price)) / _d_step).quantize(Decimal(1), rounding=ROUND_HALF_UP) * _d_step)
     step_str = f"{step:.10f}".rstrip("0")
     if "." in step_str:
         decimals = len(step_str.split(".")[1])
@@ -296,7 +303,20 @@ def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, f
         "auto_size":   "",
     })
 
-    fill_price = float(result.get("fill_price") or price)
+    # M1: IOC market-ордер мог быть ПРИНЯТ (HTTP 200), но не исполнен —
+    # на свежем листинге с тонкой ликвидностью fill_price отсутствует/0.
+    # Раньше `or price` подставлял кэш-цену → возвращали ложный success,
+    # и worker ставил TP/SL на НЕсуществующую позицию. Теперь: нет филла →
+    # (0,0), worker сделает retry (rejected/unfilled-ордер позиции не
+    # создаёт, повтор безопасен).
+    fill_price = float(result.get("fill_price") or 0)
+    if fill_price <= 0:
+        print(
+            f"{_tag('GATE NO FILL', RED)} {BOLD}{contract}{RESET} | "
+            f"IOC не исполнен | left={result.get('left')} "
+            f"status={result.get('status')} finish_as={result.get('finish_as')}"
+        )
+        return 0, 0
     direction  = "LONG" if is_long else "SHORT"
     color      = GREEN if is_long else RED
     print(
@@ -365,7 +385,15 @@ def gate_open_short_by_contracts(
         "auto_size":   "",
     })
 
-    fill_price = float(result.get("fill_price") or price)
+    # M1: см. _gate_open — нет филла → не выдаём ложный success.
+    fill_price = float(result.get("fill_price") or 0)
+    if fill_price <= 0:
+        print(
+            f"{_tag('GATE NO FILL', RED)} {BOLD}{contract}{RESET} | "
+            f"IOC не исполнен | left={result.get('left')} "
+            f"status={result.get('status')}"
+        )
+        return 0, 0
     fill_coins = contracts * quanto
     print(
         f"{_tag('GATE SHORT', RED)} {BOLD}{contract}{RESET} | "

@@ -250,7 +250,10 @@ _RE_ORDER_SAFE = re.compile(r"^[A-Za-z0-9._\-]+$")
 
 def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 order_link_id: str | None = None,
-                retries: int = 2) -> dict:
+                retries: int = 2,
+                stop_loss: str | None = None,
+                take_profit: str | None = None,
+                tp_size: str | None = None) -> dict:
     """
     Размещает Market ордер через Bybit V5 REST максимально быстро.
     :param symbol: "BTCUSDT" (linear).
@@ -272,18 +275,26 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
         raise ValueError(f"unsafe qty for _post_order: {qty!r}")
     if order_link_id is not None and not _RE_ORDER_SAFE.match(order_link_id):
         raise ValueError(f"unsafe order_link_id: {order_link_id!r}")
+    for _v in (stop_loss, take_profit, tp_size):
+        if _v is not None and not _RE_ORDER_SAFE.match(_v):
+            raise ValueError(f"unsafe sl/tp value for _post_order: {_v!r}")
 
+    _inner = (
+        f'"category":"linear","symbol":"{symbol}","side":"{side}",'
+        f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}'
+    )
     if order_link_id:
-        body_str = (
-            f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
-            f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx},'
-            f'"orderLinkId":"{order_link_id}"}}'
-        )
-    else:
-        body_str = (
-            f'{{"category":"linear","symbol":"{symbol}","side":"{side}",'
-            f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}}}'
-        )
+        _inner += f',"orderLinkId":"{order_link_id}"'
+    # M5: failsafe SL/TP прямо в теле REST-fallback ордера — позиция защищена
+    # в момент филла, как в WS-фрейме. Раньше fallback открывался голым, а
+    # SL/TP доезжали отдельным /v5/position/trading-stop с задержкой.
+    if stop_loss is not None:
+        _inner += f',"stopLoss":"{stop_loss}","slTriggerBy":"LastPrice"'
+    if take_profit is not None:
+        _inner += f',"takeProfit":"{take_profit}","tpTriggerBy":"LastPrice","tpslMode":"Partial"'
+        if tp_size is not None:
+            _inner += f',"tpSize":"{tp_size}"'
+    body_str = "{" + _inner + "}"
 
     # FIX: ретраи на Timeout/ConnectionError ОПАСНЫ для market-ордеров без
     # idempotency: Timeout не значит "ордер не принят", только "ответ не дошёл".
