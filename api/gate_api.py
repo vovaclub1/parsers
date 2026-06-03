@@ -12,6 +12,7 @@ import hmac
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_HALF_UP
 
 import requests
@@ -52,6 +53,9 @@ _session.headers.update({"Accept": "application/json", "Content-Type": "applicat
 # FIX: кэш установленных плеч, чтобы не дёргать API перед каждым ордером.
 _leverage_set_for: set[str] = set()
 _leverage_lock = threading.Lock()
+
+# M9: фоновый пул для установки плеча вне hot-path market_open_long.
+_leverage_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gate-lev")
 
 
 # ── авторизация ───────────────────────────────────────────────────
@@ -261,6 +265,40 @@ def _gate_set_leverage(contract: str, leverage: int = _LEVERAGE, cross: bool = T
         return False
 
 
+def _gate_set_leverage_async(contract: str, leverage: int = _LEVERAGE, cross: bool = True) -> None:
+    """
+    M9: ставит плечо в ФОНЕ — не блокирует hot-path. На cache-hit ничего не
+    делает (плечо уже установлено). На cold-тикере submit'ит установку в пул
+    и сразу возвращается; ордер уходит, не дожидаясь ~150мс HTTP POST.
+    Корректность размера: contracts считаются от КОНСТАНТЫ _LEVERAGE, а НЕ от
+    состояния биржи. Если фоновая установка не успеет и Gate отвергнет ордер
+    по марже — self-heal в _gate_open доставит плечо синхронно и повторит.
+    """
+    cache_key = f"{contract}:{leverage}:{int(cross)}"
+    with _leverage_lock:
+        if cache_key in _leverage_set_for:
+            return
+    try:
+        _leverage_executor.submit(_gate_set_leverage, contract, leverage, cross)
+    except Exception:
+        # Пул переполнен/закрыт — ставим синхронно как fallback (хуже по
+        # латентности, но корректность важнее).
+        _gate_set_leverage(contract, leverage, cross)
+
+
+def _is_leverage_margin_error(exc: Exception) -> bool:
+    """True, если ошибка Gate похожа на «плечо не установлено / не хватает маржи»."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    try:
+        label = str((resp.json() or {}).get("label", ""))
+    except Exception:
+        label = resp.text or ""
+    label = label.upper()
+    return any(k in label for k in ("LEVERAGE", "MARGIN", "INSUFFICIENT", "RISK_LIMIT"))
+
+
 def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, float]:
     """
     Общая функция открытия позиции на Gate.io (лонг или шорт).
@@ -282,7 +320,11 @@ def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, f
 
     contract = f"{ticker}_USDT"
 
-    _gate_set_leverage(contract, _LEVERAGE, cross=True)
+    # M9: плечо ставим в ФОНЕ — не блокируем hot-path на ~150мс. Требование:
+    # на аккаунте дефолтный cross-leverage ≥ _LEVERAGE (тогда первый ордер по
+    # свежему тикеру не отвергнут по марже). Если всё же отвергнут — self-heal
+    # на _post_signed ниже доставит плечо синхронно и повторит ровно один раз.
+    _gate_set_leverage_async(contract, _LEVERAGE, cross=True)
 
     contracts = _gate_calc_contracts(ticker, usdt_amount, _LEVERAGE)
     min_sz    = _gate_min_order(ticker)
@@ -294,29 +336,56 @@ def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, f
     # GATE LONG ниже. Перед каждым ордером дублировал инфу.
 
     order_size = contracts if is_long else -contracts
-    result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
+    _order_body = {
         "contract":    contract,
         "size":        order_size,
         "price":       "0",
         "tif":         "ioc",
         "reduce_only": False,
         "auto_size":   "",
-    })
+    }
+    try:
+        result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
+    except requests.HTTPError as e:
+        # M9 self-heal: фоновая установка плеча могла не успеть (или дефолт
+        # аккаунта ниже _LEVERAGE) → Gate отверг по марже/плечу. Ставим плечо
+        # СИНХРОННО и повторяем РОВНО один раз. Отвергнутый ордер позиции не
+        # создал → повтор безопасен (без double-position).
+        if not _is_leverage_margin_error(e):
+            raise
+        print(f"{_tag('GATE RETRY-LEV', YELLOW)} {BOLD}{contract}{RESET} | margin/leverage reject → sync set + retry")
+        _gate_set_leverage(contract, _LEVERAGE, cross=True)
+        result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
 
     # M1: IOC market-ордер мог быть ПРИНЯТ (HTTP 200), но не исполнен —
-    # на свежем листинге с тонкой ликвидностью fill_price отсутствует/0.
-    # Раньше `or price` подставлял кэш-цену → возвращали ложный success,
-    # и worker ставил TP/SL на НЕсуществующую позицию. Теперь: нет филла →
-    # (0,0), worker сделает retry (rejected/unfilled-ордер позиции не
+    # на свежем листинге с тонкой ликвидностью. Раньше `or price` подставлял
+    # кэш-цену → ложный success → worker ставил TP/SL на НЕсуществующую
+    # позицию. Авторитетный признак исполнения = |size|-|left| (Gate, IOC):
+    # сколько контрактов реально набралось (НЕ полагаемся на fill_price — он
+    # может отсутствовать у реально исполненного ордера, и тогда ложный (0,0)
+    # → retry → ДВОЙНАЯ позиция на Gate, где нет orderLinkId-идемпотентности).
+    # Нет филла → (0,0), worker сделает retry (unfilled-ордер позиции не
     # создаёт, повтор безопасен).
+    # (0,0) возвращаем ТОЛЬКО при ПОЛОЖИТЕЛЬНОМ признаке неисполнения — иначе
+    # ложный (0,0) → retry → ДВОЙНАЯ позиция на Gate (нет orderLinkId). Если
+    # size/left отсутствуют или не парсятся → считаем исполненным (без retry).
+    _size_raw, _left_raw = result.get("size"), result.get("left")
+    filled = None
+    if _size_raw is not None and _left_raw is not None:
+        try:
+            filled = abs(int(_size_raw)) - abs(int(_left_raw))
+        except (TypeError, ValueError):
+            filled = None
     fill_price = float(result.get("fill_price") or 0)
-    if fill_price <= 0:
+    if filled is not None and filled <= 0:
         print(
             f"{_tag('GATE NO FILL', RED)} {BOLD}{contract}{RESET} | "
-            f"IOC не исполнен | left={result.get('left')} "
+            f"IOC не исполнен | size={_size_raw} left={_left_raw} "
             f"status={result.get('status')} finish_as={result.get('finish_as')}"
         )
         return 0, 0
+    if fill_price <= 0:
+        fill_price = price  # исполнилось, но цена не пришла — берём кэш-цену
     direction  = "LONG" if is_long else "SHORT"
     color      = GREEN if is_long else RED
     print(
@@ -385,15 +454,24 @@ def gate_open_short_by_contracts(
         "auto_size":   "",
     })
 
-    # M1: см. _gate_open — нет филла → не выдаём ложный success.
+    # M1: см. _gate_open — (0,0) только при ПОЛОЖИТЕЛЬНОМ признаке неисполнения.
+    _size_raw, _left_raw = result.get("size"), result.get("left")
+    filled = None
+    if _size_raw is not None and _left_raw is not None:
+        try:
+            filled = abs(int(_size_raw)) - abs(int(_left_raw))
+        except (TypeError, ValueError):
+            filled = None
     fill_price = float(result.get("fill_price") or 0)
-    if fill_price <= 0:
+    if filled is not None and filled <= 0:
         print(
             f"{_tag('GATE NO FILL', RED)} {BOLD}{contract}{RESET} | "
-            f"IOC не исполнен | left={result.get('left')} "
+            f"IOC не исполнен | size={_size_raw} left={_left_raw} "
             f"status={result.get('status')}"
         )
         return 0, 0
+    if fill_price <= 0:
+        fill_price = price
     fill_coins = contracts * quanto
     print(
         f"{_tag('GATE SHORT', RED)} {BOLD}{contract}{RESET} | "

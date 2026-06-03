@@ -630,22 +630,23 @@ async def _poll_upbit_market(sessions: list) -> None:
 
     while True:
         await asyncio.sleep(interval)
-        t_send = time.perf_counter()
+        # Весь body в try — аддитивный поллер НЕ должен ронять relay через
+        # gather при неожиданной ошибке (парсинг/сеть/broadcast).
         try:
+            t_send = time.perf_counter()
             r = await next(cyc).get(UPBIT_MARKET_URL, timeout=3)
             cur = _markets_to_bases(r.json())
+            if not cur:
+                continue
+            new = cur - known
+            # known растёт монотонно (union) — защита от false-positive при
+            # частичном/сбойном ответе (не считаем «исчезнувшие» монеты новыми).
+            if known and new:
+                await _broadcast_new_market("UPBIT", sorted(new), (time.perf_counter() - t_send) * 1000)
+            known |= cur
         except Exception as e:
             _log("UPBIT-MKT", f"poll err: {e!r}")
             await asyncio.sleep(2.0)
-            continue
-        if not cur:
-            continue
-        new = cur - known
-        # known растёт монотонно (union) — защита от false-positive при
-        # частичном/сбойном ответе (не считаем «исчезнувшие» монеты новыми).
-        if known and new:
-            await _broadcast_new_market("UPBIT", sorted(new), (time.perf_counter() - t_send) * 1000)
-        known |= cur
 
 
 async def _poll_bithumb_market(http: aiohttp.ClientSession) -> None:
@@ -662,21 +663,20 @@ async def _poll_bithumb_market(http: aiohttp.ClientSession) -> None:
 
     while True:
         await asyncio.sleep(interval)
-        t_send = time.perf_counter()
         try:
+            t_send = time.perf_counter()
             async with http.get(BITHUMB_MARKET_URL, timeout=aiohttp.ClientTimeout(total=2)) as r:
                 r.raise_for_status()
                 cur = _markets_to_bases(await _aio_json(r))
+            if not cur:
+                continue
+            new = cur - known
+            if known and new:
+                await _broadcast_new_market("BITHUMB", sorted(new), (time.perf_counter() - t_send) * 1000)
+            known |= cur
         except Exception as e:
             _log("BITHUMB-MKT", f"poll err: {e!r}")
             await asyncio.sleep(2.0)
-            continue
-        if not cur:
-            continue
-        new = cur - known
-        if known and new:
-            await _broadcast_new_market("BITHUMB", sorted(new), (time.perf_counter() - t_send) * 1000)
-        known |= cur
 
 
 # ── Main ──────────────────────────────────────────────────────────
@@ -767,6 +767,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # uvloop ускоряет event-loop в 2-4x — на KR edge-ноде это тиже poll-циклы
+    # Upbit/Bithumb и быстрее broadcast. Опционально: если не установлен на
+    # VPS — тихо падаем на stdlib asyncio.
+    try:
+        import uvloop  # type: ignore[import-not-found]
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        _log("BOOT", "uvloop активирован")
+    except ImportError:
+        _log("BOOT", "uvloop не установлен — stdlib asyncio (pip install uvloop для скорости)")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

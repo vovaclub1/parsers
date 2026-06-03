@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -137,10 +138,19 @@ LISTING_NEG = [
 ]
 
 
+# FIX-perf: компилируем фильтры в regex-альтернацию ОДИН раз из списков выше
+# (списки — источник правды). re.search по DFA вместо N×substring-сканов в
+# hot-path WS-классификатора (~10-30µs/сообщение).
+_DELIST_KW_RE   = re.compile("|".join(re.escape(k) for k in DELIST_KEYWORDS))
+_LISTING_KW_RE  = re.compile("|".join(re.escape(k) for k in LISTING_KEYWORDS))
+_DELIST_NEG_RE  = re.compile("|".join(re.escape(k) for k in DELIST_NEG))
+_LISTING_NEG_RE = re.compile("|".join(re.escape(k) for k in LISTING_NEG))
+
+
 def _classify(text: str) -> str | None:
     tl = text.lower()
-    has_delist = any(kw in tl for kw in DELIST_KEYWORDS)
-    has_listing = any(kw in tl for kw in LISTING_KEYWORDS)
+    has_delist = bool(_DELIST_KW_RE.search(tl))
+    has_listing = bool(_LISTING_KW_RE.search(tl))
 
     # FIX: если в одном сообщении есть И delist И listing-фразы (например,
     # "We will delist X and will list Y") — не классифицируем как одно,
@@ -150,11 +160,11 @@ def _classify(text: str) -> str | None:
         return None
 
     if has_delist:
-        if any(neg in tl for neg in DELIST_NEG):
+        if _DELIST_NEG_RE.search(tl):
             return None
         return "delist"
     if has_listing:
-        if any(neg in tl for neg in LISTING_NEG):
+        if _LISTING_NEG_RE.search(tl):
             return None
         return "listing"
     return None

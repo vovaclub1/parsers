@@ -291,9 +291,11 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
     if stop_loss is not None:
         _inner += f',"stopLoss":"{stop_loss}","slTriggerBy":"LastPrice"'
     if take_profit is not None:
-        _inner += f',"takeProfit":"{take_profit}","tpTriggerBy":"LastPrice","tpslMode":"Partial"'
+        _inner += f',"takeProfit":"{take_profit}","tpTriggerBy":"LastPrice"'
+        # tpslMode:"Partial" ВАЛИДЕН только вместе с tpSize — иначе Bybit
+        # отвергнет ордер. Без tpSize оставляем дефолтный Full-режим TP.
         if tp_size is not None:
-            _inner += f',"tpSize":"{tp_size}"'
+            _inner += f',"tpslMode":"Partial","tpSize":"{tp_size}"'
     body_str = "{" + _inner + "}"
 
     # FIX: ретраи на Timeout/ConnectionError ОПАСНЫ для market-ордеров без
