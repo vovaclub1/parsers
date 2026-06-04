@@ -122,3 +122,21 @@ def parse_channels(csv: str) -> list[str | int]:
         else:
             out.append(x)
     return out
+
+
+# FIX (review M29): валидация критичных ключей на старте. Раньше
+# отсутствие ключа всплывало только в рантайме (битая подпись / пустой
+# TG). Теперь — явный warning сразу при импорте config.
+def _validate_critical_env() -> None:
+    critical = {
+        "BYBIT_API_KEY": BYBIT_API_KEY,
+        "BYBIT_SECRET_KEY": BYBIT_SECRET_KEY,
+        "TG_LOG_BOT_TOKEN": TG_LOG_BOT_TOKEN,
+        "TG_LOG_CHAT_ID": TG_LOG_CHAT_ID,
+    }
+    missing = [k for k, v in critical.items() if not v]
+    if missing:
+        print(f"[CONFIG WARN] не заданы критичные переменные: {', '.join(missing)}")
+
+
+_validate_critical_env()

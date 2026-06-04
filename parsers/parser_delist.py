@@ -1522,11 +1522,15 @@ if __name__ == "__main__":
 
     # FIX: heartbeat пишет timestamp в файл — docker healthcheck читает.
     def heartbeat():
+        # FIX (review L1): window-based — ровно 1 алерт на 2ч-окно.
+        # Раньше `% 7200 < 60` мог дать 0 или 2 алерта (дрейф sleep).
+        _last_alert_window = -1
         while True:
             _touch_heartbeat()
             time.sleep(60)
-            # Раз в 2 часа — алерт в TG.
-            if int(time.time()) % 7200 < 60:
+            window = int(time.time()) // 7200
+            if window != _last_alert_window:
+                _last_alert_window = window
                 tg_log("✅ <b>DELIST парсер работает</b>")
 
     threading.Thread(target=heartbeat, daemon=True, name="heartbeat").start()

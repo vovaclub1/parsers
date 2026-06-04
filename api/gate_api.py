@@ -61,6 +61,9 @@ _leverage_lock = threading.Lock()
 
 # M9: фоновый пул для установки плеча вне hot-path market_open_long.
 _leverage_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gate-lev")
+# FIX (review M16): корректный shutdown пула при выходе процесса.
+import atexit as _atexit
+_atexit.register(lambda: _leverage_executor.shutdown(wait=False))
 
 
 # ── авторизация ───────────────────────────────────────────────────

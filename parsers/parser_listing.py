@@ -383,8 +383,13 @@ def _warmup_listing_sessions() -> None:
 
     ok = 0
     with _cf.ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
-        for r in ex.map(_ping, targets):
-            ok += 1 if r else 0
+        try:
+            # FIX (review L0): timeout на map — прогрев не должен блокировать
+            # boot если один прокси завис (хотя _ping и так timeout=4).
+            for r in ex.map(_ping, targets, timeout=8):
+                ok += 1 if r else 0
+        except _cf.TimeoutError:
+            log_warn("WARMUP", "часть notice-сессий не прогрелась за 8с — продолжаем")
     log_ok("WARMUP", f"notice-сессии прогреты: {ok}/{len(targets)} (TCP+TLS установлены)")
 
 
@@ -1549,7 +1554,8 @@ def run_bithumb_announcement_poller() -> None:
                 process_signal(tickers, "BITHUMB-NOTICE", t_start=t_send)
 
         except Exception as e:
-            log_err("BITHUMB-NOTICE", f"poll error: {e}")
+            log_err("BITHUMB-NOTICE", f"poll error: {type(e).__name__}: {e}")
+            _hstat("error", "BITHUMB-NOTICE")
             time.sleep(POLL_ERROR_BACKOFF)
 
 
@@ -1887,7 +1893,8 @@ def run_upbit_announcement_poller() -> None:
                 time.sleep(UPBIT_ANNOUNCEMENT_POLL_INTERVAL)
 
         except Exception as e:
-            log_err("UPBIT-NOTICE", f"poll error: {e}")
+            log_err("UPBIT-NOTICE", f"poll error: {type(e).__name__}: {e}")
+            _hstat("error", "UPBIT-NOTICE")
             time.sleep(POLL_ERROR_BACKOFF)
 
 
@@ -2045,7 +2052,9 @@ def run_binance_announcement_poller() -> None:
             resp.raise_for_status()
             data = _json_loads(resp.content)
             catalogs = (data.get("data") or {}).get("catalogs") or []
-            articles = catalogs[0].get("articles", []) if catalogs else []
+            # FIX (review M4): catalogs[0] может быть None/не-dict.
+            _c0 = catalogs[0] if (catalogs and isinstance(catalogs[0], dict)) else {}
+            articles = _c0.get("articles", [])
             if articles:
                 last_max_id = max(int(a.get("id", 0)) for a in articles)
             else:
@@ -2119,7 +2128,9 @@ def run_binance_announcement_poller() -> None:
             catalogs = (data.get("data") or {}).get("catalogs") or []
             if not catalogs:
                 continue
-            articles = catalogs[0].get("articles", [])
+            # FIX (review M4): catalogs[0] может быть None/не-dict.
+            first_cat = catalogs[0] if isinstance(catalogs[0], dict) else {}
+            articles = first_cat.get("articles", [])
 
             new_max = last_max_id
             for art in articles:
@@ -2148,7 +2159,9 @@ def run_binance_announcement_poller() -> None:
             last_max_id = new_max
 
         except Exception as e:
-            log_err("BINANCE-NOTICE", f"poll error: {e}")
+            # FIX (review M0): тип ошибки → отличить parse от network в логе.
+            log_err("BINANCE-NOTICE", f"poll error: {type(e).__name__}: {e}")
+            _hstat("error", "BINANCE-NOTICE")
             time.sleep(POLL_ERROR_BACKOFF)
 
 
@@ -2650,10 +2663,14 @@ if __name__ == "__main__":
 
     # FIX: heartbeat — для docker healthcheck + TG алерт раз в 2 часа.
     def heartbeat():
+        # FIX (review L1): window-based — ровно 1 алерт на 2ч-окно.
+        _last_alert_window = -1
         while True:
             _touch_heartbeat()
             time.sleep(60)
-            if int(time.time()) % 7200 < 60:
+            window = int(time.time()) // 7200
+            if window != _last_alert_window:
+                _last_alert_window = window
                 tg_log("✅ <b>LISTING парсер работает</b>")
 
     threading.Thread(target=heartbeat, daemon=True, name="heartbeat").start()

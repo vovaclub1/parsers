@@ -21,12 +21,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import websockets
 from websockets.exceptions import ConnectionClosedError
+
+# FIX (review M24): bounded pool вместо thread-per-message. На бурсте
+# сигналов thread-per-message плодил неограниченно потоки (resource leak).
+_cb_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="seoul-cb")
 
 try:
     import orjson as _orjson  # type: ignore[import-not-found]
@@ -109,7 +115,10 @@ async def _listener(
                     if msg_type != "listing":
                         continue
 
-                    source = msg.get("source") or "SEOUL-RELAY-?"
+                    # FIX (review M25): санитизируем source из сети — он идёт
+                    # как метка источника в stats/логи. Ограничиваем алфавит и длину.
+                    _raw_src = msg.get("source") or "SEOUL-RELAY-?"
+                    source = re.sub(r"[^A-Za-z0-9_\-]", "_", str(_raw_src))[:24]
                     coins  = msg.get("coins")  or []
                     title  = msg.get("title")  or ""
                     fetch_ms = msg.get("fetch_ms")
@@ -126,15 +135,9 @@ async def _listener(
                     if listing_callback is None:
                         continue
 
-                    # Колбэк в отдельном thread — не блокируем WS loop.
-                    # Тяжёлый market_open_long в process_signal не сидит
-                    # под нашим async-loop'ом.
-                    threading.Thread(
-                        target=listing_callback,
-                        args=(coins, source, t_start),
-                        daemon=True,
-                        name=f"seoul-cb-{coins[0]}",
-                    ).start()
+                    # Колбэк в bounded pool — не блокируем WS loop, не плодим
+                    # потоки на бурсте (FIX M24). source уже санитизирован выше.
+                    _cb_executor.submit(listing_callback, coins, source, t_start)
 
         except (ConnectionClosedError, OSError, asyncio.TimeoutError) as e:
             _log("RX", f"разрыв: {e!r} — переподключение через {delay:.0f}с")
