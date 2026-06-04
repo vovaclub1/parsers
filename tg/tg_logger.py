@@ -30,21 +30,31 @@ except (TypeError, ValueError):
     _CHAT_ID = TG_LOG_CHAT_ID or ""
 
 
+# Разрешённые Telegram HTML-теги (открывающие и закрывающие).
+_ALLOWED_TAGS = ("<b>", "</b>", "<i>", "</i>", "<code>", "</code>", "<pre>", "</pre>")
+_TAG_PLACEHOLDERS = [(t, f"\x00{i}\x00") for i, t in enumerate(_ALLOWED_TAGS)]
+
+
 def _escape_for_html(msg: str) -> str:
     """
-    Telegram parse_mode=HTML кидает 400 если в тексте есть несбалансированные
-    <, > или &. Эскейпируем всё, кроме разрешённых тегов <b>, <i>, <code>.
+    FIX (review L6): раньше функция была NO-OP (оба return возвращали msg
+    как есть), а комментарий врал что эскейпит. При тикере/тексте с '&'
+    или несбалансированным '<' Telegram возвращал 400 (спасал только
+    retry без parse_mode в _tg_log_blocking).
+
+    Теперь: прячем разрешённые теги (<b>/<i>/<code>/<pre>) в плейсхолдеры,
+    html.escape всё остальное (& < >), возвращаем теги назад. Так
+    форматирование сохраняется, а спецсимволы в данных безопасны.
     """
-    # html.escape экранирует < > & — оставит только нужные нам теги если
-    # их добавим обратно. Самый простой способ: эскейпим всё кроме явных
-    # вызовов клиента (которые делают <b>foo</b> сами и должны быть валидны).
-    # Здесь мы НЕ заменяем — оставляем теги как есть, но эскейпируем
-    # все & которые не часть entity.
-    # Простая стратегия: если в сообщении есть валидные теги — оставляем
-    # как есть. Иначе — html.escape.
     if "<" not in msg and "&" not in msg:
         return msg
-    return msg
+    tmp = msg
+    for tag, ph in _TAG_PLACEHOLDERS:
+        tmp = tmp.replace(tag, ph)
+    tmp = html.escape(tmp, quote=False)   # экранирует & < > (не трогает ")
+    for tag, ph in _TAG_PLACEHOLDERS:
+        tmp = tmp.replace(ph, tag)
+    return tmp
 
 
 def _tg_log_blocking(msg: str) -> None:

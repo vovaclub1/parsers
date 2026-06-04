@@ -206,6 +206,14 @@ price_cache: dict[str, float] = {}
 cache_lock  = threading.Lock()
 known_coins: set[str] = set()
 
+# FIX (review high): монотонный timestamp последнего УСПЕШНОГО обновления.
+# Без него при сбое Bybit (outage / parse-fail) price_updater молча
+# держит замороженный кэш, а market_open_short сайзит реальный шорт по
+# старой цене во время делистинг-памп/дампа — это money-losing путь.
+# get_price гейтит по возрасту → None → авто-fallback на Gate.io (свежая цена).
+_price_cache_updated_at = 0.0   # time.monotonic() последнего успеха
+_PRICE_STALE_SEC = 6.0          # 3 пропущенных 2с-цикла → считаем устаревшим
+
 
 # ── Подпись Bybit ─────────────────────────────────────────────────
 
@@ -574,9 +582,14 @@ def price_updater() -> None:
                 price_cache.update(new_cache)
                 known_coins.clear()
                 known_coins.update(new_known)
+                # FIX (review high): отмечаем успешное обновление.
+                global _price_cache_updated_at
+                _price_cache_updated_at = time.monotonic()
 
         except Exception as e:
-            print(f"[PRICE CACHE ERROR] {e}")
+            # FIX: тип ошибки в логе — отличить network-blip от code-contract
+            # бага (напр. изменение _parse_bybit_tickers).
+            print(f"[PRICE CACHE ERROR] {type(e).__name__}: {e}")
 
         time.sleep(2)
 
@@ -585,10 +598,17 @@ def price_updater() -> None:
 
 def get_price(coin: str) -> Optional[float]:
     """
-    Возвращает последнюю цену монеты из кэша.
+    Возвращает последнюю цену монеты из кэша, ИЛИ None если кэш устарел.
     :param coin: str - тикер монеты (например "BTC").
-    :return: float | None - цена в USDT или None если монеты нет в кэше.
+    :return: float | None - цена в USDT, None если монеты нет ИЛИ кэш протух.
+
+    FIX (review high): age-gate. Если price_updater не обновлял кэш дольше
+    _PRICE_STALE_SEC (Bybit outage / parse-fail), возвращаем None — это
+    переводит market_open_* на свежий Gate.io fallback вместо сайзинга
+    ордера по замороженной цене во время делистинг-движения.
     """
+    if (time.monotonic() - _price_cache_updated_at) > _PRICE_STALE_SEC:
+        return None
     # FIX: race condition — price_cache.clear() в price_updater может
     # произойти между этим чтением и возвратом. Берём под lock.
     with cache_lock:
@@ -659,21 +679,35 @@ def _get_qty_step(symbol: str) -> float:
     if step is not None:
         return step
 
-    try:
-        data = _get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
-        # FIX: защита от KeyError если структура ответа изменилась
-        result = data.get("result", {})
-        items = result.get("list", [])
-        if not items:
-            raise QtyStepUnavailable(f"{symbol}: пустой список инструментов в ответе")
-        lot_filter = items[0].get("lotSizeFilter")
-        if not lot_filter or "qtyStep" not in lot_filter:
-            raise QtyStepUnavailable(f"{symbol}: отсутствует lotSizeFilter.qtyStep в ответе")
-        step = float(lot_filter["qtyStep"])
-    except QtyStepUnavailable:
-        raise  # Пробрасываем наше исключение как есть
-    except Exception as e:
-        raise QtyStepUnavailable(f"{symbol}: не получили шаг лота — {e}") from e
+    # FIX (review high): отличаем «символа нет на Bybit» (пустой list →
+    # QtyStepUnavailable → корректный Gate fallback) от TRANSIENT-сбоя
+    # (timeout/connection → Bybit на самом деле жив, просто медленный).
+    # Раньше любой timeout молча переводил шорт на Gate (другая ликвидность/
+    # комиссия). Теперь на transient делаем ОДИН быстрый retry перед сдачей.
+    last_exc: Exception | None = None
+    for attempt in range(2):  # 1 попытка + 1 retry
+        try:
+            data = _get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
+            result = data.get("result", {})
+            items = result.get("list", [])
+            if not items:
+                raise QtyStepUnavailable(f"{symbol}: пустой список инструментов в ответе")
+            lot_filter = items[0].get("lotSizeFilter")
+            if not lot_filter or "qtyStep" not in lot_filter:
+                raise QtyStepUnavailable(f"{symbol}: отсутствует lotSizeFilter.qtyStep в ответе")
+            step = float(lot_filter["qtyStep"])
+            break
+        except QtyStepUnavailable:
+            raise  # Символ реально отсутствует — пробрасываем (Gate fallback корректен)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            # Transient — быстрый retry (50мс), Bybit жив.
+            last_exc = e
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
+            raise QtyStepUnavailable(f"{symbol}: transient после retry — {e}") from e
+        except Exception as e:
+            raise QtyStepUnavailable(f"{symbol}: не получили шаг лота — {e}") from e
 
     with _lot_step_lock:
         _lot_step_cache[coin] = step

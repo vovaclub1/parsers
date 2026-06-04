@@ -268,12 +268,20 @@ def run_tree_of_alpha_listener(
     # ошибок верхнего уровня. После 5 крашей подряд — сдаёмся.
     try:
         consecutive_failures = 0
+        _last_crash_at = 0.0
         while consecutive_failures < 5:
             try:
                 loop.run_until_complete(_listener(delist_callback, listing_callback))
                 # _listener вернулся без исключения (что нормально только при stop) — выходим.
                 break
             except Exception as e:  # noqa: BLE001
+                # FIX (review): сбрасываем счётчик если с прошлого краша прошло
+                # >60с — значит listener работал нормально, краши НЕ «подряд».
+                # Иначе 5 редких крашей за всё время убивали источник навсегда.
+                now = time.monotonic()
+                if now - _last_crash_at > 60.0:
+                    consecutive_failures = 0
+                _last_crash_at = now
                 consecutive_failures += 1
                 print(
                     f"[TOA-WS] listener crashed ({consecutive_failures}/5): {e!r} — restart через 5с",
@@ -284,6 +292,6 @@ def run_tree_of_alpha_listener(
                 except Exception:
                     time.sleep(5)
         else:
-            print("[TOA-WS] 5 крашей подряд — listener остановлен", flush=True)
+            print("[TOA-WS] 5 крашей за <60с — listener остановлен", flush=True)
     finally:
         loop.close()

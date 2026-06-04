@@ -55,6 +55,7 @@ def _log(tag: str, msg: str) -> None:
 async def _listener(
     url: str,
     listing_callback: Callable[[list[str], str, float], None] | None,
+    on_disconnect: Callable[[], None] | None = None,
 ) -> None:
     """
     Главный loop: коннект к Seoul WS, чтение сообщений, диспатч в callback.
@@ -137,6 +138,11 @@ async def _listener(
 
         except (ConnectionClosedError, OSError, asyncio.TimeoutError) as e:
             _log("RX", f"разрыв: {e!r} — переподключение через {delay:.0f}с")
+            if on_disconnect is not None:
+                try:
+                    on_disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:  # noqa: BLE001
             _log("RX", f"неожиданная ошибка: {e!r}")
 
@@ -147,6 +153,7 @@ async def _listener(
 def run_seoul_relay_listener(
     url: str,
     listing_callback: Callable[[list[str], str, float], None] | None = None,
+    on_disconnect: Callable[[], None] | None = None,
 ) -> None:
     """
     Точка входа для threading.Thread. Создаёт собственный asyncio loop
@@ -163,11 +170,17 @@ def run_seoul_relay_listener(
 
     try:
         consecutive_failures = 0
+        _last_crash_at = 0.0
         while consecutive_failures < 5:
             try:
-                loop.run_until_complete(_listener(url, listing_callback))
+                loop.run_until_complete(_listener(url, listing_callback, on_disconnect))
                 break  # _listener вернулся без exception
             except Exception as e:  # noqa: BLE001
+                # FIX (review): сброс счётчика если краши НЕ подряд (>60с).
+                now = time.monotonic()
+                if now - _last_crash_at > 60.0:
+                    consecutive_failures = 0
+                _last_crash_at = now
                 consecutive_failures += 1
                 _log(
                     "RX",
@@ -178,6 +191,6 @@ def run_seoul_relay_listener(
                 except Exception:
                     time.sleep(5)
         else:
-            _log("RX", "5 крашей подряд — listener остановлен")
+            _log("RX", "5 крашей за <60с — listener остановлен")
     finally:
         loop.close()

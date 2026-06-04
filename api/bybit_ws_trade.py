@@ -230,7 +230,10 @@ class BybitWsTrade:
                     async for raw in ws:
                         try:
                             msg = _json_loads(raw)
-                        except Exception:
+                        except Exception as e:  # noqa: BLE001
+                            # FIX (review): не глотаем молча — malformed frame
+                            # может сигналить о смене протокола/обрезке.
+                            print(f"[BYBIT-WS] bad frame skipped: {type(e).__name__} | {raw[:120]!r}", flush=True)
                             continue
                         await self._dispatch(msg)
 

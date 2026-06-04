@@ -64,6 +64,17 @@ __all__ = [
 ]
 
 
+# ── Параметры TP/SL (FIX review M11: вынесены из inline-магии) ────
+# Используются и в market_open_long (failsafe SL+TP1 в order.create),
+# и в _set_tp_sl_bybit (trailing) — держим в одном месте, чтобы значения
+# не разъезжались между двумя путями.
+_SL_MULT       = 0.92    # стоп-лосс: -8% от entry
+_TP1_MULT      = 1.045   # тейк-1: +4.5% от entry
+_TP1_FRACTION  = 0.30    # доля позиции на TP1 (остальное под trailing)
+_TRAIL_PCT     = 0.035   # трейлинг-дистанция: 3.5%
+_TRAIL_ACT     = 1.035   # активация трейлинга: +3.5% от entry
+
+
 # ── Маржа ─────────────────────────────────────────────────────────
 
 def calculate_margin_for_listing() -> float:
@@ -121,9 +132,9 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 # trailing уже в фоне). Если open-frame пройдёт, а trading-stop
                 # задержится — SL уже стоит. trailingStop в order.create
                 # Bybit'ом не поддерживается, поэтому ставится отдельно.
-                sl_price  = round(bybit_price * 0.92, 8)   # -8%
-                tp1_price = round(bybit_price * 1.045, 8)  # +4.5%
-                tp1_qty   = _round_qty(amount_tokens * 0.30, step)
+                sl_price  = round(bybit_price * _SL_MULT, 8)
+                tp1_price = round(bybit_price * _TP1_MULT, 8)
+                tp1_qty   = _round_qty(amount_tokens * _TP1_FRACTION, step)
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
@@ -237,9 +248,9 @@ def warmup_chain(n: int = 30) -> int:
                 continue
             qty_str = str(amount_tokens)
             order_link_id = new_order_link_id()
-            sl_price  = round(bybit_price * 0.92, 8)
-            tp1_price = round(bybit_price * 1.045, 8)
-            tp1_qty   = _round_qty(amount_tokens * 0.30, step)
+            sl_price  = round(bybit_price * _SL_MULT, 8)
+            tp1_price = round(bybit_price * _TP1_MULT, 8)
+            tp1_qty   = _round_qty(amount_tokens * _TP1_FRACTION, step)
             order_args = {
                 "category":    "linear",
                 "symbol":      symbol,
@@ -285,17 +296,17 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
         print(f"[TP/SL SKIP] {e}")
         return "skip"
 
-    sl  = round(entry_price * 0.92, 8)    # -8%
-    tp1 = round(entry_price * 1.045, 8)   # +4.5%
+    sl  = round(entry_price * _SL_MULT, 8)
+    tp1 = round(entry_price * _TP1_MULT, 8)
 
-    tp1_size = str(_round_qty(amount * 0.30, step))  # 30% на TP1
+    tp1_size = str(_round_qty(amount * _TP1_FRACTION, step))  # 30% на TP1
 
     # trailingStop = абсолютное расстояние в USDT от максимума до стопа.
     # 3.5% — потуже чем было (5.5%), чтобы меньше отдавать с пика.
-    trailing_distance = round(entry_price * 0.035, 8)
+    trailing_distance = round(entry_price * _TRAIL_PCT, 8)
     # activePrice для лонга: активация когда цена поднимется на 3.5% (в плюс).
     # Защита от входного шума — trailing не активен пока не зафиксируем профит.
-    active_price = round(entry_price * 1.035, 8)
+    active_price = round(entry_price * _TRAIL_ACT, 8)
 
     _post_http2("/v5/position/trading-stop", {
         "category":     "linear",
@@ -383,9 +394,11 @@ def find_listing_pairs(text: str) -> list[str]:
         return list(dict.fromkeys(t.upper() for t, _ in matches))
 
     # FIX-batch-6: Метод 2 — тикеры в скобках (Binance "Will List X (TICKER)")
+    # FIX (review M12): .upper() для консистентности с методами 1/3 (биржа
+    # ждёт uppercase-символы; защита если regex когда-то расширят на [a-z]).
     paren_tickers = list(dict.fromkeys(
-        t for t in _RE_TICKER_PAREN.findall(text)
-        if t not in EXCLUDED_TOKENS
+        t.upper() for t in _RE_TICKER_PAREN.findall(text)
+        if t.upper() not in EXCLUDED_TOKENS
         and 2 <= len(t) <= 10
         and not t.isdigit()
     ))

@@ -45,6 +45,11 @@ _TRAILING_MAX_LIFETIME = 24 * 3600   # FIX: трейлинг не висит д�
 gate_price_cache: dict[str, float] = {}   # {"BTC": 65000.0, ...}
 gate_known_coins: set[str]         = set()
 _cache_lock = threading.Lock()
+# FIX (review high): age-gate против money-losing сайзинга по замороженной
+# цене при сбое Gate. gate_get_price → 0 если кэш протух → caller не торгует
+# по старой цене (market_open_* трактует 0 как "нет цены").
+_gate_cache_updated_at = 0.0
+_GATE_STALE_SEC = 10.0   # обновление каждые 3с → 3 пропуска = устарело
 
 # ── HTTP сессия ───────────────────────────────────────────────────
 _session = requests.Session()
@@ -109,14 +114,19 @@ def gate_price_updater() -> None:
                 gate_price_cache.update(new_cache)
                 gate_known_coins.clear()
                 gate_known_coins.update(new_coins)
+                global _gate_cache_updated_at
+                _gate_cache_updated_at = time.monotonic()
 
         except Exception as e:
-            print(f"{_tag('GATE ERR', RED)} price_updater: {e}")
+            print(f"{_tag('GATE ERR', RED)} price_updater: {type(e).__name__}: {e}")
 
         time.sleep(3)
 
 
 def gate_get_price(ticker: str) -> float:
+    # FIX (review high): age-gate — 0 если кэш протух (сбой Gate).
+    if (time.monotonic() - _gate_cache_updated_at) > _GATE_STALE_SEC:
+        return 0
     with _cache_lock:
         return gate_price_cache.get(ticker, 0)
 

@@ -259,11 +259,32 @@ def _parse_listing_proxies(raw: str) -> list[str | None]:
     return proxies
 
 
+# FIX-LATENCY: keep-alive adapter с TCP_NODELAY (отключаем Nagle — мелкие
+# GET'ы уходят без буферизации) + увеличенный pool, чтобы round-robin сессии
+# держали тёплые TCP+TLS соединения и не переустанавливали их.
+def _mount_keepalive_adapter(s: requests.Session) -> None:
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.connection import HTTPConnection
+        # TCP_NODELAY на все новые urllib3-сокеты (глобально, идемпотентно).
+        import socket as _sock
+        _opts = list(getattr(HTTPConnection, "default_socket_options", []) or [])
+        if (_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1) not in _opts:
+            _opts.append((_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1))
+            HTTPConnection.default_socket_options = _opts
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+    except Exception as e:  # noqa: BLE001
+        print(f"[ADAPTER WARN] keep-alive adapter не смонтирован: {e!r}", flush=True)
+
+
 def _make_listing_session(proxy: str | None) -> requests.Session:
     s = requests.Session()
     s.headers.update({"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
+    _mount_keepalive_adapter(s)
     return s
 
 
@@ -287,6 +308,7 @@ def _make_binance_session(proxy: str | None) -> requests.Session:
     })
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
+    _mount_keepalive_adapter(s)
     return s
 
 
@@ -328,6 +350,42 @@ def _next_binance_session() -> requests.Session:
     if _binance_session_cycle is None:
         _init_listing_proxy_pool()
     return next(_binance_session_cycle)  # type: ignore[arg-type]
+
+
+def _warmup_listing_sessions() -> None:
+    """
+    FIX-LATENCY: прогревает TCP+TLS для всех notice-сессий ко всем трём
+    endpoint'ам параллельно. Убирает cold-TLS handshake (~300-500мс до
+    Сеула) с ПЕРВОГО боевого запроса. Best-effort — ошибки игнорим.
+    Binance прогреваем мягко (1 запрос на сессию) чтоб не словить 429.
+    """
+    import concurrent.futures as _cf
+
+    targets: list[tuple[requests.Session, str]] = []
+    # Upbit/Bithumb notice — каждую listing-сессию к обоим хостам.
+    for s in _LISTING_PROXY_POOL:
+        targets.append((s, "https://api-manager.upbit.com/api/v1/announcements?page=1&per_page=1"))
+        targets.append((s, BITHUMB_NOTICES_URL))
+    # Binance — отдельные сессии, по одному прогреву (WAF чувствителен).
+    for s in _BINANCE_PROXY_POOL:
+        targets.append((s, _binance_notice_url()))
+
+    if not targets:
+        return
+
+    def _ping(item: tuple[requests.Session, str]) -> bool:
+        sess, url = item
+        try:
+            sess.get(url, timeout=4)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    ok = 0
+    with _cf.ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
+        for r in ex.map(_ping, targets):
+            ok += 1 if r else 0
+    log_ok("WARMUP", f"notice-сессии прогреты: {ok}/{len(targets)} (TCP+TLS установлены)")
 
 
 def _adjust_notice_intervals_for_pool() -> None:
@@ -412,6 +470,25 @@ _source_first_wins: Counter[str] = Counter()
 _source_lag_stats: dict[tuple[str, str], dict[str, float]] = {}
 _source_stats_dirty = threading.Event()
 _SOURCE_STATS_FILE = Path(STATE_DIR) / "source_stats.json"
+
+# ── Health-stats: персистентная диагностика «слабых мест» ─────────
+# throttle/error/disconnect/latency по компонентам → TG-отчёт ГДЕ узко.
+try:
+    from tg.health_stats import HealthStats
+    _health = HealthStats(Path(STATE_DIR) / "health_stats.json")
+except Exception as _he:  # noqa: BLE001
+    print(f"[HEALTH] init failed: {_he!r} — health-stats отключены", flush=True)
+    _health = None
+
+
+def _hstat(method: str, *args) -> None:
+    """Безопасный вызов health-метрики (no-op если модуль не загрузился)."""
+    if _health is not None:
+        try:
+            getattr(_health, method)(*args)
+        except Exception:  # noqa: BLE001
+            pass
+
 
 # ── Watchdog: время последнего успешного запроса ───────────────────
 _upbit_last_ts   = time.monotonic()
@@ -794,6 +871,23 @@ def _source_stats_summary_loop() -> None:
         time.sleep(6 * 3600)
 
 
+def _health_report_loop() -> None:
+    """
+    Каждые 6 часов шлёт health-отчёт «слабые места» в TG и stdout.
+    Первый тик через 1 час после старта (даём накопить данные).
+    """
+    time.sleep(3600)
+    while True:
+        try:
+            if _health is not None:
+                report = _health.build_report()
+                print(report.replace("<b>", "").replace("</b>", ""), flush=True)
+                tg_log(report)
+        except Exception as e:  # noqa: BLE001
+            log_warn("HEALTH", f"report failed: {e!r}")
+        time.sleep(6 * 3600)
+
+
 def _fired_sweeper() -> None:
     """L1: очистка истёкших claim'ов. L2 — постоянно, не трогаем."""
     while True:
@@ -847,9 +941,28 @@ def worker(coin: str, margin: float, t_start: float,
                 f"[{source}] {coin} | ордер за {BOLD}{open_ms:.0f}мс{RESET}{GREEN} | "
                 f"entry={entry_price} | amount={amount:.4f}"
             ))
+            # Health: латентность сигнал→ордер по источнику (видно кто медленный).
+            _hstat("latency", f"{source}→order", open_ms)
             # FIX-PERF: tg_log теперь fire-and-forget (см. tg/tg_logger.py) —
             # возвращается за ~10мкс, реальный HTTP уходит в фоне.
-            tg_log(f"🟢 <b>LISTING LONG</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
+            # Информативный лог: источник, биржа исполнения, notional, маржа,
+            # попытка — по нему сразу видно ОТКУДА сигнал и КАК исполнился.
+            try:
+                from api.listing_api import _last_exchange as _lx
+                venue = _lx.get(coin, "bybit").upper()
+            except Exception:  # noqa: BLE001
+                venue = "?"
+            notional = entry_price * amount if (entry_price and amount) else 0.0
+            tg_log(
+                f"🟢 <b>LISTING LONG</b> <code>{coin}</code>\n"
+                f"📡 Источник: <b>{source}</b>\n"
+                f"🏦 Биржа: <b>{venue}</b>\n"
+                f"💵 Entry: <code>{entry_price}</code>\n"
+                f"📦 Объём: <code>{amount:.4f}</code> (~{notional:.1f} USDT)\n"
+                f"💰 Маржа: {margin:.1f} USDT\n"
+                f"⏱ Сигнал→ордер: <b>{open_ms:.0f}мс</b>"
+                + (f" (попытка {attempt})" if attempt > 1 else "")
+            )
 
             # FIX-PERF: bookkeeping ПОСЛЕ метрики и tg_log — не должен влиять
             # на «время от сигнала до ордера». _mark_opened теперь только
@@ -876,7 +989,12 @@ def worker(coin: str, margin: float, t_start: float,
                 time.sleep(0.05)
 
     log_err("WORKER", f"{coin}: все {retries} попытки провалились")
-    tg_log(f"⚠️Listing {coin}: все попытки провалились")
+    _hstat("error", f"{source}→order")
+    tg_log(
+        f"⚠️ <b>LISTING FAIL</b> <code>{coin}</code>\n"
+        f"📡 Источник: <b>{source}</b>\n"
+        f"❌ Все {retries} попытки провалились — позиция НЕ открыта"
+    )
 
 
 # ── FIX-batch-8: callback для Tree of Alpha WS ───────────────────
@@ -935,6 +1053,10 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None,
     """
     if t_start is None:
         t_start = time.perf_counter()
+
+    # Health: считаем приход сигнала от КАЖДОГО источника (не только
+    # first-wins) — видно кто реально приносит сигналы, кто молчит.
+    _hstat("signal", source)
 
     new_pairs = [c for c in pairs if _try_claim(c, source, exchange)]
     if not new_pairs:
@@ -1441,6 +1563,16 @@ def run_bithumb_announcement_poller() -> None:
 # ══════════════════════════════════════════════════════════════════
 UPBIT_ANNOUNCEMENT_URL = "https://api-manager.upbit.com/api/v1/announcements/{id}"
 
+# FIX (ресерч 2026-06): LIST endpoint — один запрос отдаёт N свежих нотисов
+# с title/category/listed_at/first_listed_at, отсортированных по id убыв.
+# Ловит ЛЮБЫЕ гэпы id мгновенно (id-increment lookahead их пропускал) и
+# даёт title сразу → не нужен per-id body GET для извлечения тикера.
+# category=trade фильтрует только торговые нотисы на стороне сервера.
+UPBIT_ANNOUNCEMENT_LIST_URL = (
+    "https://api-manager.upbit.com/api/v1/announcements"
+    "?os=web&page=1&per_page=5&category=trade"
+)
+
 # Стартовый id: захардкоден на дату коммита (2026-05-29, последний
 # известный id = 6255 — это листинг IO). На проде поллер быстро
 # доберётся до текущего за несколько итераций. Если id уже занят
@@ -1454,14 +1586,49 @@ UPBIT_ANNOUNCEMENT_POLL_INTERVAL = 0.15
 
 # Сколько id'ов вперёд пробовать за один тик (защита от прыжков id'ов
 # через служебные категории, которые мы пропускаем).
-UPBIT_ANNOUNCEMENT_LOOKAHEAD = 3
+# FIX (ресерч 2026-06): наблюдались реальные гэпы id до +14 (6248→6262).
+# lookahead=3 МОЛЧА пропускал листинги при таких прыжках — это потерянные
+# сделки, не латентность. Подняли до 15. Лишние probe идут только когда
+# реально есть новые id подряд (на холостом ходу — 1 probe + sleep).
+UPBIT_ANNOUNCEMENT_LOOKAHEAD = 15
 
 # Категории, которые ВЕДУТ к торговле. У Upbit поле "category" в JSON:
 # наблюдали "거래" для трейд-нотисов (включая листинги, делисты, изменения).
 _UPBIT_NOTICE_TRADE_CATEGORIES = {"거래"}
 
-# Те же корейские стопы, что и для Bithumb.
-_UPBIT_NOTICE_NEG_KEYWORDS = _BITHUMB_NOTICE_NEG_KEYWORDS
+# FIX (fake-long 2026-06-04, id=6258 SLX): инцидент.
+# Нотис "솔스티스(SLX) 신규 거래지원 안내 ... (거래지원 개시 시점 추가 변경 안내)"
+# был апдейтом времени старта уже анонсированного листинга — НЕ новым листингом.
+# Прошёл потому что "변경" (изменение) не было в негативном списке.
+#
+# Двухуровневая защита:
+#  1. NEG-список расширен словами update/reschedule/announce-ahead.
+#  2. Требуем ПОЗИТИВНЫЙ паттерн открытия торгов в title.
+#
+# Базовые стопы Bithumb (делист/пауза/тех.работы) + Upbit-специфика.
+_UPBIT_NOTICE_NEG_KEYWORDS = _BITHUMB_NOTICE_NEG_KEYWORDS + (
+    "변경",      # изменение (времени/условий) — апдейт, не листинг
+    "추가 변경",  # доп. изменение
+    "지연",      # задержка
+    "재공지",    # повторное уведомление
+    "예정",      # запланировано (анонс заранее, торги ещё не открыты)
+    "정정",      # исправление/корректировка
+)
+
+# FIX: позитивный паттерн — title ДОЛЖЕН содержать хотя бы одну из фраз,
+# означающих фактическое открытие торгов (а не анонс/изменение).
+# "거래지원 개시" = старт торговой поддержки; "신규 거래지원" = новая
+# торговая поддержка; "원화 마켓 추가"/"KRW 마켓" = добавление KRW-рынка.
+# (Полная таксономия уточняется по результатам research — это hotfix.)
+_UPBIT_NOTICE_POS_KEYWORDS = (
+    "거래지원 개시",
+    "신규 거래지원",
+    "원화 마켓",
+    "거래 개시",
+    "디지털 자산 추가",   # FIX: "KRW 마켓 디지털 자산 추가" (IO id=6255) — реальный
+                          # листинг, отсекался по nopos. Латиница "KRW", не "원화".
+    "마켓 추가",          # "... 마켓 추가" — добавление рынка
+)
 
 _UPBIT_NOTICE_TICKER_RE = _BITHUMB_NOTICE_TICKER_RE
 _UPBIT_NOTICE_BANNED = _BITHUMB_NOTICE_BANNED
@@ -1470,32 +1637,90 @@ _UPBIT_NOTICE_BANNED = _BITHUMB_NOTICE_BANNED
 def _try_fetch_upbit_announcement(
     session: requests.Session,
     notice_id: int,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, bool]:
     """
-    Возвращает (title, category) если id существует и листинг,
-    или (None, None) если 404 / делист / служебное.
+    Возвращает (title, category, is_reannounce) если id существует,
+    или (None, None, False) если 404 / ошибка.
+
+    is_reannounce=True означает, что нотис — ПЕРЕанонс уже опубликованного
+    (listed_at != first_listed_at). Машиночитаемый признак апдейта/переноса
+    времени старта (язык-независимый, надёжнее корейских keyword'ов).
+    Подтверждено на проде: SLX(id=6258), TRAC, IRYS, UP2, B3 имели
+    listed_at != first_listed_at и НЕ были новыми листингами; реальные
+    листинги IO/VVV/PROS имели listed_at == first_listed_at.
     """
     try:
         url = UPBIT_ANNOUNCEMENT_URL.format(id=notice_id)
         resp = session.get(url, timeout=2)
         if resp.status_code == 404:
-            return None, None
+            return None, None, False
+        # FIX (ресерч): api-manager за Cloudflare. При троттле он отдаёт
+        # 429/503 ИЛИ статус 200 с HTML-телом "error code: 1015" (НЕ JSON).
+        # Раньше _json_loads на таком теле бросал → except → (None,None,False),
+        # что неотличимо от 404 «нет нотиса» → СЛЕПОЕ ПЯТНО в секунды листинга.
+        # Теперь детектим явно и логируем (round-robin прокси сменит IP).
+        if resp.status_code in (429, 503) or b"error code: 1015" in resp.content[:200]:
+            log_warn("UPBIT-NOTICE", f"throttle (CF 1015/{resp.status_code}) id={notice_id} — смена IP на след. probe")
+            _hstat("throttle", "UPBIT-NOTICE")
+            return None, None, False
         resp.raise_for_status()
         data = _json_loads(resp.content)
     except Exception:
-        return None, None
+        return None, None, False
 
     if not isinstance(data, dict) or not data.get("success"):
-        return None, None
+        return None, None, False
     payload = data.get("data") or {}
     title = payload.get("title") or ""
     category = payload.get("category") or ""
-    return title, category
+    # listed_at != first_listed_at → нотис переанонсирован (апдейт времени).
+    listed_at = payload.get("listed_at")
+    first_listed_at = payload.get("first_listed_at")
+    is_reannounce = bool(listed_at and first_listed_at and listed_at != first_listed_at)
+    return title, category, is_reannounce
+
+
+def _fetch_upbit_list(session: requests.Session) -> list[dict] | None:
+    """
+    LIST endpoint: возвращает список свежих trade-нотисов (id убыв.) или None
+    при ошибке/троттле. Каждый элемент: {id, title, category, is_reannounce}.
+    Один запрос вместо id-increment — ловит гэпы id, даёт title сразу.
+    """
+    try:
+        resp = session.get(UPBIT_ANNOUNCEMENT_LIST_URL, timeout=2)
+        if resp.status_code in (429, 503) or b"error code: 1015" in resp.content[:200]:
+            log_warn("UPBIT-NOTICE", f"LIST throttle (CF 1015/{resp.status_code}) — смена IP")
+            _hstat("throttle", "UPBIT-NOTICE")
+            return None
+        resp.raise_for_status()
+        data = _json_loads(resp.content)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict) or not data.get("success"):
+        return None
+    notices = ((data.get("data") or {}).get("notices")) or []
+    out: list[dict] = []
+    for n in notices:
+        if not isinstance(n, dict):
+            continue
+        nid = n.get("id")
+        if nid is None:
+            continue
+        la = n.get("listed_at")
+        fl = n.get("first_listed_at")
+        out.append({
+            "id": int(nid),
+            "title": n.get("title") or "",
+            "category": n.get("category") or "",
+            "is_reannounce": bool(la and fl and la != fl),
+        })
+    return out
 
 
 def _upbit_id_exists(session: requests.Session, notice_id: int) -> bool:
     """True если /announcements/{id} вернул success=true (что угодно)."""
-    title, _ = _try_fetch_upbit_announcement(session, notice_id)
+    title, _, _ = _try_fetch_upbit_announcement(session, notice_id)
     return title is not None
 
 
@@ -1559,6 +1784,46 @@ def _discover_upbit_max_id(session: requests.Session) -> int:
     return lo + 1
 
 
+def _handle_upbit_notice(nid: int, title: str, category: str,
+                         is_reannounce: bool, t_start: float) -> bool:
+    """
+    Общий фильтр+fire для одного Upbit-нотиса (LIST и id-increment делят).
+    Возвращает True если выстрелили (передали в process_signal).
+    Порядок: reannounce → category → neg → pos → извлечь тикеры.
+    """
+    if is_reannounce:
+        log_info("UPBIT-NOTICE", f"skip id={nid} reannounce (listed_at≠first) | {title[:55]}")
+        return False
+    if category not in _UPBIT_NOTICE_TRADE_CATEGORIES:
+        log_info("UPBIT-NOTICE", f"skip id={nid} cat={category} | {title[:60]}")
+        return False
+    neg_hit = next((kw for kw in _UPBIT_NOTICE_NEG_KEYWORDS if kw in title), None)
+    if neg_hit:
+        log_info("UPBIT-NOTICE", f"skip id={nid} neg='{neg_hit}' | {title[:60]}")
+        return False
+    if not any(kw in title for kw in _UPBIT_NOTICE_POS_KEYWORDS):
+        log_info("UPBIT-NOTICE", f"skip id={nid} no-pos-kw | {title[:60]}")
+        return False
+
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for tok in _UPBIT_NOTICE_TICKER_RE.findall(title):
+        t = tok.upper()
+        if t in _UPBIT_NOTICE_BANNED or t in seen:
+            continue
+        seen.add(t)
+        tickers.append(t)
+    if not tickers:
+        log_warn("UPBIT-NOTICE", f"id={nid} нет тикеров в title | {title[:80]}")
+        return False
+
+    fetch_ms = (time.perf_counter() - t_start) * 1000
+    log_ok("UPBIT-NOTICE", f"LISTING id={nid} {tickers} ({fetch_ms:.0f}мс) | {title[:80]}")
+    _hstat("latency", "UPBIT-NOTICE→detect", fetch_ms)
+    process_signal(tickers, "UPBIT-NOTICE", t_start=t_start)
+    return True
+
+
 def run_upbit_announcement_poller() -> None:
     # FIX-LATENCY (Patch #2): proxy pool round-robin вместо одной session.
     pool_size = len(_LISTING_PROXY_POOL)
@@ -1580,58 +1845,45 @@ def run_upbit_announcement_poller() -> None:
         f"Старт с id={next_id} (poll {UPBIT_ANNOUNCEMENT_POLL_INTERVAL*1000:.0f}мс, pool={pool_size})",
     )
 
+    # last_seen_id — наибольший обработанный id. Стартуем на (next_id - 1),
+    # т.к. next_id это «первый ещё не виденный».
+    last_seen_id = next_id - 1
+
     while True:
         try:
+            t_send = time.perf_counter()
+            # ── ПЕРВИЧНО: LIST-poll. Один запрос отдаёт свежие нотисы с
+            # title сразу. Ловит ЛЮБЫЕ гэпы id (id-increment их пропускал).
+            notices = _fetch_upbit_list(_next_listing_session())
+
+            if notices is not None:
+                # Новые = id > last_seen_id. Обрабатываем в порядке возр. id.
+                fresh = sorted((n for n in notices if n["id"] > last_seen_id),
+                               key=lambda n: n["id"])
+                for n in fresh:
+                    _handle_upbit_notice(n["id"], n["title"], n["category"],
+                                         n["is_reannounce"], t_send)
+                    last_seen_id = max(last_seen_id, n["id"])
+                next_id = last_seen_id + 1
+                time.sleep(UPBIT_ANNOUNCEMENT_POLL_INTERVAL)
+                continue
+
+            # ── FALLBACK: LIST затроттлен/упал → id-increment probe
+            # (lookahead, как раньше). Гарантирует детект даже если LIST лёг.
             advanced = False
             for offset in range(UPBIT_ANNOUNCEMENT_LOOKAHEAD):
                 probe_id = next_id + offset
-                t_send = time.perf_counter()
-                # FIX-LATENCY: round-robin сессии на каждый probe.
-                title, category = _try_fetch_upbit_announcement(_next_listing_session(), probe_id)
-                t_recv = time.perf_counter()
-
+                t_probe = time.perf_counter()
+                title, category, is_reannounce = _try_fetch_upbit_announcement(
+                    _next_listing_session(), probe_id)
                 if title is None:
-                    # 404 — id ещё не выпущен. Без lookahead'а — стоп.
-                    if offset == 0:
-                        break
-                    continue
-
-                # id существует. Двигаемся вперёд независимо от того,
-                # листинг это или нет.
+                    break  # 404/throttle — дальше пусто (id монотонны)
                 next_id = probe_id + 1
+                last_seen_id = max(last_seen_id, probe_id)
                 advanced = True
-
-                # Фильтры: категория должна быть "거래", и title без
-                # негативных корейских ключей.
-                if category not in _UPBIT_NOTICE_TRADE_CATEGORIES:
-                    log_info("UPBIT-NOTICE", f"skip id={probe_id} cat={category} | {title[:60]}")
-                    continue
-                if any(kw in title for kw in _UPBIT_NOTICE_NEG_KEYWORDS):
-                    log_info("UPBIT-NOTICE", f"skip id={probe_id} negative | {title[:60]}")
-                    continue
-
-                tickers: list[str] = []
-                seen: set[str] = set()
-                for tok in _UPBIT_NOTICE_TICKER_RE.findall(title):
-                    t = tok.upper()
-                    if t in _UPBIT_NOTICE_BANNED or t in seen:
-                        continue
-                    seen.add(t)
-                    tickers.append(t)
-
-                if not tickers:
-                    log_warn("UPBIT-NOTICE", f"id={probe_id} нет тикеров в title | {title[:80]}")
-                    continue
-
-                fetch_ms = (t_recv - t_send) * 1000
-                log_ok(
-                    "UPBIT-NOTICE",
-                    f"LISTING id={probe_id} {tickers} ({fetch_ms:.0f}мс) | {title[:80]}",
-                )
-                process_signal(tickers, "UPBIT-NOTICE", t_start=t_send)
+                _handle_upbit_notice(probe_id, title, category, is_reannounce, t_probe)
 
             if not advanced:
-                # Не нашли новых id — обычная пауза.
                 time.sleep(UPBIT_ANNOUNCEMENT_POLL_INTERVAL)
 
         except Exception as e:
@@ -1661,7 +1913,7 @@ BINANCE_NOTICE_CATALOG_ID = 48
 # REST API с лимитом 1200 req/min!), особенно жёсткий к datacenter-IP.
 # Тот же урок уже закодирован в parser_delist.py: безопасно ~3с = ~20 req/min.
 # Env BINANCE_NOTICE_POLL_INTERVAL=Xс позволяет тюнить без передеплоя.
-BINANCE_NOTICE_POLL_INTERVAL = float(os.getenv("BINANCE_NOTICE_POLL_INTERVAL", "3.0"))
+BINANCE_NOTICE_POLL_INTERVAL = float(os.getenv("BINANCE_NOTICE_POLL_INTERVAL", "5.0"))
 # Анти-стадо: ±jitter к каждому sleep, размывает пики req/с на стороне Binance.
 BINANCE_NOTICE_JITTER = 0.10
 # При HTTP 429 — длинная пауза, иначе долбёжка каждые 3с держит бан живым
@@ -1826,6 +2078,7 @@ def run_binance_announcement_poller() -> None:
             # поэтому отступаем надолго — даём WAF разбаниться.
             if resp.status_code == 429:
                 ban_streak += 1
+                _hstat("throttle", "BINANCE-NOTICE")
                 # Адаптивно растим базовый интервал (+STEP%) до потолка MAX.
                 cur_interval = min(cur_interval * (1 + BINANCE_NOTICE_INTERVAL_STEP),
                                    BINANCE_NOTICE_INTERVAL_MAX)
@@ -1848,10 +2101,17 @@ def run_binance_announcement_poller() -> None:
             resp.raise_for_status()
             t_recv = time.perf_counter()
 
-            # Успех — сбрасываем бан-стейт к базовым значениям.
-            if ban_streak or cur_interval != BINANCE_NOTICE_POLL_INTERVAL:
-                ban_streak = 0
-                cur_interval = BINANCE_NOTICE_POLL_INTERVAL
+            # FIX (429-пила): НЕ сбрасываем интервал на одном успехе — иначе
+            # success → cur_interval=3.0с → снова 429 → backoff → success →
+            # ... бесконечная пила (видно в логах: 429 каждые ~минуту).
+            # Вместо этого плавный decay (−10% за успех) до базового потолка,
+            # и сброс ban_streak только после ПОДРЯД успехов. Так интервал,
+            # выросший из-за банов, опускается медленно и находит равновесие
+            # выше «банящего» 3.0с.
+            ban_streak = 0
+            if cur_interval > BINANCE_NOTICE_POLL_INTERVAL:
+                cur_interval = max(BINANCE_NOTICE_POLL_INTERVAL,
+                                   cur_interval * 0.90)
 
             data = _json_loads(resp.content)
             if data.get("code") != "000000":
@@ -2149,6 +2409,32 @@ if __name__ == "__main__":
     else:
         log_info("PROXY", "LISTING_PROXIES пуст — поллеры на прямом подключении (default intervals)")
 
+    # FIX (регресс): запускаем фоновый connect+auth Bybit WS Trade ДО
+    # блокирующего прогрева notice-сессий, чтобы WS-handshake (manager-thread)
+    # шёл ПАРАЛЛЕЛЬНО с прогревом (~4с полезной работы). К моменту is_ready
+    # ниже соединение уже почти готово — больше не упираемся в дедлайн.
+    _pre_sync_inst = None
+    _pre_async_inst = None
+    if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
+        try:
+            if BYBIT_SYNC_WS_ENABLED:
+                from api import bybit_sync_ws_trade as _sync_mod
+                _pre_sync_inst = _sync_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+            from api.bybit_ws_trade import init as _bybit_ws_init
+            _pre_async_inst = _bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+        except Exception as e:  # noqa: BLE001
+            log_warn("PARSER", f"Bybit WS pre-init упал: {e!r} — init произойдёт ниже")
+            _pre_sync_inst = None
+            _pre_async_inst = None
+
+    # FIX-LATENCY: прогрев notice-сессий — устанавливаем TCP+TLS ко всем
+    # трём endpoint'ам ЗАРАНЕЕ, параллельно. Без этого ПЕРВЫЙ боевой запрос
+    # к Upbit/Bithumb/Binance ест cold-TLS handshake (несколько RTT до
+    # Сеула = 300-500мс, видно в логах: discovery 1463мс). Прогретые
+    # сессии переиспользуют соединение (keep-alive adapter) → первый
+    # реальный листинг ловится на тёплом сокете.
+    _warmup_listing_sessions()
+
     # FIX-batch-5: Bybit V5 WS Trade — persistent connection для ордеров.
     if BYBIT_WS_TRADE_ENABLED and BYBIT_API_KEY and BYBIT_SECRET_KEY:
         # FIX-PERF: пробуем сначала SYNC вариант (api/bybit_sync_ws_trade.py).
@@ -2161,7 +2447,11 @@ if __name__ == "__main__":
                 from api import bybit_sync_ws_trade as _sync_mod
                 from api.bybit_ws_trade import use_sync_ws
                 sync_inst = _sync_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
-                if sync_inst.is_ready(wait_sec=3.0):
+                # FIX (регресс «SYNC WS не подключился за 3с»): cold WS+TLS
+                # handshake до Bybit из SG иногда >3с (auth OK приходил уже
+                # ПОСЛЕ дедлайна → fallback на REST на весь сеанс). WS Trade —
+                # критичный hot-path (−15-30мс/ордер), ждём дольше: 8с.
+                if sync_inst.is_ready(wait_sec=8.0):
                     sync_warm = sync_inst.warmup()
                     use_sync_ws(sync_inst)
                     _sync_mod.start_periodic_warmup()
@@ -2169,7 +2459,7 @@ if __name__ == "__main__":
                     suffix = "+ прогрет" if sync_warm else "(warmup не прошёл)"
                     log_ok("PARSER", f"Bybit SYNC WS Trade готов {suffix} ✓ (no cross-thread)")
                 else:
-                    log_warn("PARSER", "Bybit SYNC WS не подключился за 3с — fallback на async")
+                    log_warn("PARSER", "Bybit SYNC WS не подключился за 8с — fallback на async")
             except Exception as e:
                 log_warn("PARSER", f"Bybit SYNC WS init упал: {e!r} — fallback на async")
 
@@ -2178,7 +2468,11 @@ if __name__ == "__main__":
         try:
             from api.bybit_ws_trade import init as bybit_ws_init, start_periodic_warmup
             inst = bybit_ws_init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
-            if inst.is_ready(wait_sec=3.0):
+            # FIX (регресс): если sync уже основной — async лишь fallback,
+            # не блокируем boot надолго (1с). Если sync НЕ готов — async
+            # становится основным hot-path, ждём полноценные 8с (cold WS+TLS).
+            _async_wait = 1.0 if sync_ready else 8.0
+            if inst.is_ready(wait_sec=_async_wait):
                 if not sync_ready:
                     # Async — основной hot-path. Прогреваем как раньше.
                     if inst.warmup():
@@ -2189,7 +2483,7 @@ if __name__ == "__main__":
                 else:
                     log_ok("PARSER", "Bybit ASYNC WS готов (резерв на случай sync-disconnect)")
             else:
-                log_warn("PARSER", "Bybit ASYNC WS не подключился за 3с — fallback на REST")
+                log_warn("PARSER", "Bybit ASYNC WS не подключился за 8с — fallback на REST")
         except Exception as e:
             log_err("PARSER", f"Bybit ASYNC WS init упал: {e!r} — будет REST")
     else:
@@ -2299,6 +2593,17 @@ if __name__ == "__main__":
     ).start()
     log_ok("STATS", "source-first телеметрия активна (persist 5мин, summary 6ч)")
 
+    # Health-stats: персистентность + периодический TG-отчёт «слабые места».
+    if _health is not None:
+        threading.Thread(
+            target=_health.persist_loop, kwargs={"batch_sec": 300.0},
+            daemon=True, name="health-persist",
+        ).start()
+        threading.Thread(
+            target=_health_report_loop, daemon=True, name="health-report",
+        ).start()
+        log_ok("HEALTH", "диагностика слабых мест активна (TG-отчёт каждые 6ч)")
+
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:
         try:
@@ -2326,7 +2631,11 @@ if __name__ == "__main__":
                 process_signal(tickers, source, t_start=t_start)
             threading.Thread(
                 target=run_seoul_relay_listener,
-                kwargs={"url": SEOUL_RELAY_URL, "listing_callback": _on_seoul_listing},
+                kwargs={
+                    "url": SEOUL_RELAY_URL,
+                    "listing_callback": _on_seoul_listing,
+                    "on_disconnect": lambda: _hstat("disconnect", "SEOUL-RELAY"),
+                },
                 daemon=True,
                 name="seoul-relay-rx",
             ).start()
