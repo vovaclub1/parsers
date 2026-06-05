@@ -526,7 +526,10 @@ def _run_trailing_stop(ticker: str, entry_price: float, contracts: int, trail_pc
     contract  = f"{ticker}_USDT"
     max_price = entry_price
     started   = time.monotonic()
-    last_check = 0.0
+    last_check = time.monotonic()   # FIX: НЕ 0.0 — иначе первая итерация (t=1с)
+                                    # сразу триггерит position-check до того как
+                                    # Gate API увидит свежую позицию (race).
+    zero_reads = 0                  # FIX: 2 подряд нуля прежде чем выйти.
 
     print(
         f"{_tag('GATE TRAIL', MAGENTA)} {BOLD}{ticker}{RESET} | "
@@ -541,12 +544,19 @@ def _run_trailing_stop(ticker: str, entry_price: float, contracts: int, trail_pc
             print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | таймаут {_TRAILING_MAX_LIFETIME}с, выход")
             return
 
-        # FIX: каждую минуту проверяем что позиция ещё жива (биржа могла закрыть по SL)
-        if time.monotonic() - last_check > 60:
+        # FIX 2026-06-06: grace 15с (position-API Gate отстаёт 2-5с после IOC) +
+        # 2 подряд нулевых чтения. Без этого первая же проверка читала 0 (позиция
+        # ещё не осела в API) → трейлинг умирал сразу после открытия.
+        if (time.monotonic() - started > 15
+                and time.monotonic() - last_check > 60):
             last_check = time.monotonic()
             if _gate_position_size(contract) == 0:
-                print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | позиция уже закрыта, выход")
-                return
+                zero_reads += 1
+                if zero_reads >= 2:
+                    print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | позиция закрыта (2 чтения), выход")
+                    return
+            else:
+                zero_reads = 0
 
         price = gate_get_price(ticker)
         if not price:
@@ -591,23 +601,93 @@ def gate_start_trailing(ticker: str, entry_price: float, contracts: int, trail_p
     ).start()
 
 
+def _run_trailing_stop_short(ticker: str, entry_price: float, contracts: int,
+                             trail_pct: float = 0.005) -> None:
+    """
+    Фоновый trailing stop для ШОРТ позиции (зеркало _run_trailing_stop).
+    Отслеживает МИНИМУМ цены (профит шорта при падении); закрывает позицию
+    покупкой если цена откатила вверх на trail_pct от достигнутого минимума.
+    """
+    contract  = f"{ticker}_USDT"
+    min_price = entry_price
+    started   = time.monotonic()
+    last_check = time.monotonic()   # FIX: см. _run_trailing_stop — не 0.0.
+    zero_reads = 0
+
+    print(
+        f"{_tag('GATE TRAIL', MAGENTA)} {BOLD}{ticker}{RESET} | "
+        f"старт SHORT trailing {trail_pct*100:.1f}% | "
+        f"contracts={contracts} | entry={entry_price:.6f}"
+    )
+
+    while True:
+        time.sleep(1)
+        if time.monotonic() - started > _TRAILING_MAX_LIFETIME:
+            print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | таймаут {_TRAILING_MAX_LIFETIME}с, выход")
+            return
+        # FIX 2026-06-06: grace 15с + 2 подряд нуля (Gate position-API лаг).
+        if (time.monotonic() - started > 15
+                and time.monotonic() - last_check > 60):
+            last_check = time.monotonic()
+            if _gate_position_size(contract) == 0:
+                zero_reads += 1
+                if zero_reads >= 2:
+                    print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | позиция закрыта (2 чтения), выход")
+                    return
+            else:
+                zero_reads = 0
+        price = gate_get_price(ticker)
+        if not price:
+            continue
+        if price < min_price:
+            min_price = price
+        stop_price = min_price * (1 + trail_pct)
+        if price >= stop_price:
+            print(
+                f"{_tag('GATE TRAIL HIT', RED)} {BOLD}{ticker}{RESET} | "
+                f"цена={price:.6f} ≥ стоп={stop_price:.6f} | мин был={min_price:.6f}"
+            )
+            try:
+                # Закрытие шорта = покупка (положительный size).
+                _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
+                    "contract":    contract,
+                    "size":        int(abs(contracts)),
+                    "price":       "0",
+                    "tif":         "ioc",
+                    "reduce_only": True,
+                })
+                print(
+                    f"{_tag('GATE TRAIL CLOSED', GREEN)} {BOLD}{ticker}{RESET} | "
+                    f"{contracts} контрактов закрыто по ~{price:.6f}"
+                )
+            except Exception as e:
+                print(f"{_tag('GATE TRAIL ERR', RED)} {ticker}: {e}")
+            return
+
+
+def gate_start_trailing_short(ticker: str, entry_price: float, contracts: int,
+                              trail_pct: float = 0.005) -> None:
+    """Запускает SHORT trailing stop в daemon-потоке."""
+    threading.Thread(
+        target=_run_trailing_stop_short,
+        args=(ticker, entry_price, int(contracts), trail_pct),
+        daemon=True,
+        name=f"trail-short-{ticker}",
+    ).start()
+
+
 # ── TP/SL для лонга на Gate.io ────────────────────────────────────
 
 def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет:
-      - SL  -8%   на 100% позиции (через price_order)
-      - TP1 +5.5% на 30%  позиции (через price_order)
-      - Trailing 6% на оставшиеся 70% (через поллинг-поток)
+    FIX 2026-06-04: новая стратегия — только SL -1% + trailing 1% на всю
+    позицию. Фиксированный TP убран (синхрон с Bybit listing_api).
+      - SL  -1%  на 100% позиции (price_order reduce-only)
+      - Trailing 1% на 100% позиции (через поллинг-поток _run_trailing_stop)
     """
     contract = f"{ticker}_USDT"
-
-    sl  = round(entry_price * 0.92, 8)   # -8%
-    tp1 = round(entry_price * 1.055, 8)  # +5.5%
-
-    sl_contracts  = int(amount)
-    tp1_contracts = max(1, int(amount * 0.30))
-    tail_contracts = max(0, sl_contracts - tp1_contracts)
+    sl = round(entry_price * 0.99, 8)   # -1%
+    sl_contracts = int(amount)
 
     def _place_price_order(trigger: float, order_price: float, size: int, label: str) -> None:
         try:
@@ -645,16 +725,15 @@ def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
             else:
                 print(f"{_tag('GATE TP/SL ERR', RED)} {ticker} [{label}]: {e}")
 
-    _place_price_order(sl, sl, sl_contracts, "SL -8%")
-    _place_price_order(tp1, tp1, tp1_contracts, "TP1 +5.5%")
+    _place_price_order(sl, sl, sl_contracts, "SL -1%")
 
-    if tail_contracts > 0:
-        gate_start_trailing(ticker, entry_price, tail_contracts, trail_pct=0.06)
+    # Trailing 1% на всю позицию (поллинг-поток).
+    if sl_contracts > 0:
+        gate_start_trailing(ticker, entry_price, sl_contracts, trail_pct=0.01)
 
     print(
         f"{_tag('GATE TP/SL SET', CYAN)} {BOLD}{ticker}{RESET} | "
-        f"SL={sl}(-8%/100%) | TP1={tp1}(+5.5%/30%) | "
-        f"Trailing=6%(70%/{tail_contracts}контр)"
+        f"SL={sl}(-1%/100%) | Trailing=1%(100%/{sl_contracts}контр)"
     )
     return "Gate TP/SL выставлен"
 
@@ -663,33 +742,22 @@ def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
 
 def gate_set_tp_sl_short(ticker: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет для шорт-позиции на Gate.io:
-      - SL  +5%   на 100% позиции
-      - TP1 -8%   на 20%  позиции
-      - TP2 -15%  на 30%  позиции
-      - TP3 -45%  на 50%  позиции
-    Для шорта: TP ниже цены входа, SL выше.
+    FIX 2026-06-04: новая стратегия делиста — SL +1% + trailing 0.5% на всю
+    позицию (синхрон с Bybit delist_api). Фиксированные TP убраны.
+      - SL +1% на 100% позиции (price_order reduce-only, закрытие = покупка)
+      - Trailing 0.5% на 100% (поллинг-поток _run_trailing_stop_short)
+    Для шорта: SL выше входа, профит когда цена падает.
     """
     contract = f"{ticker}_USDT"
-
-    sl  = round(entry_price * 1.05, 8)   # +5%  — стоп выше входа
-    tp1 = round(entry_price * 0.92, 8)   # -8%
-    tp2 = round(entry_price * 0.85, 8)   # -15%
-    tp3 = round(entry_price * 0.55, 8)   # -45%
-
-    tp1_contracts = max(1, int(amount * 0.20))
-    tp2_contracts = max(1, int(amount * 0.30))
-    tp3_contracts = max(1, int(amount * 0.50))
-    sl_contracts  = int(amount)
+    sl = round(entry_price * 1.01, 8)   # +1% — стоп выше входа
+    sl_contracts = int(amount)
 
     def _place(trigger: float, order_price: float, size: int, label: str) -> None:
         try:
             price_str   = _gate_round_price(ticker, order_price)
             trigger_str = _gate_round_price(ticker, trigger)
-            # Для шорта: закрытие = покупка (положительный size).
-            # rule 1 = цена >= триггер (SL для шорта),
-            # rule 2 = цена <= триггер (TP для шорта).
-            rule = 1 if order_price >= entry_price else 2
+            # Для шорта закрытие = покупка (положительный size).
+            # rule 1 = цена >= триггер (SL для шорта).
             _post_signed(f"/api/v4/futures/{_SETTLE}/price_orders", {
                 "initial": {
                     "contract":    contract,
@@ -702,26 +770,24 @@ def gate_set_tp_sl_short(ticker: str, entry_price: float, amount: float) -> str:
                     "strategy_type": 0,
                     "price_type":    0,
                     "price":         trigger_str,
-                    "rule":          rule,
+                    "rule":          1,
                 },
             })
-            color = RED if order_price >= entry_price else GREEN
             print(
-                f"{_tag('GATE ORDER', color)} {ticker} | "
+                f"{_tag('GATE ORDER', RED)} {ticker} | "
                 f"{label} → trigger={trigger_str} | size={size} контрактов"
             )
         except Exception as e:
             print(f"{_tag('GATE TP/SL ERR', RED)} {ticker} [{label}]: {e}")
 
-    _place(sl,  sl,  sl_contracts,  "SL  +5%")
-    _place(tp1, tp1, tp1_contracts, "TP1 -8%")
-    _place(tp2, tp2, tp2_contracts, "TP2 -15%")
-    _place(tp3, tp3, tp3_contracts, "TP3 -45%")
+    _place(sl, sl, sl_contracts, "SL +1%")
+
+    if sl_contracts > 0:
+        gate_start_trailing_short(ticker, entry_price, sl_contracts, trail_pct=0.005)
 
     print(
         f"{_tag('GATE TP/SL SHORT', CYAN)} {BOLD}{ticker}{RESET} | "
-        f"SL={sl}(+5%) | TP1={tp1}(-8%/20%) | "
-        f"TP2={tp2}(-15%/30%) | TP3={tp3}(-45%/50%)"
+        f"SL={sl}(+1%/100%) | Trailing=0.5%(100%/{sl_contracts}контр)"
     )
     return "Gate TP/SL SHORT выставлен"
 

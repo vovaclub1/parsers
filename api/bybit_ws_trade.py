@@ -668,6 +668,29 @@ def place_order_ws_fast(args: dict, _warmup_mode: bool = False) -> dict | None:
     return inst.place_order_fast(args)
 
 
+def place_order_ws_ack(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
+    """
+    FIX 2026-06-05: ack-waiting вариант с той же sync→async маршрутизацией,
+    что place_order_ws_fast. Нужен для ретраев на 30208 (price-cap): caller
+    должен ЗНАТЬ retCode, чтобы решить ретраить или нет.
+
+    Возврат:
+      dict с retCode (0=ok, !=0=reject) — ack от Bybit получен.
+      None — WS не подключён / таймаут ack → caller делает REST fallback.
+    """
+    sync = _sync_preferred
+    if sync is not None and sync.is_ready():
+        result = sync.place_order(args, timeout=timeout)
+        if result is not None:
+            return result
+        # sync вернул None (transport/таймаут) — пробуем async.
+
+    inst = _global_instance
+    if inst is None:
+        return None
+    return inst.place_order(args, timeout=timeout)
+
+
 # ── периодический прогрев hot-path ────────────────────────────────
 # Один прогрев на старте недостаточен: если первый листинг прилетит
 # через 30+ минут, asyncio _ready cache, PEP-659 inline caches и

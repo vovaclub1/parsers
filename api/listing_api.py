@@ -5,12 +5,15 @@ from __future__ import annotations
 # Если токена нет на Bybit — открываем на Gate.io.
 # ─────────────────────────────────────────────────────────────────
 
+import os
 import re
 import threading
+import time
 
 from api.delist_api import (
     _post,
     _post_http2,             # FIX: HTTP/2 client для background TP/SL
+    _trading_stop_settle,    # FIX 2026-06-06: ретрай trading-stop на осёдку
     post_order,              # FIX-10: публичный алиас вместо _post_order
     new_order_link_id,       # FIX-10: публичный алиас вместо _new_order_link_id
     _get_qty_step,
@@ -35,14 +38,21 @@ from api.gate_api import (
 )
 
 # FIX: вынесли импорт из хот-функции market_open_long на модульный уровень.
-# FIX-PERF: используем fire-and-forget вариант (place_order_ws_fast) — не
-# ждём 70-100мс RTT до Bybit на ack. Send возвращает за ~1-5мс, reject
-# логируется в фоне через _watch_ack в bybit_ws_trade.
+# FIX 2026-06-05: перешли с fire-and-forget на ack-вариант — нужно знать
+# retCode для ретраев на 30208 (price-cap на быстром листинге). _ws_place_order_ack
+# ждёт ack (~10-70мс RTT), но это цена за точность: иначе отвергнутые ордера
+# логировались как успешные и позиция по факту не открывалась.
 try:
-    from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
+    from api.bybit_ws_trade import (
+        place_order_ws_fast as _ws_place_order,
+        place_order_ws_ack as _ws_place_order_ack,
+        WSOrderRejected,
+    )
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict, _warmup_mode: bool = False) -> dict | None:  # type: ignore[misc]
+        return None
+    def _ws_place_order_ack(args: dict, timeout: float = 1.5) -> dict | None:  # type: ignore[misc]
         return None
     class WSOrderRejected(Exception):  # type: ignore[no-redef]
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
@@ -64,15 +74,28 @@ __all__ = [
 ]
 
 
-# ── Параметры TP/SL (FIX review M11: вынесены из inline-магии) ────
-# Используются и в market_open_long (failsafe SL+TP1 в order.create),
-# и в _set_tp_sl_bybit (trailing) — держим в одном месте, чтобы значения
-# не разъезжались между двумя путями.
-_SL_MULT       = 0.92    # стоп-лосс: -8% от entry
-_TP1_MULT      = 1.045   # тейк-1: +4.5% от entry
-_TP1_FRACTION  = 0.30    # доля позиции на TP1 (остальное под trailing)
-_TRAIL_PCT     = 0.035   # трейлинг-дистанция: 3.5%
-_TRAIL_ACT     = 1.035   # активация трейлинга: +3.5% от entry
+# ── Параметры TP/SL (FIX 2026-06-04: новая стратегия) ────────────
+# Диагностика closed-pnl/execution-list показала: связка takeProfit +
+# trailingStop + tpslMode:Partial в одном /v5/position/trading-stop почти
+# не срабатывала (14 закрытий, только 1 через PartialTakeProfit, остальные
+# UNKNOWN = ручное закрытие). Новая схема: ТОЛЬКО trailing в Full-режиме,
+# без фиксированного TP. Все стопы максимум 1%.
+_SL_MULT       = 0.99    # стоп-лосс: -1% от entry (было -8%)
+_TRAIL_PCT     = 0.01    # трейлинг-дистанция: 1% (было 3.5%)
+_TRAIL_ACT     = 1.01    # активация трейлинга: +1% от entry (было +3.5%)
+# Robinhood time-based exit (см. set_robinhood_exit).
+_RH_BE_MULT    = 1.002   # стоп в БУ после первого тейка: entry + 0.2%
+_RH_FRACTION   = 0.30    # доля на каждый из первых двух партиалов
+_RH_T1_SEC     = 25      # первый партиал (30%) — t+25с
+_RH_T2_SEC     = 180     # второй партиал (30%) — t+3мин
+_RH_T3_SEC     = 900     # остаток (40%) — t+15мин
+
+# FIX 2026-06-05: ретраи на price-cap reject (30208 "order price higher than
+# maximum buying price") — на быстром листинге цена уходит за cap Bybit.
+# 10 попыток × ~7мс. Заходим всегда (без лимита проскальзывания, по решению).
+_PRICE_CAP_RETCODES = {30208, 30209}  # 30208 buy-cap, 30209 sell-floor (шорт)
+_ORDER_RETRIES = int(os.getenv("LISTING_ORDER_RETRIES", "10"))
+_ORDER_RETRY_SLEEP = float(os.getenv("LISTING_ORDER_RETRY_MS", "7")) / 1000.0
 
 
 # ── Маржа ─────────────────────────────────────────────────────────
@@ -126,15 +149,14 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 # дубль с retCode 30050, защита от double-position при WS
                 # ack timeout (см. post_order в delist_api).
                 order_link_id = new_order_link_id()
-                # Bundle SL + TP1 в order.create — failsafe stop loss попадает
-                # на сервер в одной WS-фрейме с открытием, без зависимости от
+                # Bundle SL в order.create — failsafe stop loss попадает на
+                # сервер в одной WS-фрейме с открытием, без зависимости от
                 # отдельного /v5/position/trading-stop (который добавляет
                 # trailing уже в фоне). Если open-frame пройдёт, а trading-stop
                 # задержится — SL уже стоит. trailingStop в order.create
-                # Bybit'ом не поддерживается, поэтому ставится отдельно.
+                # Bybit'ом не поддерживается, ставится отдельно.
+                # FIX 2026-06-04: убран TP1 — стратегия теперь чистый trailing.
                 sl_price  = round(bybit_price * _SL_MULT, 8)
-                tp1_price = round(bybit_price * _TP1_MULT, 8)
-                tp1_qty   = _round_qty(amount_tokens * _TP1_FRACTION, step)
                 order_args = {
                     "category":    "linear",
                     "symbol":      symbol,
@@ -145,45 +167,46 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                     "orderLinkId": order_link_id,
                     "stopLoss":    str(sl_price),
                     "slTriggerBy": "LastPrice",
-                    "takeProfit":  str(tp1_price),
-                    "tpTriggerBy": "LastPrice",
-                    "tpslMode":    "Partial",
-                    "tpSize":      str(tp1_qty),
                 }
-                # FIX-PERF: WS Trade fire-and-forget (place_order_ws_fast).
-                # Возврат не-None означает «frame ушёл на провод»; ack от
-                # Bybit ждётся в фоне (см. _watch_ack). Reject логируется
-                # как [BYBIT-WS-FAST] REJECTED в stdout.
-                placed_via = "REST"
-                try:
-                    ws_ack = _ws_place_order(order_args)
-                except WSOrderRejected as e:
-                    # Защитный путь: fast-вариант не должен бросать reject
-                    # (он логирует асинхронно). Но если bybit_ws_trade не
-                    # подгрузился и упал на старую sync-обёртку — обрабатываем.
-                    print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
-                    return 0, 0
-                except Exception as e:  # noqa: BLE001
-                    print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
-                    ws_ack = None
+                # FIX 2026-06-05: ack-waiting + ретраи на 30208 (price-cap).
+                # Быстрые листинги: цена уходит за cap Bybit (30208), Market
+                # reject. Ретраим до _ORDER_RETRIES × _ORDER_RETRY_SLEEP.
+                # orderLinkId одинаков во всех попытках → идемпотентность.
+                success = False
+                for attempt in range(1, _ORDER_RETRIES + 1):
+                    ack = _ws_place_order_ack(order_args)
+                    if ack is None:
+                        # WS недоступен/таймаут ack → REST fallback один раз.
+                        post_order(symbol, "Buy", qty_str, 1,
+                                   order_link_id=order_link_id,
+                                   stop_loss=str(sl_price))
+                        success = True
+                        break
+                    rc = ack.get("retCode", -1)
+                    if rc == 0:
+                        success = True
+                        break
+                    if rc not in _PRICE_CAP_RETCODES:
+                        # Не price-cap reject (нет маржи, symbol not found
+                        # и т.д.) — ретраи бессмысленны, fail fast.
+                        print(
+                            f"[BYBIT-WS] REJECTED {symbol} retCode={rc} "
+                            f"retMsg={ack.get('retMsg','?')!r} — fail fast",
+                            flush=True,
+                        )
+                        return 0, 0
+                    if attempt < _ORDER_RETRIES:
+                        time.sleep(_ORDER_RETRY_SLEEP)
 
-                if ws_ack is None:
-                    # FIX-batch-8 #5: fast-path post_order вместо _post (f-string,
-                    # -2..-5мс) + тот же orderLinkId — idempotency.
-                    # M5: SL+TP1 летят в теле fallback-ордера (защита на филле).
-                    post_order(symbol, "Buy", qty_str, 1, order_link_id=order_link_id,
-                               stop_loss=str(sl_price), take_profit=str(tp1_price),
-                               tp_size=str(tp1_qty))
-                else:
-                    placed_via = "WS-FAST"
+                if not success:
+                    print(
+                        f"[BYBIT-WS] {symbol}: все {_ORDER_RETRIES} ретраев "
+                        f"на price-cap — не зашли", flush=True,
+                    )
+                    return 0, 0
 
                 with _last_exchange_lock:
                     _last_exchange[ticker_name] = "bybit"
-                # FIX-PERF: удалён print "[BYBIT LONG/{placed_via}] ..." — он
-                # стоял ПЕРЕД return и добавлял ~1мс к open_ms (PYTHONUNBUFFERED=1).
-                # WS-vs-REST на success-пути не информативен; на failure-пути
-                # bybit_ws_trade уже логирует "[BYBIT-WS-FAST] send failed/timeout".
-                # Worker сразу после return пишет [OPEN] с timing.
                 return amount_tokens, bybit_price
 
     # ── Gate.io fallback ─────────────────────────────────────────
@@ -249,8 +272,6 @@ def warmup_chain(n: int = 30) -> int:
             qty_str = str(amount_tokens)
             order_link_id = new_order_link_id()
             sl_price  = round(bybit_price * _SL_MULT, 8)
-            tp1_price = round(bybit_price * _TP1_MULT, 8)
-            tp1_qty   = _round_qty(amount_tokens * _TP1_FRACTION, step)
             order_args = {
                 "category":    "linear",
                 "symbol":      symbol,
@@ -261,10 +282,6 @@ def warmup_chain(n: int = 30) -> int:
                 "orderLinkId": order_link_id,
                 "stopLoss":    str(sl_price),
                 "slTriggerBy": "LastPrice",
-                "takeProfit":  str(tp1_price),
-                "tpTriggerBy": "LastPrice",
-                "tpslMode":    "Partial",
-                "tpSize":      str(tp1_qty),
             }
             # _warmup_mode=True → диверсия в cancel-fake. Никакого ордера.
             _ws_place_order(order_args, _warmup_mode=True)
@@ -279,14 +296,19 @@ def warmup_chain(n: int = 30) -> int:
 
 def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str:
     """
-    Добавляет trailing stop 3.5% на 70% позиции на Bybit. SL (-8%) и
-    TP1 (+4.5% на 30%) уже выставлены в момент открытия — они летят
-    в одном WS-фрейме с order.create (см. market_open_long). Эта функция
-    только добавляет trailing (Bybit не поддерживает trailingStop в
-    order.create — только через /v5/position/trading-stop).
+    Выставляет нативный trailing stop 1% + аварийный SL 1% на ВСЮ позицию
+    (Full-режим). Без фиксированного TP.
 
-    Если open прошёл через REST fallback и не нёс SL/TP — повторно
-    выставляем их через trading-stop здесь же (idempotent).
+    FIX 2026-06-04: старая схема (TP1 +4.5% на 30% + trailing на 70% в
+    tpslMode:Partial) на проде НЕ срабатывала — диагностика closed-pnl
+    показала закрытия через UNKNOWN, а не PartialTakeProfit/TrailingStop.
+    Bybit требует Full-режим для trailing на всю позицию (как на делисте).
+
+    Стратегия «поймать импульс листинга»:
+      - trailingStop 1% (тугой) — фиксируем максимум с пика
+      - activePrice = entry × 1.01 — активация после +1% в плюс
+      - аварийный SL = entry × 0.99 (-1%) — если цена сразу пошла против
+      - БЕЗ фиксированных TP — чистый трейлинг на всю позицию (Full)
     """
     symbol = f"{ticker_name}USDT"
 
@@ -296,34 +318,33 @@ def _set_tp_sl_bybit(ticker_name: str, entry_price: float, amount: float) -> str
         print(f"[TP/SL SKIP] {e}")
         return "skip"
 
-    sl  = round(entry_price * _SL_MULT, 8)
-    tp1 = round(entry_price * _TP1_MULT, 8)
+    sl = round(entry_price * _SL_MULT, 8)              # -1% аварийный стоп
+    trailing_distance = round(entry_price * _TRAIL_PCT, 8)  # 1% дистанция
+    active_price = round(entry_price * _TRAIL_ACT, 8)  # активация после +1%
 
-    tp1_size = str(_round_qty(amount * _TP1_FRACTION, step))  # 30% на TP1
+    sl_size = str(_round_qty(amount, step))            # вся позиция
+    if sl_size == "0.0" or float(sl_size) <= 0:
+        print(f"[TP/SL SKIP] {ticker_name}: slSize={sl_size} (amount={amount}, step={step}) — слишком мало")
+        return "skip"
 
-    # trailingStop = абсолютное расстояние в USDT от максимума до стопа.
-    # 3.5% — потуже чем было (5.5%), чтобы меньше отдавать с пика.
-    trailing_distance = round(entry_price * _TRAIL_PCT, 8)
-    # activePrice для лонга: активация когда цена поднимется на 3.5% (в плюс).
-    # Защита от входного шума — trailing не активен пока не зафиксируем профит.
-    active_price = round(entry_price * _TRAIL_ACT, 8)
-
-    _post_http2("/v5/position/trading-stop", {
+    # FIX 2026-06-06: через _trading_stop_settle — ретраи на 10001 (осёдка позиции).
+    _trading_stop_settle({
         "category":     "linear",
         "symbol":       symbol,
+        "positionIdx":  1,
         "stopLoss":     str(sl),
         "slTriggerBy":  "LastPrice",
-        "takeProfit":   str(tp1),
-        "tpTriggerBy":  "LastPrice",
+        "slSize":       sl_size,
         "trailingStop": str(trailing_distance),
-        "activePrice":  str(active_price),  # Активация после +3.5%
-        "tpslMode":     "Partial",
-        "tpSize":       tp1_size,
-        "positionIdx":  1,
-    })
+        "activePrice":  str(active_price),
+        # tpslMode не указываем → Full-режим (trailing на всю позицию)
+    }, tag=ticker_name)
 
-    print(f"[TP/SL SET LONG] {ticker_name} | SL={sl}(-8%) | TP1={tp1}(+4.5%/30%) | Trailing=3.5%(70%)")
-    return "Выставил цели (лонг)"
+    print(
+        f"[TP/SL SET LONG] {ticker_name} | entry={entry_price} | "
+        f"SL={sl}(-1%) | Trailing=1% (active@{active_price})"
+    )
+    return "Выставил trailing (лонг)"
 
 
 def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
@@ -349,6 +370,113 @@ def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
             f"биржей (позиции нет). ПРОВЕРЬ ПОЗИЦИЮ!"
         )
         return "error"
+
+
+# ── Robinhood time-based exit ─────────────────────────────────────
+# Robinhood-листинги закрываются НЕ по трейлингу, а по времени:
+#   t+25с  → 30% reduce-only + перенос SL остатка в БУ (entry × 1.002)
+#   t+180с → ещё 30% reduce-only
+#   t+900с → закрыть остаток (40%)
+# Сразу при открытии ставится только аварийный SL -1% (на всю позицию).
+
+def close_reduce_long(ticker_name: str, qty: float) -> bool:
+    """
+    Закрывает часть лонга reduce-only Market Sell на Bybit. positionIdx=1.
+    reduce_only гарантирует, что ордер только уменьшает позицию (не откроет
+    шорт, если qty случайно больше остатка). Возвращает True при отправке.
+    """
+    symbol = f"{ticker_name}USDT"
+    try:
+        step = _get_qty_step(symbol)
+        qty_r = _round_qty(qty, step)
+        if qty_r <= 0:
+            print(f"[RH-EXIT] {ticker_name}: qty={qty}→0 после округления, skip")
+            return False
+        post_order(symbol, "Sell", str(qty_r), 1,
+                   order_link_id=new_order_link_id(), reduce_only=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[RH-EXIT] {ticker_name}: reduce-only close упал: {e!r}")
+        return False
+
+
+def _set_sl_breakeven_long(ticker_name: str, entry_price: float) -> None:
+    """Переносит SL лонга в безубыток (entry × _RH_BE_MULT) на остаток позиции."""
+    symbol = f"{ticker_name}USDT"
+    be_price = round(entry_price * _RH_BE_MULT, 8)
+    try:
+        _post_http2("/v5/position/trading-stop", {
+            "category":    "linear",
+            "symbol":      symbol,
+            "positionIdx": 1,
+            "stopLoss":    str(be_price),
+            "slTriggerBy": "LastPrice",
+            # Full-режим: SL на всю оставшуюся позицию.
+        })
+        print(f"[RH-EXIT] {ticker_name}: SL → БУ {be_price} (entry+0.2%)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[RH-EXIT] {ticker_name}: перенос SL в БУ упал: {e!r}")
+
+
+def _robinhood_exit_scheduler(ticker_name: str, entry_price: float,
+                              amount: float) -> None:
+    """Фоновый планировщик партиалов Robinhood (запускается в отдельном потоке)."""
+    import time as _t
+    part = amount * _RH_FRACTION  # 30% на каждый из первых двух тейков
+    # t+25с: первый партиал 30% + SL остатка в БУ.
+    _t.sleep(_RH_T1_SEC)
+    if close_reduce_long(ticker_name, part):
+        _set_sl_breakeven_long(ticker_name, entry_price)
+    # t+180с: второй партиал 30%.
+    _t.sleep(max(0, _RH_T2_SEC - _RH_T1_SEC))
+    close_reduce_long(ticker_name, part)
+    # t+900с: закрыть остаток (40% + всё что не закрылось reduce-only безопасно).
+    _t.sleep(max(0, _RH_T3_SEC - _RH_T2_SEC))
+    # Остаток = всё что есть (reduce_only обрежет до реального размера).
+    close_reduce_long(ticker_name, amount)
+    print(f"[RH-EXIT] {ticker_name}: time-based exit завершён (t+{_RH_T3_SEC}с)")
+
+
+def set_robinhood_exit(ticker_name: str, entry_price: float, amount: float) -> str:
+    """
+    Robinhood-стратегия: аварийный SL -1% сразу + time-based партиалы в фоне.
+    Только Bybit (вызывается из воркера лишь когда venue==bybit).
+    """
+    symbol = f"{ticker_name}USDT"
+    try:
+        step = _get_qty_step(symbol)
+    except QtyStepUnavailable as e:
+        print(f"[RH-EXIT SKIP] {e}")
+        return "skip"
+
+    sl = round(entry_price * _SL_MULT, 8)               # -1% аварийный
+    sl_size = str(_round_qty(amount, step))
+    if sl_size == "0.0" or float(sl_size) <= 0:
+        print(f"[RH-EXIT SKIP] {ticker_name}: slSize={sl_size} — слишком мало")
+        return "skip"
+
+    try:
+        # FIX 2026-06-06: ретрай на осёдку позиции (SL ставится сразу после open).
+        _trading_stop_settle({
+            "category":    "linear",
+            "symbol":      symbol,
+            "positionIdx": 1,
+            "stopLoss":    str(sl),
+            "slTriggerBy": "LastPrice",
+            "slSize":      sl_size,
+            # БЕЗ trailing/TP — выход по времени.
+        }, tag=ticker_name)
+    except Exception as e:  # noqa: BLE001
+        print(f"[RH-EXIT] {ticker_name}: аварийный SL упал: {e!r}")
+
+    threading.Thread(
+        target=_robinhood_exit_scheduler,
+        args=(ticker_name, entry_price, amount),
+        daemon=True, name=f"rh-exit-{ticker_name}",
+    ).start()
+    print(f"[RH-EXIT SET] {ticker_name} | entry={entry_price} | SL={sl}(-1%) | "
+          f"партиалы: 30%@{_RH_T1_SEC}с→БУ, 30%@{_RH_T2_SEC}с, остаток@{_RH_T3_SEC}с")
+    return "Robinhood time-based exit запущен"
 
 
 # ── Парсинг тикера из TG-сообщения ───────────────────────────────

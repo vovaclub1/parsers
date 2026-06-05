@@ -126,10 +126,13 @@ TG_LISTING_PHRASES = [
     # FIX-batch-7: структурированные форматы
     # listing_binance_mids: "✅ BINANCE | Listing"
     # cryptolistingwebsocket: "BINANCE Listing Announcement"
-    "| listing", "binance listing", "bybit listing",
+    # FIX 2026-06-05: "bybit listing" убран из позитивных — Bybit-листинги
+    # блокируются (см. TG_LISTING_NEG). Мы открываем позицию НА Bybit, листинг
+    # там не даёт пампа/асимметрии (токен уже торгуется).
+    "| listing", "binance listing",
     # Корейские биржи (Upbit / Bithumb)
     "listed on upbit", "listed on bithumb",
-    "listed on binance", "listed on bybit",
+    "listed on binance",
     "upbit will list", "bithumb will list",
     "upbit listing", "bithumb listing",
     "news listing",  # listing_binance_mids: "News listing: UP2/USDT"
@@ -169,6 +172,12 @@ TG_LISTING_NEG = [
     "multiple usd",              # bulk-add нескольких TradFi/Pre-IPO за раз
     "multiple usdⓈ",            # тот же с символом Ⓢ как у Binance
     "делист", "делисты",
+    # FIX 2026-06-05: Bybit-листинги — НЕ торгуем. Инцидент ZEST:
+    # "[BYBIT] $ZEST listed on Bybit Futures" открыл лонг, хотя это
+    # добавление фьючерсной пары на уже торгуемый токен (нет пампа).
+    # Мы открываем позицию НА Bybit — листинг там не создаёт асимметрии.
+    "listed on bybit", "bybit futures", "bybit listing",
+    "[bybit]", "on bybit futures",
 ]
 
 # FIX-perf: компилируем фильтры в regex-альтернацию ОДИН раз из списков выше
@@ -393,17 +402,67 @@ def _warmup_listing_sessions() -> None:
     log_ok("WARMUP", f"notice-сессии прогреты: {ok}/{len(targets)} (TCP+TLS установлены)")
 
 
+# ── Upbit throttle circuit-breaker (FIX throttle-storm 2026-06-04) ─
+# Инцидент №1: Upbit-поллер уходил в бесконечный throttle-loop — CF 1015/429
+# на каждом запросе, ротация IP не помогала (WAF банил весь пул).
+# Инцидент №2 (этот фикс): consecutive-streak счётчик НЕ срабатывал — с 13
+# round-robin прокси один незабаненный IP изредка отдавал 200 OK, success
+# сбрасывал streak в 0, до cooldown-порога (10 подряд) дело не доходило
+# НИКОГДА. Поллер вечно долбил каждые ~15с фиксированным backoff'ом, держа
+# CF-бан тёплым.
+#
+# Решение: sliding-window circuit breaker вместо consecutive-streak.
+#   - храним последние N исходов (throttle/success) в deque
+#   - если throttle-rate за окно ≥ порога (редкие успехи НЕ сбрасывают) →
+#     trip: эскалирующий cooldown (5→10→20→30мин cap), чистим окно, пробуем
+#     снова. Если снова троттлят — cooldown растёт. Если пускают — сброс.
+#   - real-time Upbit-нотисы в это время идут через Seoul-relay.
+from collections import deque as _deque
+
+_UPBIT_OUTCOME_WINDOW = int(os.getenv("UPBIT_OUTCOME_WINDOW", "20"))
+_upbit_outcomes: "_deque[bool]" = _deque(maxlen=_UPBIT_OUTCOME_WINDOW)  # True = throttled
+_upbit_throttle_lock = threading.Lock()
+
+
+def _record_upbit_throttle() -> None:
+    """Вызывается при каждом 429/503/CF-1015 от Upbit API."""
+    with _upbit_throttle_lock:
+        _upbit_outcomes.append(True)
+
+
+def _record_upbit_success() -> None:
+    """Вызывается при каждом нетроттленом ответе (200/404) от Upbit API."""
+    with _upbit_throttle_lock:
+        _upbit_outcomes.append(False)
+
+
+def _upbit_throttle_rate() -> tuple[int, int]:
+    """Возвращает (throttled, total) за скользящее окно."""
+    with _upbit_throttle_lock:
+        total = len(_upbit_outcomes)
+        throttled = sum(_upbit_outcomes)
+    return throttled, total
+
+
+def _clear_upbit_outcomes() -> None:
+    """Чистый старт окна (после cooldown — пробуем заново)."""
+    with _upbit_throttle_lock:
+        _upbit_outcomes.clear()
+
+
 def _adjust_notice_intervals_for_pool() -> None:
     """С 3+ IP уменьшаем интервал notice-поллеров. Каждый IP видит ~10 req/s
-    даже на самой агрессивной частоте, остаёмся в rate-limit."""
+    даже на самой агрессивной частоте, остаёмся в rate-limit.
+    FIX (throttle-storm): Upbit floor = 100мс (10 req/s) — Cloudflare WAF
+    на api-manager.upbit.com агрессивнее Bithumb, 60мс(16.6 rps) банит."""
     global BITHUMB_NOTICE_POLL_INTERVAL, UPBIT_ANNOUNCEMENT_POLL_INTERVAL
     size = len(_LISTING_PROXY_POOL)
     if size >= 3:
         BITHUMB_NOTICE_POLL_INTERVAL = 0.04
-        UPBIT_ANNOUNCEMENT_POLL_INTERVAL = 0.06
+        UPBIT_ANNOUNCEMENT_POLL_INTERVAL = max(UPBIT_INTERVAL_MIN, 0.06)
     elif size == 2:
         BITHUMB_NOTICE_POLL_INTERVAL = 0.06
-        UPBIT_ANNOUNCEMENT_POLL_INTERVAL = 0.10
+        UPBIT_ANNOUNCEMENT_POLL_INTERVAL = max(UPBIT_INTERVAL_MIN, 0.10)
     # size == 1 (direct only): оставляем дефолты (100/150мс)
 
 # ── Дедуп: L1 (TTL) + L2 (permanent persisted) ────────────────────
@@ -491,6 +550,64 @@ def _hstat(method: str, *args) -> None:
     if _health is not None:
         try:
             getattr(_health, method)(*args)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ── Signal-stats: журнал событий + отчёты 09:00/22:00 МСК ─────────
+# Отдельно от health: здесь append-only журнал с таймстампами, из которого
+# считаются окна «с прошлого отчёта / 7 дней / 30 дней / месяц». См.
+# tg/signal_stats.py.
+try:
+    from tg.signal_stats import SignalStats
+    _sig_stats = SignalStats(
+        Path(STATE_DIR) / "signal_events.jsonl",
+        Path(STATE_DIR) / "stats_report_state.json",
+        kind="LISTING",
+    )
+except Exception as _se:  # noqa: BLE001
+    print(f"[SIGSTATS] init failed: {_se!r} — signal-stats отключены", flush=True)
+    _sig_stats = None
+
+# Closed-PnL поллер Bybit — дописывает PnL в статистику когда позиция закрылась.
+try:
+    from api.bybit_pnl import BybitClosedPnL
+    _pnl_poller = BybitClosedPnL(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+except Exception as _pe:  # noqa: BLE001
+    print(f"[BYBIT-PNL] init failed: {_pe!r} — PnL-трекинг отключён", flush=True)
+    _pnl_poller = None
+
+
+def _sig_open(coin: str, src: str, venue: str, outcome: str,
+              open_ms: float = 0.0, entry: float = 0.0, amount: float = 0.0,
+              listing_exchange: str = "") -> None:
+    """Безопасный emit open-события (no-op если модуль не загрузился)."""
+    if _sig_stats is not None:
+        try:
+            _sig_stats.log_open(coin, src, venue, outcome, open_ms, entry,
+                                amount, listing_exchange)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _register_pnl(coin: str, src: str, venue: str) -> None:
+    """Регистрирует Bybit-позицию в closed-pnl поллере. Gate пропускаем."""
+    if _pnl_poller is None or venue.lower() != "bybit":
+        return
+    try:
+        def _on_pnl(c: str, pnl: float, exit_price: float, _s=src) -> None:
+            if _sig_stats is not None:
+                _sig_stats.log_pnl(c, _s, pnl, exit_price)
+        _pnl_poller.register(f"{coin}USDT", coin, time.time(), _on_pnl)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sig_lag(coin: str, loser: str, winner: str, lag_ms: float) -> None:
+    """Безопасный emit lag-события."""
+    if _sig_stats is not None:
+        try:
+            _sig_stats.log_lag(coin, loser, winner, lag_ms)
         except Exception:  # noqa: BLE001
             pass
 
@@ -917,6 +1034,9 @@ def _fired_sweeper() -> None:
 
 def worker(coin: str, margin: float, t_start: float,
            source: str, retries: int = 3, exchange: str = "") -> None:
+    # Signal-stats: причина последнего провала (для emit в конце).
+    # no_price → market_open_long вернул 0; rejected → биржа 400/404.
+    last_fail = "failed"
     for attempt in range(1, retries + 1):
         try:
             # FIX-PERF: пропускаем "Старт"-print на attempt 1. Это
@@ -928,14 +1048,27 @@ def worker(coin: str, margin: float, t_start: float,
             amount, entry_price = market_open_long(coin, margin)
             if not amount:
                 log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
+                last_fail = "no_price"
                 time.sleep(0.1)
                 continue
 
-            # FIX-PERF: failsafe SL+TP1 уже улетели в одной order.create-фрейме
-            # (stopLoss/takeProfit полях). Эта submit'ка добавляет trailing-stop
-            # 3.5% через trading-stop endpoint — не критично для failsafe, поэтому
-            # делаем ДО открытия метрики (submit ~5-20μs не сдвинет open_ms).
-            _tp_sl_executor.submit(set_tp_sl_long, coin, entry_price, amount)
+            # FIX 2026-06-04: выбор стратегии выхода.
+            #   • Robinhood-листинг на Bybit → time-based exit (партиалы по
+            #     25с/3мин/15мин + стоп в БУ после первого тейка).
+            #   • всё остальное (вкл. Robinhood на Gate) → обычный trailing 1%.
+            # venue читаем из _last_exchange (выставлен в market_open_long).
+            try:
+                from api.listing_api import _last_exchange as _lx_pre
+                _venue_pre = _lx_pre.get(coin, "bybit").lower()
+            except Exception:  # noqa: BLE001
+                _venue_pre = "bybit"
+            if "ROBINHOOD" in source and _venue_pre == "bybit":
+                from api.listing_api import set_robinhood_exit
+                _tp_sl_executor.submit(set_robinhood_exit, coin, entry_price, amount)
+            else:
+                # trading-stop endpoint: trailing 1% в Full-режиме (submit
+                # ~5-20μs не сдвинет open_ms).
+                _tp_sl_executor.submit(set_tp_sl_long, coin, entry_price, amount)
 
             open_ms = (time.perf_counter() - t_start) * 1000
             # FIX-PERF: один print вместо двух — раньше OPEN-print + intermediate
@@ -973,6 +1106,14 @@ def worker(coin: str, margin: float, t_start: float,
             # на «время от сигнала до ордера». _mark_opened теперь только
             # set-add + Event.set (~2мкс), без thread.start.
             _mark_opened(coin, source, exchange)
+            # Signal-stats: успешное открытие (venue/латентность/объём + биржа
+            # листинга). lex = биржа, ОТКУДА сигнал (Upbit/Bithumb/Binance).
+            lex = _resolve_exchange(source, exchange) or ""
+            _sig_open(coin, source, venue, "opened",
+                      open_ms=open_ms, entry=entry_price, amount=amount,
+                      listing_exchange=lex)
+            # Регистрируем позицию для отслеживания закрытого PnL (только Bybit).
+            _register_pnl(coin, source, venue)
             return
         except Exception as e:
             err_str = str(e)
@@ -984,7 +1125,9 @@ def worker(coin: str, margin: float, t_start: float,
             # 400/404 — fail fast, без sleep.
             if "400 Client Error" in err_str or "404 Client Error" in err_str:
                 log_warn("WORKER", f"{coin}: {err_str.split('http')[0].strip()} — fail fast, биржа отвергла")
+                last_fail = "rejected"
                 break
+            last_fail = "failed"
             if attempt < retries:
                 # FIX: 0.1с → 0.05с. На retry-path основная задержка — это
                 # сетевой round-trip, дополнительные 50мс не имеют смысла.
@@ -995,6 +1138,8 @@ def worker(coin: str, margin: float, t_start: float,
 
     log_err("WORKER", f"{coin}: все {retries} попытки провалились")
     _hstat("error", f"{source}→order")
+    # Signal-stats: финальный провал с распознанной причиной.
+    _sig_open(coin, source, "?", last_fail)
     tg_log(
         f"⚠️ <b>LISTING FAIL</b> <code>{coin}</code>\n"
         f"📡 Источник: <b>{source}</b>\n"
@@ -1024,10 +1169,14 @@ def _on_toa_listing(full_text: str, t_start: float, source_hint: str = "") -> No
         return
     log_ok("TOA-LIST", f"Листинг-сигнал из TOA WS: {pairs}")
     exchange = _detect_exchange(source_hint) or _detect_exchange(full_text)
+    # FIX 2026-06-04: Robinhood-листинги закрываются по времени (см. worker).
+    # Метку несём в source-теге — воркер проверит подстроку ROBINHOOD.
+    blob = f"{source_hint} {full_text}".lower()
+    source = "TOA-WS:ROBINHOOD" if "robinhood" in blob else "TOA-WS"
     # FIX-batch-8: пробрасываем t_start из WS-loop. Раньше perf_counter()
     # перезаписывался в process_signal и латентность от прихода сообщения
     # до ордера терялась.
-    process_signal(pairs, "TOA-WS", t_start=t_start, exchange=exchange)
+    process_signal(pairs, source, t_start=t_start, exchange=exchange)
 
 
 # ── общая обработка сигнала ───────────────────────────────────────
@@ -1076,12 +1225,14 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None,
             if lag is not None:
                 first_src, dt = lag
                 lag_info.append(f"{coin}: {source} опоздал на {dt:.2f}с от {first_src}")
+                dt_ms = dt * 1000.0
+                # Signal-stats: журнал lag-события (loser=source, winner=first_src).
+                _sig_lag(coin, source, first_src, dt_ms)
                 # FIX-LATENCY (Patch #3): running stats отставаний.
                 # Ключ (loser, winner) — loser=текущий поздний source,
                 # winner=первый. Это даёт пары вида
                 # ("TG:coin_listing", "TOA-WS") и позволяет ответить
                 # на вопрос «насколько TOA опережает TG в среднем».
-                dt_ms = dt * 1000.0
                 key = (source, first_src)
                 with _source_stats_lock:
                     entry = _source_lag_stats.get(key)
@@ -1598,6 +1749,25 @@ UPBIT_ANNOUNCEMENT_POLL_INTERVAL = 0.15
 # реально есть новые id подряд (на холостом ходу — 1 probe + sleep).
 UPBIT_ANNOUNCEMENT_LOOKAHEAD = 15
 
+# FIX (throttle-storm 2026-06-04): Upbit-поллер без backoff-а уходил в
+# бесконечный throttle-loop. Cloudflare WAF на api-manager.upbit.com банит
+# агрессивнее Bithumb. Circuit-breaker по throttle-rate в скользящем окне
+# (см. _upbit_outcomes выше):
+#   - если throttle-rate за окно ≥ UPBIT_TRIP_RATE → trip breaker
+#   - cooldown эскалирует: UPBIT_COOLDOWN_BASE → ×2 → ... → UPBIT_COOLDOWN_MAX
+#   - real-time покрытие Upbit в это время держит Seoul-relay
+#   - минимальный интервал: UPBIT_INTERVAL_MIN = 100мс (10 req/s)
+UPBIT_TRIP_RATE = float(os.getenv("UPBIT_TRIP_RATE", "0.8"))           # ≥80% окна throttled → trip
+UPBIT_TRIP_MIN_SAMPLES = int(os.getenv("UPBIT_TRIP_MIN_SAMPLES", "8")) # не триггерим пока < N исходов
+UPBIT_COOLDOWN_BASE = float(os.getenv("UPBIT_COOLDOWN_BASE", "300.0")) # 5 мин
+UPBIT_COOLDOWN_MAX = float(os.getenv("UPBIT_COOLDOWN_MAX", "1800.0"))  # 30 мин cap
+UPBIT_INTERVAL_MIN = float(os.getenv("UPBIT_INTERVAL_MIN", "0.10"))    # 100мс floor
+
+# FIX (2026-06-04): мастер-выключатель Upbit direct-поллера. По умолчанию OFF —
+# datacenter-прокси банятся Cloudflare наглухо (см. main()). Включать только
+# с корейскими residential прокси.
+UPBIT_DIRECT_POLLER_ENABLED = os.getenv("UPBIT_DIRECT_POLLER_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+
 # Категории, которые ВЕДУТ к торговле. У Upbit поле "category" в JSON:
 # наблюдали "거래" для трейд-нотисов (включая листинги, делисты, изменения).
 _UPBIT_NOTICE_TRADE_CATEGORIES = {"거래"}
@@ -1659,6 +1829,7 @@ def _try_fetch_upbit_announcement(
         url = UPBIT_ANNOUNCEMENT_URL.format(id=notice_id)
         resp = session.get(url, timeout=2)
         if resp.status_code == 404:
+            _record_upbit_success()  # 404 — НЕ троттл, API отвечает штатно
             return None, None, False
         # FIX (ресерч): api-manager за Cloudflare. При троттле он отдаёт
         # 429/503 ИЛИ статус 200 с HTML-телом "error code: 1015" (НЕ JSON).
@@ -1666,6 +1837,7 @@ def _try_fetch_upbit_announcement(
         # что неотличимо от 404 «нет нотиса» → СЛЕПОЕ ПЯТНО в секунды листинга.
         # Теперь детектим явно и логируем (round-robin прокси сменит IP).
         if resp.status_code in (429, 503) or b"error code: 1015" in resp.content[:200]:
+            _record_upbit_throttle()
             log_warn("UPBIT-NOTICE", f"throttle (CF 1015/{resp.status_code}) id={notice_id} — смена IP на след. probe")
             _hstat("throttle", "UPBIT-NOTICE")
             return None, None, False
@@ -1676,6 +1848,7 @@ def _try_fetch_upbit_announcement(
 
     if not isinstance(data, dict) or not data.get("success"):
         return None, None, False
+    _record_upbit_success()  # FIX throttle-storm: штатный ответ
     payload = data.get("data") or {}
     title = payload.get("title") or ""
     category = payload.get("category") or ""
@@ -1695,6 +1868,7 @@ def _fetch_upbit_list(session: requests.Session) -> list[dict] | None:
     try:
         resp = session.get(UPBIT_ANNOUNCEMENT_LIST_URL, timeout=2)
         if resp.status_code in (429, 503) or b"error code: 1015" in resp.content[:200]:
+            _record_upbit_throttle()
             log_warn("UPBIT-NOTICE", f"LIST throttle (CF 1015/{resp.status_code}) — смена IP")
             _hstat("throttle", "UPBIT-NOTICE")
             return None
@@ -1705,6 +1879,7 @@ def _fetch_upbit_list(session: requests.Session) -> list[dict] | None:
 
     if not isinstance(data, dict) or not data.get("success"):
         return None
+    _record_upbit_success()  # FIX throttle-storm: штатный LIST-ответ
     notices = ((data.get("data") or {}).get("notices")) or []
     out: list[dict] = []
     for n in notices:
@@ -1855,14 +2030,37 @@ def run_upbit_announcement_poller() -> None:
     # т.к. next_id это «первый ещё не виденный».
     last_seen_id = next_id - 1
 
+    # FIX (throttle-storm 2026-06-04): circuit-breaker по throttle-rate.
+    # Consecutive-streak не работал — редкие успехи с 13 прокси сбрасывали
+    # счётчик, cooldown не срабатывал, поллер вечно долбил CF-бан. Теперь:
+    # если ≥UPBIT_TRIP_RATE окна затроттлено → trip → эскалирующий cooldown.
+    cur_interval = UPBIT_ANNOUNCEMENT_POLL_INTERVAL
+    cooldown = UPBIT_COOLDOWN_BASE
+
     while True:
         try:
+            # ── Circuit breaker: проверяем throttle-rate за окно ─────
+            throttled, total = _upbit_throttle_rate()
+            if total >= UPBIT_TRIP_MIN_SAMPLES and throttled / total >= UPBIT_TRIP_RATE:
+                log_err(
+                    "UPBIT-NOTICE",
+                    f"breaker TRIP: {throttled}/{total} throttled (≥{UPBIT_TRIP_RATE:.0%}) "
+                    f"→ cooldown {cooldown/60:.0f}мин (Upbit идёт через Seoul-relay)",
+                )
+                time.sleep(cooldown)
+                # Эскалация на следующий trip; чистим окно → пробуем заново.
+                cooldown = min(cooldown * 2, UPBIT_COOLDOWN_MAX)
+                _clear_upbit_outcomes()
+                continue
+
             t_send = time.perf_counter()
             # ── ПЕРВИЧНО: LIST-poll. Один запрос отдаёт свежие нотисы с
             # title сразу. Ловит ЛЮБЫЕ гэпы id (id-increment их пропускал).
             notices = _fetch_upbit_list(_next_listing_session())
 
             if notices is not None:
+                # LIST успешен — здоровый API. Сбрасываем cooldown к базовому.
+                cooldown = UPBIT_COOLDOWN_BASE
                 # Новые = id > last_seen_id. Обрабатываем в порядке возр. id.
                 fresh = sorted((n for n in notices if n["id"] > last_seen_id),
                                key=lambda n: n["id"])
@@ -1871,11 +2069,22 @@ def run_upbit_announcement_poller() -> None:
                                          n["is_reannounce"], t_send)
                     last_seen_id = max(last_seen_id, n["id"])
                 next_id = last_seen_id + 1
-                time.sleep(UPBIT_ANNOUNCEMENT_POLL_INTERVAL)
+                time.sleep(cur_interval)
                 continue
 
-            # ── FALLBACK: LIST затроттлен/упал → id-increment probe
-            # (lookahead, как раньше). Гарантирует детект даже если LIST лёг.
+            # ── LIST вернул None — троттл или ошибка. ───────────────
+            # FIX (throttle-storm): при недавнем троттле НЕ дёргаем fallback
+            # id-increment (каждый probe = ещё запрос к забаненому API,
+            # продлевает бан). Спим интервал — breaker наверху разрулит,
+            # если троттл устойчивый.
+            recent_throttled, recent_total = _upbit_throttle_rate()
+            if recent_total > 0 and recent_throttled / recent_total >= 0.5:
+                time.sleep(cur_interval)
+                continue
+
+            # ── FALLBACK: LIST упал не из-за троттла (сеть/ошибка) →
+            # id-increment probe (lookahead). Гарантирует детект даже
+            # если LIST временно лёг.
             advanced = False
             for offset in range(UPBIT_ANNOUNCEMENT_LOOKAHEAD):
                 probe_id = next_id + offset
@@ -1890,7 +2099,7 @@ def run_upbit_announcement_poller() -> None:
                 _handle_upbit_notice(probe_id, title, category, is_reannounce, t_probe)
 
             if not advanced:
-                time.sleep(UPBIT_ANNOUNCEMENT_POLL_INTERVAL)
+                time.sleep(cur_interval)
 
         except Exception as e:
             log_err("UPBIT-NOTICE", f"poll error: {type(e).__name__}: {e}")
@@ -2572,11 +2781,22 @@ if __name__ == "__main__":
         daemon=True,
         name="bithumb-notice-poller",
     ).start()
-    threading.Thread(
-        target=run_upbit_announcement_poller,
-        daemon=True,
-        name="upbit-notice-poller",
-    ).start()
+    # FIX (2026-06-04): Upbit direct-поллер ОТКЛЮЧЁН по умолчанию. На текущем
+    # datacenter proxy-пуле (pool=4) Cloudflare на api-manager.upbit.com банит
+    # все IP наглухо — за прогон 4712 CF-1015 троттлов, 0 успешных ответов,
+    # 0 пойманных листингов. Backoff/breaker это не лечат (проблема в самих
+    # флагнутых IP, не в частоте). Upbit-покрытие держат Seoul-relay + TG + TOA.
+    # Включить обратно: UPBIT_DIRECT_POLLER_ENABLED=1 (нужны корейские
+    # residential прокси, иначе снова throttle-storm).
+    if UPBIT_DIRECT_POLLER_ENABLED:
+        threading.Thread(
+            target=run_upbit_announcement_poller,
+            daemon=True,
+            name="upbit-notice-poller",
+        ).start()
+    else:
+        log_warn("UPBIT-NOTICE", "direct-поллер ОТКЛЮЧЁН (UPBIT_DIRECT_POLLER_ENABLED=0) "
+                                 "— Upbit идёт через Seoul-relay + TG + TOA")
     threading.Thread(
         target=run_binance_announcement_poller,
         daemon=True,
@@ -2616,6 +2836,25 @@ if __name__ == "__main__":
             target=_health_report_loop, daemon=True, name="health-report",
         ).start()
         log_ok("HEALTH", "диагностика слабых мест активна (TG-отчёт каждые 6ч)")
+
+    # Signal-stats: журнал событий (flush 10с) + отчёты 09:00/22:00 МСК в TG.
+    if _sig_stats is not None:
+        threading.Thread(
+            target=_sig_stats.flush_loop, kwargs={"batch_sec": 10.0},
+            daemon=True, name="sigstats-flush",
+        ).start()
+        threading.Thread(
+            target=_sig_stats.report_scheduler_loop, args=(tg_log,),
+            daemon=True, name="sigstats-report",
+        ).start()
+        log_ok("STATS", "signal-stats журнал активен (отчёты 09:00/22:00 МСК в TG)")
+
+    # Closed-PnL поллер Bybit — дописывает PnL закрытых позиций в статистику.
+    if _pnl_poller is not None and _pnl_poller.enabled:
+        threading.Thread(
+            target=_pnl_poller.poll_loop, daemon=True, name="bybit-pnl",
+        ).start()
+        log_ok("STATS", "closed-PnL поллер Bybit активен (PnL в статистику)")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:

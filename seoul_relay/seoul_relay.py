@@ -70,7 +70,13 @@ async def _aio_json(r):
 # ── Конфиг ────────────────────────────────────────────────────────
 PORT          = int(os.environ.get("RELAY_PORT", "8765"))
 SECRET        = os.environ.get("RELAY_SECRET", "")
-BITHUMB_POLL_MS = int(os.environ.get("BITHUMB_POLL_MS", "50"))
+# FIX (rate-limit 2026-06-04): feed-api.bithumb.com за Cloudflare, лимит 1 req/s
+# (x-ratelimit-burst-capacity: 1, x-ratelimit-replenish-rate: 1). При 50мс (20 req/s)
+# bucket пустеет за ~1с → ВСЕ запросы получают cf-cache-status: HIT со stale-кешем
+# (max-age=14400 = 4ч). Инцидент: нотис опубликован в 9:00:00, релей увидел в 9:11:13.
+# 2000мс = 0.5 req/s, с запасом под replenish 1/с. Для субсекундной детекции —
+# добавить BITHUMB_PROXIES (как у Upbit), каждый IP получает свой bucket.
+BITHUMB_POLL_MS = int(os.environ.get("BITHUMB_POLL_MS", "2000"))
 # FIX: Upbit api-manager имеет публичный rate-limit 10 req/s per IP.
 # При 80мс interval'е → 12.5 req/s = выше лимита, 429 в логи.
 # 150мс = 6.6 req/s per session, на 3 прокси suma ≈ 20 req/s но
@@ -321,9 +327,15 @@ async def _ws_handler(ws: websockets.WebSocketServerProtocol) -> None:
 async def _poll_bithumb(http: aiohttp.ClientSession) -> None:
     seen_ids: set[str] = set()
 
+    # FIX (rate-limit): cache-busting — каждый poll добавляет &_ts=<unix_sec>
+    # чтобы при попадании в origin (раз в 2с при bucket=1/с) создавался свежий
+    # cache key. Без этого даже редкий запрос может попасть в чужой HIT.
+    def _bithumb_url() -> str:
+        return f"{BITHUMB_NOTICES_URL}&_ts={int(time.time())}"
+
     # Инициализация: помечаем существующие нотисы как уже виденные.
     try:
-        async with http.get(BITHUMB_NOTICES_URL, timeout=aiohttp.ClientTimeout(total=4)) as r:
+        async with http.get(_bithumb_url(), timeout=aiohttp.ClientTimeout(total=4)) as r:
             r.raise_for_status()
             items = await _aio_json(r)
         if isinstance(items, list):
@@ -344,7 +356,7 @@ async def _poll_bithumb(http: aiohttp.ClientSession) -> None:
         await asyncio.sleep(interval)
         t_send = time.perf_counter()
         try:
-            async with http.get(BITHUMB_NOTICES_URL, timeout=aiohttp.ClientTimeout(total=2)) as r:
+            async with http.get(_bithumb_url(), timeout=aiohttp.ClientTimeout(total=2)) as r:
                 r.raise_for_status()
                 items = await _aio_json(r)
         except Exception as e:

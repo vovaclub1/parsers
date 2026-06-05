@@ -135,6 +135,26 @@ LISTING_NEG = [
     "perpetual contract pre",
     "multiple usd",
     "multiple usdⓈ",
+    # FIX 2026-06-05: новостные/регуляторные заголовки. Инцидент: TOA Scrapers
+    # прислал "SEC Proposes New Listing Criteria for Crypto-Based Options on
+    # Commodity Trusts: Filing" → "new listing" дало listing-классификацию →
+    # parser выдрал BASED из "crypto-Based" → ложный лонг. Эти фразы есть в
+    # новостях/регуляторике, но НИКОГДА в терсном анонсе "X: New Listing: TICKER"
+    # / "Will List" / корейском "마켓 추가", поэтому реальные листинги не задеты.
+    # source=Scrapers НЕ блокируем — оттуда идут и реальные Robinhood-листинги.
+    "listing criteria",
+    "proposes", "proposal",
+    "filing",
+    "lawsuit", "court", "ruling",
+    "regulator", "regulatory", "regulation",
+    "commodity trust",
+    "options on",
+    "settlement",
+    "investigation",
+    " sec ",   # с пробелами — только отдельное слово SEC, не Secret/SECID
+    # FIX 2026-06-05: Bybit-листинги — НЕ торгуем (открываем позицию НА Bybit,
+    # листинг там не даёт пампа). Инцидент ZEST через TG, защита и для TOA.
+    "listed on bybit", "bybit futures", "on bybit futures",
 ]
 
 

@@ -398,6 +398,11 @@ async def _parse_tokens_streaming(url: str, started: float, is_bithumb: bool) ->
         elapsed = (time.perf_counter() - started) * 1000
         if found:
             log_ok("FAST", f"parsed in {elapsed:.1f}ms | {found}")
+        elif len(buffer) < 200 and (b"success" in buffer[:200] or b"error code" in buffer[:200]):
+            # FIX 2026-06-05: api-manager ответил success:false/404/CF-throttle —
+            # нотис ещё не проиндексирован или API заблокирован. Это не ошибка
+            # парсинга. Fallback на text-parser/TG всё равно ловит сигнал.
+            log_info("FAST", f"notice not indexed yet ({elapsed:.1f}ms) — fallback to text-parser")
         else:
             log_warn("FAST", f"no tokens found ({elapsed:.1f}ms)")
         return found

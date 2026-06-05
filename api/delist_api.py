@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import socket
 import threading
@@ -98,10 +99,16 @@ from api.gate_api import (   # noqa: E402  (импорт после monkey-patch
 # FIX-PERF: fire-and-forget вариант place_order_ws_fast — экономит ~70-100мс
 # на ack-roundtrip. Reject логируется в фоне через _watch_ack.
 try:
-    from api.bybit_ws_trade import place_order_ws_fast as _ws_place_order, WSOrderRejected
+    from api.bybit_ws_trade import (
+        place_order_ws_fast as _ws_place_order,
+        place_order_ws_ack as _ws_place_order_ack,
+        WSOrderRejected,
+    )
 except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
     print(f"[BYBIT-WS] модуль не подгружен: {_ws_import_exc!r} — будет только REST")
     def _ws_place_order(args: dict, _warmup_mode: bool = False) -> dict | None:  # type: ignore[misc]
+        return None
+    def _ws_place_order_ack(args: dict, timeout: float = 1.5) -> dict | None:  # type: ignore[misc]
         return None
     class WSOrderRejected(Exception):  # type: ignore[no-redef]
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
@@ -112,6 +119,12 @@ BYBIT_BASE_URL = "https://api.bybit.com"
 ORDER_CREATE_URL = BYBIT_BASE_URL + "/v5/order/create"   # FIX-batch-8: pre-built URL
 RECV_WINDOW    = "5000"
 LEVERAGE       = 10   # FIX: вынес магическое число в константу
+
+# FIX 2026-06-05: ретраи на price-cap reject (30208/30209 — см. listing_api).
+# Для шорта: 30209 = "order price lower than minimum selling price" (cap снизу).
+_PRICE_CAP_RETCODES = {30208, 30209}
+_ORDER_RETRIES = int(os.getenv("DELIST_ORDER_RETRIES", "10"))
+_ORDER_RETRY_SLEEP = float(os.getenv("DELIST_ORDER_RETRY_MS", "7")) / 1000.0
 
 # Защита от None если ключи не заданы в .env
 BYBIT_API_KEY    = BYBIT_API_KEY    or ""
@@ -261,7 +274,8 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 retries: int = 2,
                 stop_loss: str | None = None,
                 take_profit: str | None = None,
-                tp_size: str | None = None) -> dict:
+                tp_size: str | None = None,
+                reduce_only: bool = False) -> dict:
     """
     Размещает Market ордер через Bybit V5 REST максимально быстро.
     :param symbol: "BTCUSDT" (linear).
@@ -291,6 +305,9 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
         f'"category":"linear","symbol":"{symbol}","side":"{side}",'
         f'"orderType":"Market","qty":"{qty}","positionIdx":{position_idx}'
     )
+    if reduce_only:
+        # reduce-only: ордер только уменьшает позицию, не откроет противоположную.
+        _inner += ',"reduceOnly":true'
     if order_link_id:
         _inner += f',"orderLinkId":"{order_link_id}"'
     # M5: failsafe SL/TP прямо в теле REST-fallback ордера — позиция защищена
@@ -464,6 +481,40 @@ def _post_http2(endpoint: str, params: dict, retries: int = 2) -> dict:
                 pass
             raise
 
+    assert last_exc is not None
+    raise last_exc
+
+
+# FIX 2026-06-06: ретраи trading-stop на retCode=10001 "zero position".
+# Позиция оседает на Bybit с задержкой после market-ордера; trading-stop
+# выставленный сразу падает 10001, и трейлинг/SL НЕ ставятся (инцидент:
+# позиция без трейлинга, цена развернулась, закрывали руками). Ждём осёдку.
+_TPSL_SETTLE_RETRIES = int(os.getenv("TPSL_SETTLE_RETRIES", "8"))
+_TPSL_SETTLE_SLEEP = float(os.getenv("TPSL_SETTLE_SLEEP_MS", "300")) / 1000.0
+
+
+def _trading_stop_settle(params: dict, tag: str = "") -> dict:
+    """
+    Вызывает /v5/position/trading-stop с ретраями на 10001 "zero position"
+    (гонка осёдки позиции). Прочие ошибки пробрасываются сразу.
+    Возвращает data при успехе, либо raise после исчерпания ретраев.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _TPSL_SETTLE_RETRIES + 1):
+        try:
+            return _post_http2("/v5/position/trading-stop", params)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            is_zero_pos = ("10001" in msg and "position" in msg.lower()) or \
+                          "zero position" in msg.lower()
+            if not is_zero_pos:
+                raise  # не гонка осёдки — реальная ошибка, не ретраим
+            last_exc = e
+            if attempt < _TPSL_SETTLE_RETRIES:
+                print(f"[TP/SL SETTLE] {tag} zero-position, ждём осёдку "
+                      f"(попытка {attempt}/{_TPSL_SETTLE_RETRIES})", flush=True)
+                time.sleep(_TPSL_SETTLE_SLEEP)
+    # Исчерпали ретраи — пробрасываем последнюю ошибку.
     assert last_exc is not None
     raise last_exc
 
@@ -779,8 +830,7 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 # orderLinkId Bybit отвергнет (retCode 30050 → success).
                 order_link_id = _new_order_link_id()
 
-                # FIX-batch-5: пробуем WS Trade API (−30...−80мс), при ошибке/None — REST.
-                placed_via = "REST"
+                # FIX 2026-06-05: ack-waiting + ретраи на price-cap (зеркало listing).
                 ws_args = {
                     "category":    "linear",
                     "symbol":      symbol,
@@ -790,24 +840,35 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                     "positionIdx": 2,
                     "orderLinkId": order_link_id,
                 }
-                try:
-                    ws_ack = _ws_place_order(ws_args)
-                except WSOrderRejected as e:
-                    # Защитный путь (fast вариант reject не бросает — он
-                    # логирует асинхронно). Остался на случай если bybit_ws
-                    # модуль не подгрузился и упал на старую sync-обёртку.
-                    print(f"[BYBIT-WS] reject — пропускаем REST fallback: {e}")
-                    return 0, 0
-                except Exception as e:  # noqa: BLE001
-                    print(f"[BYBIT-WS] ошибка place_order_ws: {e!r} — REST")
-                    ws_ack = None
+                success = False
+                for attempt in range(1, _ORDER_RETRIES + 1):
+                    ack = _ws_place_order_ack(ws_args)
+                    if ack is None:
+                        # WS недоступен/таймаут → REST fallback один раз.
+                        _post_order(symbol, "Sell", qty_str, 2,
+                                    order_link_id=order_link_id)
+                        success = True
+                        break
+                    rc = ack.get("retCode", -1)
+                    if rc == 0:
+                        success = True
+                        break
+                    if rc not in _PRICE_CAP_RETCODES:
+                        print(
+                            f"[BYBIT-WS] REJECTED {symbol} retCode={rc} "
+                            f"retMsg={ack.get('retMsg','?')!r} — fail fast",
+                            flush=True,
+                        )
+                        return 0, 0
+                    if attempt < _ORDER_RETRIES:
+                        time.sleep(_ORDER_RETRY_SLEEP)
 
-                if ws_ack is None:
-                    # FIX-batch-8: специализированный _post_order (f-string JSON, −2..−5мс)
-                    # FIX: тот же orderLinkId, что и в WS-попытке — idempotency.
-                    _post_order(symbol, "Sell", qty_str, 2, order_link_id=order_link_id)
-                else:
-                    placed_via = "WS-FAST"
+                if not success:
+                    print(
+                        f"[BYBIT-WS] {symbol}: все {_ORDER_RETRIES} ретраев "
+                        f"на price-cap — не зашли", flush=True,
+                    )
+                    return 0, 0
 
                 with _delist_exchange_lock:
                     _delist_exchange[ticker_name] = "bybit"
@@ -878,15 +939,14 @@ def warmup_chain(n: int = 30) -> int:
 
 def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет нативный trailing stop 1.0% + аварийный SL 5% для шорта на Bybit.
+    Выставляет нативный trailing stop + аварийный SL для шорта на Bybit.
+    Значения из config (FIX 2026-06-04): trailing 0.5%, SL 1%, активация -0.5%.
 
     Стратегия «первая быстрая свеча»:
-      - trailingStop 1% (тугой) — максимум фиксируем с пика дампа
-      - activePrice = entry × 0.99 — активация после +1% в плюс
-      - аварийный SL = entry × 1.05 — защита если цена сразу пошла против
-      - БЕЗ фиксированных TP — чистый трейлинг на всю позицию
-
-    Паттерн взят из listing_api.py (там trailing 3.5% на лонгах работает).
+      - trailingStop DELIST_TRAILING_PCT (тугой) — фиксируем максимум с пика дампа
+      - activePrice = entry × (1 - DELIST_ACTIVE_PCT) — активация после движения вниз
+      - аварийный SL = entry × (1 + DELIST_SL_PCT) — защита если цена пошла против
+      - БЕЗ фиксированных TP — чистый трейлинг на всю позицию (Full-режим)
     """
     symbol = f"{ticker_name}USDT"
     try:
@@ -907,8 +967,9 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
         print(f"[TP/SL SKIP] {ticker_name}: slSize={sl_size} (amount={amount}, step={step}) — слишком мало")
         return "skip"
 
-    # Один вызов /v5/position/trading-stop с нативным trailing
-    _post_http2("/v5/position/trading-stop", {
+    # Один вызов /v5/position/trading-stop с нативным trailing.
+    # FIX 2026-06-06: через _trading_stop_settle — ретраи на 10001 (осёдка).
+    _trading_stop_settle({
         "category":     "linear",
         "symbol":       symbol,
         "positionIdx":  2,  # short-hedge
@@ -923,7 +984,7 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
         "activePrice":  str(active_price),
 
         # tpslMode не указываем — trailing на всю позицию (Full mode по умолчанию)
-    })
+    }, tag=ticker_name)
 
     print(
         f"[TP/SL SET SHORT] {ticker_name} | entry={entry_price:.2f} | "
@@ -936,12 +997,24 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
 def set_tp_sl(ticker_name: str, entry_price: float, amount: float) -> str:
     """
     Роутер — выставляет TP/SL на той бирже где открыт шорт.
+
+    FIX 2026-06-06: обёрнуто в try/except (как listing.set_tp_sl_long). Раньше
+    исключение из _set_tp_sl_bybit_short (напр. trading-stop не сел) МОЛЧА
+    гибло в _tp_sl_executor-future → позиция оставалась БЕЗ трейлинга/SL, и
+    никто не знал. Теперь — громкий лог.
     """
-    with _delist_exchange_lock:
-        exchange = _delist_exchange.get(ticker_name, "bybit")
-    if exchange == "gate":
-        return gate_set_tp_sl_short(ticker_name, entry_price, amount)
-    return _set_tp_sl_bybit_short(ticker_name, entry_price, amount)
+    try:
+        with _delist_exchange_lock:
+            exchange = _delist_exchange.get(ticker_name, "bybit")
+        if exchange == "gate":
+            return gate_set_tp_sl_short(ticker_name, entry_price, amount)
+        return _set_tp_sl_bybit_short(ticker_name, entry_price, amount)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[TP/SL FAIL] {ticker_name}: {e} — трейлинг/SL НЕ выставлен! "
+            f"ПРОВЕРЬ ПОЗИЦИЮ!", flush=True,
+        )
+        return "error"
 
 
 # ── find_pairs ────────────────────────────────────────────────────
@@ -958,6 +1031,9 @@ _RE_MONITORING  = re.compile(r"MONITORING\s+TAG\s+TO\s+INCLUDE\s+(.*?)(?:\s+ON\b
 # FIX-batch-7: $TICKER маркеры (cryptolistingwebsocket: "Monitoring Tag Added – $ALCX, $COOKIE")
 # FIX: добавлен IGNORECASE — иногда каналы шлют "$alcx" вместо "$ALCX".
 _RE_DOLLAR_TKN  = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,9})\b")
+# FIX 2026-06-06: вырезаем "link"-контекст (Source link / link:) перед жадным
+# fallback — слово "link" → LINK (реальный символ) выдиралось как тикер.
+_RE_LINK_CONTEXT = re.compile(r"\b(?:SOURCE\s+)?LINK\b\s*:?", re.IGNORECASE)
 
 
 def find_pairs(text: str) -> list[str]:
@@ -994,7 +1070,8 @@ def find_pairs(text: str) -> list[str]:
     m = _RE_WILL_DELIST.search(text_upper)
     if m:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
-        found  = _filter_tokens(tokens)
+        # FIX 2026-06-06: прозовый метод → фильтр по known_coins (мусор-слова).
+        found  = _filter_known(tokens)
         if found:
             return found
 
@@ -1002,18 +1079,22 @@ def find_pairs(text: str) -> list[str]:
     m = _RE_MONITORING.search(text_upper)
     if m:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
-        found  = _filter_tokens(tokens)
+        found  = _filter_known(tokens)
         if found:
             return found
 
     m = _RE_DELIST_BLOCK.search(text_upper)
     if m:
         tokens = _RE_PAIR_TOKENS.findall(m.group(1))
-        found  = _filter_tokens(tokens)
+        found  = _filter_known(tokens)
         if found:
             return found
 
-    all_tokens = _RE_ALL_TOKENS.findall(text_upper)
+    # FIX 2026-06-06: вырезаем "source link"/"link:" контекст ПЕРЕД жадным
+    # fallback — иначе LINK (реальный Bybit-символ) выдирается из слова "link".
+    # Инцидент: "Pair: D/USDT ... Source link: Binance" → шорт по LINK вместо D.
+    cleaned = _RE_LINK_CONTEXT.sub(" ", text_upper)
+    all_tokens = _RE_ALL_TOKENS.findall(cleaned)
     # FIX: snapshot known_coins под lock — price_updater делает clear()+update(),
     # между ними set пуст. Без snapshot fallback мог бы пропустить валидную монету.
     with cache_lock:
@@ -1042,6 +1123,24 @@ def _filter_tokens(tokens: list[str]) -> list[str]:
         seen.add(t)
         result.append(t)
     return result
+
+
+def _filter_known(tokens: list[str]) -> list[str]:
+    """
+    FIX 2026-06-06: как _filter_tokens, но дополнительно требует присутствия
+    в known_coins (реально торгуемые символы Bybit/Gate). Для ПРОЗОВЫХ методов
+    извлечения (_RE_WILL_DELIST/_RE_MONITORING/_RE_DELIST_BLOCK), где захват
+    может содержать английские слова из текста статьи. Инцидент: body
+    "...delist... our priority ensure best while continuing adapt evolving
+    market dynamics" → шорты по 10 словам-мусору. Реальные делист-тикеры всегда
+    торгуются (делистят то что есть на бирже) → known_coins их не отсекает.
+    """
+    base = _filter_tokens(tokens)
+    if not base:
+        return []
+    with cache_lock:
+        known_snapshot = frozenset(known_coins)
+    return [t for t in base if t in known_snapshot]
 
 
 def _dedupe(tokens: list[str]) -> list[str]:

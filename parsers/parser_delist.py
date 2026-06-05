@@ -594,7 +594,110 @@ def _persist_fired_state() -> None:
         log_warn("DEDUP", f"L2 persist failed: {e!r}")
 
 
-def _try_claim(coin: str) -> bool:
+# ── Signal-stats: журнал событий + отчёты 09:00/22:00 МСК (DELIST) ─
+# Параллель listing-парсера. Отдельные файлы (delist_*) — не конфликтуют
+# с listing при общем STATE_DIR volume. Отчёт идёт отдельным TG-сообщением
+# с заголовком 🔴 DELIST.
+try:
+    from tg.signal_stats import SignalStats
+    _sig_stats = SignalStats(
+        Path(STATE_DIR) / "delist_signal_events.jsonl",
+        Path(STATE_DIR) / "delist_stats_report_state.json",
+        kind="DELIST",
+    )
+except Exception as _se:  # noqa: BLE001
+    print(f"[SIGSTATS] init failed: {_se!r} — signal-stats отключены", flush=True)
+    _sig_stats = None
+
+try:
+    from api.bybit_pnl import BybitClosedPnL
+    _pnl_poller = BybitClosedPnL(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+except Exception as _pe:  # noqa: BLE001
+    print(f"[BYBIT-PNL] init failed: {_pe!r} — PnL-трекинг отключён", flush=True)
+    _pnl_poller = None
+
+# ── Health-stats (DELIST) ─────────────────────────────────────────
+# FIX 2026-06-06: раньше health был ТОЛЬКО в listing-парсере — делисты не
+# попадали в health-отчёт. Отдельный файл delist_health_stats.json.
+try:
+    from tg.health_stats import HealthStats
+    _health = HealthStats(Path(STATE_DIR) / "delist_health_stats.json")
+except Exception as _he:  # noqa: BLE001
+    print(f"[HEALTH] init failed: {_he!r} — health-stats отключены", flush=True)
+    _health = None
+
+
+def _hstat(method: str, *args) -> None:
+    """Безопасный вызов health-метрики (no-op если модуль не загрузился)."""
+    if _health is not None:
+        try:
+            getattr(_health, method)(*args)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _health_report_loop() -> None:
+    """Каждые 6 часов шлёт health-отчёт делиста в TG и stdout (тик через 1ч)."""
+    time.sleep(3600)
+    while True:
+        try:
+            if _health is not None:
+                report = _health.build_report()
+                print(report.replace("<b>", "").replace("</b>", ""), flush=True)
+                tg_log("🔴 <b>DELIST</b>\n" + report)
+        except Exception as e:  # noqa: BLE001
+            log_warn("HEALTH", f"report failed: {e!r}")
+        time.sleep(6 * 3600)
+
+# Первый источник, заявивший монету (для метрики отставания). coin -> (src, t).
+_first_claim_ts: dict[str, tuple[str, float]] = {}
+_FIRST_CLAIM_TTL = 300
+
+
+def _sig_open(coin: str, src: str, venue: str, outcome: str,
+              open_ms: float = 0.0, entry: float = 0.0, amount: float = 0.0,
+              listing_exchange: str = "") -> None:
+    if _sig_stats is not None:
+        try:
+            _sig_stats.log_open(coin, src, venue, outcome, open_ms, entry,
+                                amount, listing_exchange)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _sig_lag(coin: str, loser: str, winner: str, lag_ms: float) -> None:
+    if _sig_stats is not None:
+        try:
+            _sig_stats.log_lag(coin, loser, winner, lag_ms)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _register_pnl(coin: str, src: str, venue: str) -> None:
+    """Регистрирует Bybit-шорт в closed-pnl поллере. Gate пропускаем."""
+    if _pnl_poller is None or venue.lower() != "bybit":
+        return
+    try:
+        def _on_pnl(c: str, pnl: float, exit_price: float, _s=src) -> None:
+            if _sig_stats is not None:
+                _sig_stats.log_pnl(c, _s, pnl, exit_price)
+        _pnl_poller.register(f"{coin}USDT", coin, time.time(), _on_pnl)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _measure_lag(coin: str) -> tuple[str, float] | None:
+    """(первый_источник, отставание_сек) если монету уже заявлял другой src."""
+    now = time.monotonic()
+    with _fired_lock:
+        first = _first_claim_ts.get(coin)
+    if first is None:
+        return None
+    first_src, t0 = first
+    return first_src, max(0.0, now - t0)
+
+
+def _try_claim(coin: str, source: str = "") -> bool:
     """
     Возвращает True если монета ещё не в работе и блокирует её на _FIRED_TTL секунд.
     Защищает от двойного открытия одной монеты.
@@ -602,6 +705,8 @@ def _try_claim(coin: str) -> bool:
     FIX-PERF: было — на каждый claim спавнили sleep-thread для TTL-cleanup.
     threading.Thread.start() ≈ 3-5мс на coin (для 5 монет = 15-25мс в hot-path).
     Теперь один фоновый sweeper (_fired_sweeper) подметает по таймстампу.
+    FIX (signal-stats): source-параметр — запоминаем ПЕРВЫЙ источник монеты
+    для метрики отставания (_measure_lag).
     """
     with _fired_lock:
         # L2: уже шортили эту монету (навсегда) → skip.
@@ -612,6 +717,8 @@ def _try_claim(coin: str) -> bool:
             return False
         _fired_coins.add(coin)
         _fired_expiry[coin] = time.monotonic() + _FIRED_TTL
+        if source and coin not in _first_claim_ts:
+            _first_claim_ts[coin] = (source, time.monotonic())
     return True
 
 
@@ -655,6 +762,11 @@ def _fired_sweeper() -> None:
             for c in expired:
                 _fired_coins.discard(c)
                 _fired_expiry.pop(c, None)
+            # Чистим _first_claim_ts (метрика отставания) по своему TTL.
+            stale = [c for c, (_s, t0) in _first_claim_ts.items()
+                     if now - t0 > _FIRST_CLAIM_TTL]
+            for c in stale:
+                _first_claim_ts.pop(c, None)
 
 
 # ── Fetch ────────────────────────────────────────────────────────
@@ -704,6 +816,7 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
     """
     Воркер — открывает шорт, логирует время, ставит TP/SL в фоне.
     """
+    last_fail = "failed"
     for attempt in range(1, retries + 1):
         try:
             # FIX-PERF: "Старт"-print только на retry'ях — на attempt 1
@@ -715,6 +828,7 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             if not amount:
                 # FIX: проверяем что это не последняя попытка, иначе зависнем
                 # в бесконечном цикле если market_open_short всегда возвращает 0.
+                last_fail = "no_price"
                 if attempt < retries:
                     log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
                     time.sleep(0.1)
@@ -733,6 +847,14 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
                 f"[{source}] {coin} | ордер за {BOLD}{open_ms:.0f}мс{RESET}{GREEN} | "
                 f"entry={entry_price} | amount={amount:.4f}"
             ))
+            # Health: латентность сигнал→ордер по источнику.
+            _hstat("latency", f"{source}→order", open_ms)
+            # Биржа исполнения шорта (bybit/gate) для venue/PnL.
+            try:
+                from api.delist_api import _delist_exchange as _dx
+                venue = _dx.get(coin, "bybit")
+            except Exception:  # noqa: BLE001
+                venue = "?"
             # FIX-PERF: tg_log fire-and-forget (см. tg/tg_logger.py).
             tg_log(
                 f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
@@ -741,13 +863,24 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             # на «время от сигнала до ордера». _mark_opened только set.add +
             # Event.set (~2мкс), без thread.start (см. _fired_persist_loop).
             _mark_opened(coin)
+            # Signal-stats: успешное открытие + регистрация PnL (только Bybit).
+            _sig_open(coin, source, venue, "opened",
+                      open_ms=open_ms, entry=entry_price, amount=amount)
+            _register_pnl(coin, source, venue)
             return
         except Exception as e:
+            err_str = str(e)
             log_err("WORKER", f"{coin}: попытка {attempt}/{retries} упала → {e}")
+            if "400 Client Error" in err_str or "404 Client Error" in err_str:
+                last_fail = "rejected"
+                break
+            last_fail = "failed"
             if attempt < retries:
                 time.sleep(0.1)
 
     log_err("WORKER", f"{coin}: все {retries} попытки провалились, сдаёмся")
+    _hstat("error", f"{source}→order")
+    _sig_open(coin, source, "?", last_fail)
     tg_log(f"⚠️ {coin}: все попытки провалились")
 
 
@@ -790,9 +923,25 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None) 
     if t_start is None:
         t_start = time.perf_counter()
 
-    new_pairs = [c for c in pairs if _try_claim(c)]
+    # Health: приход сигнала от каждого источника (видно кто приносит делисты).
+    _hstat("signal", source)
+
+    new_pairs = [c for c in pairs if _try_claim(c, source)]
     if not new_pairs:
-        log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
+        # Метрика отставания: для каждой отброшенной монеты считаем, на сколько
+        # текущий source опоздал относительно первого (для статистики «кто
+        # опережает кого»). См. parser_listing.process_signal.
+        lag_info: list[str] = []
+        for coin in pairs:
+            lag = _measure_lag(coin)
+            if lag is not None:
+                first_src, dt = lag
+                lag_info.append(f"{coin}: {source} опоздал на {dt:.2f}с от {first_src}")
+                _sig_lag(coin, source, first_src, dt * 1000.0)
+        if lag_info:
+            log_warn("SIGNAL-LAG", " | ".join(lag_info))
+        else:
+            log_warn("SIGNAL", f"[{source}] монеты уже в работе или ранее отстреливались: {pairs}")
         return
 
     margin = calculate_margin_for_delist()
@@ -1505,6 +1654,35 @@ if __name__ == "__main__":
     # FIX-PERF: единый фоновый L2-writer (dirty-flag + 1с batching) вместо
     # thread.start на каждый _mark_opened в hot-path.
     threading.Thread(target=_fired_persist_loop, daemon=True, name="fired-persist").start()
+
+    # Signal-stats: журнал событий (flush 10с) + отчёты 09:00/22:00 МСК в TG.
+    if _sig_stats is not None:
+        threading.Thread(
+            target=_sig_stats.flush_loop, kwargs={"batch_sec": 10.0},
+            daemon=True, name="sigstats-flush",
+        ).start()
+        threading.Thread(
+            target=_sig_stats.report_scheduler_loop, args=(tg_log,),
+            daemon=True, name="sigstats-report",
+        ).start()
+        log_ok("STATS", "signal-stats журнал активен (отчёты 09:00/22:00 МСК в TG)")
+    # Closed-PnL поллер Bybit — дописывает PnL закрытых шортов в статистику.
+    if _pnl_poller is not None and _pnl_poller.enabled:
+        threading.Thread(
+            target=_pnl_poller.poll_loop, daemon=True, name="bybit-pnl",
+        ).start()
+        log_ok("STATS", "closed-PnL поллер Bybit активен (PnL в статистику)")
+
+    # Health-stats: персистентность + TG-отчёт «слабые места» каждые 6ч.
+    if _health is not None:
+        threading.Thread(
+            target=_health.persist_loop, kwargs={"batch_sec": 300.0},
+            daemon=True, name="health-persist",
+        ).start()
+        threading.Thread(
+            target=_health_report_loop, daemon=True, name="health-report",
+        ).start()
+        log_ok("HEALTH", "диагностика делиста активна (TG-отчёт каждые 6ч)")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник делистингов.
     if TREE_OF_ALPHA_WS_ENABLED:
