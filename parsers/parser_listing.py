@@ -16,9 +16,12 @@ from __future__ import annotations
 # ─────────────────────────────────────────────────────────────────
 
 import asyncio
+import atexit
 import os
 import random
 import re
+import signal
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -544,6 +547,122 @@ except Exception as _he:  # noqa: BLE001
     print(f"[HEALTH] init failed: {_he!r} — health-stats отключены", flush=True)
     _health = None
 
+# ── Price-recorder (захват головы) + eval-поллер 6ч-итогов (LISTING) ─
+# Гибрид: рекордер ловит только первые ~10 мин входа (price_paths.jsonl), а по
+# истечении 6ч eval-поллер дотягивает хвост свечами (klines), склеивает,
+# оценивает 12 стратегий, копит винрейт и шлёт 6ч-итоги в TG.
+# get_price из listing_api читает тот же price_cache, что наполняет price_updater.
+_EVAL_LEVERAGE, _EVAL_TAKER, _EVAL_MARGIN = 10.0, 0.00055, 14.0
+_EVAL_WINDOW_SEC = 21600          # 6ч — момент оценки
+_price_paths_path = Path(STATE_DIR) / "price_paths.jsonl"
+_strat_results_path = Path(STATE_DIR) / "strategy_results.jsonl"
+_eval_paths_path = Path(STATE_DIR) / "eval_paths.jsonl"
+try:
+    from tg.price_recorder import PriceRecorder
+    from tg.strategy_eval import evaluate as _strat_evaluate, stitch as _stitch
+    from api.listing_api import get_price as _gp_for_rec
+    # Рекордер = чистый захват головы (без on_complete; оценку делает eval-поллер).
+    _recorder = PriceRecorder(_price_paths_path, _gp_for_rec)
+except Exception as _re:  # noqa: BLE001
+    print(f"[PRICE-REC] init failed: {_re!r} — рекордер отключён", flush=True)
+    _recorder = None
+    _strat_evaluate = None
+
+
+def _record_path(coin: str, side: str, src: str, venue: str, entry) -> None:
+    """Безопасная регистрация траектории (no-op если рекордер не загрузился)."""
+    if _recorder is not None:
+        try:
+            _recorder.track(coin, side, src, venue, entry)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _eval_loop() -> None:
+    """
+    Раз в 60с: для записей price_paths старше 6ч и ещё не оценённых — тянет
+    klines-хвост, склеивает с головой, оценивает стратегии, шлёт 6ч-итоги в TG
+    и пишет полную траекторию в eval_paths (для оффлайн-бэктеста). Дедуп по
+    (coin, entry_ts) из strategy_results — переживает рестарт (догоняет старое).
+    """
+    import json as _json
+    from api.klines import fetch_klines
+    if _strat_evaluate is None:
+        return
+    evaluated = set()
+    try:
+        if _strat_results_path.exists():
+            with _strat_results_path.open("rb") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        row = _json.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    evaluated.add((row.get("coin"), int(row.get("entry_ts", 0))))
+    except Exception as e:  # noqa: BLE001
+        print(f"[EVAL] preload evaluated failed: {e!r}", flush=True)
+    print(f"[EVAL] поллер 6ч-итогов активен (оценено ранее: {len(evaluated)})", flush=True)
+    while True:
+        time.sleep(60)
+        try:
+            if not _price_paths_path.exists():
+                continue
+            now = int(time.time())
+            with _price_paths_path.open("rb") as f:
+                lines = f.readlines()
+            for raw in lines:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = _json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    continue
+                coin = rec.get("coin")
+                ets = int(rec.get("entry_ts", 0) or 0)
+                key = (coin, ets)
+                if not coin or ets <= 0 or key in evaluated:
+                    continue
+                age = now - ets
+                if age < _EVAL_WINDOW_SEC:
+                    continue                       # ещё не 6ч
+                if age > 7 * 86400:
+                    evaluated.add(key)             # слишком старая — пропускаем
+                    continue
+                venue = rec.get("venue", "bybit")
+                head = rec.get("samples") or []
+                last_head_dt = 0.0
+                for s in head:
+                    try:
+                        if s[1] is not None and float(s[0]) > last_head_dt:
+                            last_head_dt = float(s[0])
+                    except (TypeError, ValueError, IndexError):
+                        pass
+                start_ms = (ets + int(last_head_dt)) * 1000
+                end_ms = (ets + _EVAL_WINDOW_SEC) * 1000
+                tail = fetch_klines(venue, coin, start_ms, end_ms)
+                if not tail:
+                    print(f"[EVAL] {coin}: klines пусты (venue={venue}) — оценка по голове",
+                          flush=True)
+                full = _stitch(head, tail, ets)
+                actual = _sig_stats.latest_pnl(coin) if _sig_stats is not None else None
+                rec2 = dict(rec)
+                rec2["samples"] = full
+                try:
+                    text = _strat_evaluate(rec2, actual, _strat_results_path,
+                                           _EVAL_LEVERAGE, _EVAL_TAKER, _EVAL_MARGIN)
+                    tg_log(text)
+                    with _eval_paths_path.open("ab") as ef:
+                        ef.write((_json.dumps(rec2, ensure_ascii=False) + "\n").encode())
+                except Exception as e:  # noqa: BLE001
+                    print(f"[EVAL] {coin} eval failed: {e!r}", flush=True)
+                evaluated.add(key)
+        except Exception as e:  # noqa: BLE001
+            print(f"[EVAL] loop err: {e!r}", flush=True)
+
 
 def _hstat(method: str, *args) -> None:
     """Безопасный вызов health-метрики (no-op если модуль не загрузился)."""
@@ -577,6 +696,15 @@ except Exception as _pe:  # noqa: BLE001
     print(f"[BYBIT-PNL] init failed: {_pe!r} — PnL-трекинг отключён", flush=True)
     _pnl_poller = None
 
+# Closed-PnL поллер Gate.io — реальный PnL Gate-сделок (раньше был «н/д»).
+try:
+    from api.gate_pnl import GateClosedPnL
+    from config.config import GATEIO_API_KEY, GATEIO_SECRET_KEY
+    _gate_pnl_poller = GateClosedPnL(GATEIO_API_KEY, GATEIO_SECRET_KEY)
+except Exception as _gpe:  # noqa: BLE001
+    print(f"[GATE-PNL] init failed: {_gpe!r} — Gate-PnL отключён", flush=True)
+    _gate_pnl_poller = None
+
 
 def _sig_open(coin: str, src: str, venue: str, outcome: str,
               open_ms: float = 0.0, entry: float = 0.0, amount: float = 0.0,
@@ -591,14 +719,17 @@ def _sig_open(coin: str, src: str, venue: str, outcome: str,
 
 
 def _register_pnl(coin: str, src: str, venue: str) -> None:
-    """Регистрирует Bybit-позицию в closed-pnl поллере. Gate пропускаем."""
-    if _pnl_poller is None or venue.lower() != "bybit":
-        return
+    """Регистрирует позицию в closed-pnl поллере (Bybit ИЛИ Gate)."""
+    v = (venue or "").lower()
+
+    def _on_pnl(c: str, pnl: float, exit_price: float, _s=src) -> None:
+        if _sig_stats is not None:
+            _sig_stats.log_pnl(c, _s, pnl, exit_price)
     try:
-        def _on_pnl(c: str, pnl: float, exit_price: float, _s=src) -> None:
-            if _sig_stats is not None:
-                _sig_stats.log_pnl(c, _s, pnl, exit_price)
-        _pnl_poller.register(f"{coin}USDT", coin, time.time(), _on_pnl)
+        if v == "bybit" and _pnl_poller is not None:
+            _pnl_poller.register(f"{coin}USDT", coin, time.time(), _on_pnl)
+        elif v == "gate" and _gate_pnl_poller is not None:
+            _gate_pnl_poller.register(f"{coin}_USDT", coin, time.time(), _on_pnl)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1052,19 +1183,20 @@ def worker(coin: str, margin: float, t_start: float,
                 time.sleep(0.1)
                 continue
 
-            # FIX 2026-06-04: выбор стратегии выхода.
-            #   • Robinhood-листинг на Bybit → time-based exit (партиалы по
-            #     25с/3мин/15мин + стоп в БУ после первого тейка).
-            #   • всё остальное (вкл. Robinhood на Gate) → обычный trailing 1%.
+            # FIX 2026-06-09: выбор стратегии выхода.
+            #   • Robinhood-листинг (Bybit ИЛИ Gate) → тугой выход: трейлинг
+            #     0.75% + страховочный SL 0.5% на всю позицию.
+            #   • всё остальное → обычный trailing 1% / SL 1%.
             # venue читаем из _last_exchange (выставлен в market_open_long).
             try:
                 from api.listing_api import _last_exchange as _lx_pre
                 _venue_pre = _lx_pre.get(coin, "bybit").lower()
             except Exception:  # noqa: BLE001
                 _venue_pre = "bybit"
-            if "ROBINHOOD" in source and _venue_pre == "bybit":
+            if "ROBINHOOD" in source:
                 from api.listing_api import set_robinhood_exit
-                _tp_sl_executor.submit(set_robinhood_exit, coin, entry_price, amount)
+                _tp_sl_executor.submit(set_robinhood_exit, coin, entry_price,
+                                       amount, _venue_pre)
             else:
                 # trading-stop endpoint: trailing 1% в Full-режиме (submit
                 # ~5-20μs не сдвинет open_ms).
@@ -1114,6 +1246,8 @@ def worker(coin: str, margin: float, t_start: float,
                       listing_exchange=lex)
             # Регистрируем позицию для отслеживания закрытого PnL (только Bybit).
             _register_pnl(coin, source, venue)
+            # Бэктест: пишем пост-входную траекторию цены (лонг).
+            _record_path(coin, "long", source, venue, entry_price)
             return
         except Exception as e:
             err_str = str(e)
@@ -2565,6 +2699,50 @@ def _watchdog() -> None:
 # ЗАПУСК
 # ══════════════════════════════════════════════════════════════════
 
+# ── Graceful shutdown: flush статистики на диск перед остановкой ───
+# FIX 2026-06-06: docker при рестарте шлёт SIGTERM → daemon-потоки
+# (_source_stats_persist_loop / _health.persist_loop / _sig_stats.flush_loop /
+# _fired_persist_loop) убиваются мгновенно, не успев записать накопленное.
+# Из-за этого статистика «сбрасывалась» при перезапуске. Здесь синхронно
+# сбрасываем всё на диск по SIGTERM/SIGINT/atexit. Идемпотентно (флаг).
+_shutdown_done = threading.Event()
+
+
+def _graceful_shutdown(*_a) -> None:
+    if _shutdown_done.is_set():
+        return
+    _shutdown_done.set()
+    print("[SHUTDOWN] flush статистики на диск...", flush=True)
+    for label, fn in (
+        ("fired-state", _persist_fired_state),
+        ("source-stats", _persist_source_stats),
+        ("health", (lambda: _health.persist()) if _health is not None else None),
+        ("sig-stats", (lambda: _sig_stats._flush()) if _sig_stats is not None else None),
+        ("price-paths", _recorder.flush_active if _recorder is not None else None),
+    ):
+        if fn is None:
+            continue
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            print(f"[SHUTDOWN] {label} flush failed: {e!r}", flush=True)
+    print("[SHUTDOWN] flush завершён", flush=True)
+
+
+def _install_shutdown_handlers() -> None:
+    atexit.register(_graceful_shutdown)
+
+    def _on_signal(signum, _frame):
+        _graceful_shutdown()
+        sys.exit(0)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _on_signal)
+        except (ValueError, OSError):
+            pass  # не главный поток / платформа без сигнала
+
+
 if __name__ == "__main__":
     # FIX-batch-1: uvloop — asyncio event loop в 2-4x быстрее.
     # FIX: install() deprecated с 0.18+, используем set_event_loop_policy.
@@ -2595,6 +2773,10 @@ if __name__ == "__main__":
     import gc
     gc.freeze()
     print(f"[BOOT] GC frozen: {gc.get_freeze_count()} objects (thresholds={gc.get_threshold()})")
+
+    # FIX 2026-06-06: ставим shutdown-хендлеры в главном потоке — flush
+    # статистики на диск при SIGTERM/SIGINT (docker restart) и atexit.
+    _install_shutdown_handlers()
 
     threading.Thread(target=price_updater,      daemon=True).start()
     threading.Thread(target=gate_price_updater, daemon=True).start()
@@ -2829,7 +3011,7 @@ if __name__ == "__main__":
     # Health-stats: персистентность + периодический TG-отчёт «слабые места».
     if _health is not None:
         threading.Thread(
-            target=_health.persist_loop, kwargs={"batch_sec": 300.0},
+            target=_health.persist_loop, kwargs={"batch_sec": 30.0},
             daemon=True, name="health-persist",
         ).start()
         threading.Thread(
@@ -2837,17 +3019,24 @@ if __name__ == "__main__":
         ).start()
         log_ok("HEALTH", "диагностика слабых мест активна (TG-отчёт каждые 6ч)")
 
-    # Signal-stats: журнал событий (flush 10с) + отчёты 09:00/22:00 МСК в TG.
+    # Price-recorder: захват «головы» входа (первые 10 мин) для бэктеста выходов.
+    if _recorder is not None:
+        threading.Thread(
+            target=_recorder.run_loop, daemon=True, name="price-recorder",
+        ).start()
+        log_ok("PRICE-REC", "рекордер головы входа активен (10 мин, klines-хвост)")
+    # Eval-поллер: через 6ч дотягивает klines, оценивает стратегии, шлёт итоги.
+    if _strat_evaluate is not None:
+        threading.Thread(target=_eval_loop, daemon=True, name="strat-eval").start()
+
+    # Signal-stats: журнал событий (flush 10с). Авто-отчёт 09:00/22:00 МСК
+    # теперь шлёт лог-бот одним сообщением (оба парсера) — см. tg/log_bot.py.
     if _sig_stats is not None:
         threading.Thread(
             target=_sig_stats.flush_loop, kwargs={"batch_sec": 10.0},
             daemon=True, name="sigstats-flush",
         ).start()
-        threading.Thread(
-            target=_sig_stats.report_scheduler_loop, args=(tg_log,),
-            daemon=True, name="sigstats-report",
-        ).start()
-        log_ok("STATS", "signal-stats журнал активен (отчёты 09:00/22:00 МСК в TG)")
+        log_ok("STATS", "signal-stats журнал активен")
 
     # Closed-PnL поллер Bybit — дописывает PnL закрытых позиций в статистику.
     if _pnl_poller is not None and _pnl_poller.enabled:
@@ -2855,6 +3044,12 @@ if __name__ == "__main__":
             target=_pnl_poller.poll_loop, daemon=True, name="bybit-pnl",
         ).start()
         log_ok("STATS", "closed-PnL поллер Bybit активен (PnL в статистику)")
+    # Closed-PnL поллер Gate — реальный PnL Gate-сделок (раньше «н/д»).
+    if _gate_pnl_poller is not None and _gate_pnl_poller.enabled:
+        threading.Thread(
+            target=_gate_pnl_poller.poll_loop, daemon=True, name="gate-pnl",
+        ).start()
+        log_ok("STATS", "closed-PnL поллер Gate активен (PnL в статистику)")
 
     # FIX-batch-4: Tree of Alpha free WS — параллельный источник листингов.
     if TREE_OF_ALPHA_WS_ENABLED:
@@ -2919,6 +3114,7 @@ if __name__ == "__main__":
         try:
             run_telegram_listener()
         except KeyboardInterrupt:
+            _graceful_shutdown()
             break
         except Exception as e:
             log_err("PARSER", f"TG listener упал: {e} — перезапуск через 10с")

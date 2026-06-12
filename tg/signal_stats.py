@@ -54,6 +54,17 @@ MSK = timezone(timedelta(hours=3))
 RETENTION_DAYS = 400
 REPORT_HOURS_MSK = (9, 22)   # во сколько по МСК слать отчёты
 
+# Периоды статистики (скользящие окна) для бота и авто-отчёта.
+PERIOD_WINDOWS = {"1d": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+_PERIOD_LABEL = {"1d": ("День", "за 24 часа"),
+                 "7d": ("Неделя", "за 7 дней"),
+                 "30d": ("Месяц", "за 30 дней")}
+
+
+def _pre_escape(s: str) -> str:
+    """Экранирует & < > для текста внутри <pre> (Telegram HTML)."""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 # outcome → человекочитаемая причина провала
 _OUTCOME_LABEL = {
     "opened":   "✅ открыт",
@@ -546,3 +557,115 @@ class SignalStats:
                 print(f"[SIGSTATS] report failed: {e!r}", flush=True)
             # Защита от двойной отправки в одну минуту (sleep вернулся слишком рано).
             time.sleep(61)
+
+    # ── хелперы для лог-бота / 6ч-итогов ──────────────────────────
+    def latest_pnl(self, coin: str):
+        """
+        Последний реальный закрытый PnL (USDT) по монете из журнала, или None.
+        Сканирует k=pnl события (их пишут BybitClosedPnL и GateClosedPnL через
+        log_pnl). Читает ХВОСТ файла с конца и выходит на первом совпадении —
+        не тянет весь журнал (вызывается на каждом 6ч-закрытии из потока).
+        """
+        if not coin:
+            return None
+        try:
+            self._flush()
+            if not self._events_path.exists():
+                return None
+            size = self._events_path.stat().st_size
+            # Читаем хвост блоками с конца; свежие pnl-события в самом конце.
+            chunk = 256 * 1024
+            with self._events_path.open("rb") as f:
+                pos = size
+                buf = b""
+                while pos > 0:
+                    step = min(chunk, pos)
+                    pos -= step
+                    f.seek(pos)
+                    buf = f.read(step) + buf
+                    lines = buf.split(b"\n")
+                    # первый (неполный) кусок оставляем на следующую итерацию
+                    buf = lines[0] if pos > 0 else b""
+                    tail = lines[1:] if pos > 0 else lines
+                    for raw in reversed(tail):
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            ev = _loads(raw)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if ev.get("k") == "pnl" and ev.get("coin") == coin:
+                            try:
+                                return float(ev.get("pnl"))
+                            except (TypeError, ValueError):
+                                return None
+        except Exception as e:  # noqa: BLE001
+            print(f"[SIGSTATS] latest_pnl failed: {e!r}", flush=True)
+        return None
+
+    @staticmethod
+    def period_for_now(now=None) -> str:
+        """Какой период слать авто-отчётом по дате: 1-го→месяц, пн→неделя, иначе день."""
+        d = datetime.now(MSK) if now is None else datetime.fromtimestamp(int(now), MSK)
+        if d.day == 1:
+            return "30d"
+        if d.weekday() == 0:          # понедельник
+            return "7d"
+        return "1d"
+
+    def period_summary(self, window_key: str = "1d", now=None, top: int = 6) -> str:
+        """
+        Минималистичная сводка за скользящее окно (формат «моно-таблица»):
+        иконка+период, PnL одной строкой, топ источников ровными колонками в
+        <pre>, и хвост «открыто / биржи». Для кнопки бота и авто-отчёта.
+        """
+        win = PERIOD_WINDOWS.get(window_key, 86400)
+        now = _now_ts() if now is None else int(now)
+        agg = self._aggregate(self._read_events(now - win, now))
+        icon = "🟢 LISTING" if self._kind == "LISTING" else "🔴 DELIST"
+        title, range_lbl = _PERIOD_LABEL.get(window_key, ("?", ""))
+        lines = [f"{icon} · <b>{title}</b>", f"└ {range_lbl}"]
+
+        if agg["n_open"] == 0 and agg["n_lag"] == 0 and agg["pnl_n"] == 0:
+            lines.append("")
+            lines.append("<i>нет сигналов за период</i>")
+            return "\n".join(lines)
+
+        # PnL — главная строка.
+        if agg["pnl_n"] > 0:
+            wr = _pct(agg["pnl_win"], agg["pnl_n"])
+            sign = "🟢" if agg["pnl_sum"] >= 0 else "🔴"
+            lines.append("")
+            lines.append(f"💰 {sign} <b>{agg['pnl_sum']:+.2f}$</b>   "
+                         f"win {wr:.0f}%   {agg['pnl_n']} закр.")
+
+        # Источники — ровными колонками (моно <pre>).
+        winners = sorted(agg["first_wins"].items(), key=lambda kv: kv[1], reverse=True)[:top]
+        if winners:
+            rows = []
+            for src, n in winners:
+                appeared = agg["appeared"].get(src, n)
+                wr = _pct(n, appeared)
+                rows.append(f"{str(src)[:14]:<15}{n:>3}{wr:>5.0f}%")
+            lines.append("")
+            lines.append("📡 <b>Источники</b>")
+            lines.append("<pre>" + _pre_escape("\n".join(rows)) + "</pre>")
+
+        # Хвост: открыто / биржи исполнения.
+        total_open = agg["n_open"]
+        total_opened = sum(agg["opened"].values())
+        tail = f"🎯 открыто {total_opened}/{total_open}"
+        if agg["venue"]:
+            vparts = " · ".join(
+                f"{v.capitalize()} {st['ok']}"
+                for v, st in sorted(agg["venue"].items(), key=lambda kv: kv[1]["ok"], reverse=True)
+            )
+            tail += f"   🏦 {vparts}"
+        lines.append("")
+        lines.append(tail)
+        return "\n".join(lines)
+
+    def month_section(self, top: int = 12) -> str:
+        """Совместимость: сводка за 30 дней (тонкая обёртка period_summary)."""
+        return self.period_summary("30d", top=top)

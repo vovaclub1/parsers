@@ -90,6 +90,7 @@ from api.gate_api import (   # noqa: E402  (импорт после monkey-patch
     gate_get_price,
     gate_open_short,
     gate_set_tp_sl_short,
+    gate_known_snapshot,        # FIX: Gate-only делисты (XNO) — шортятся на Gate
     gate_price_updater,         # noqa: F401  — реэкспорт для parser_delist
     gate_preload_lot_steps,     # noqa: F401  — реэкспорт для parser_delist
     warmup_gate_connection,     # noqa: F401  — реэкспорт для parser_delist
@@ -260,6 +261,13 @@ def _sign(ts: str, body_str: str) -> str:
 # Bybit retCode для дублирующегося orderLinkId — ордер УЖЕ принят на сервере,
 # можно считать success (первая попытка прошла, ответ просто потерялся в сети).
 _BYBIT_DUPLICATE_RET_CODES = {30050}  # OrderLinkID is duplicate
+
+# FIX 2026-06-10: retCode «not modified» на /v5/position/trading-stop —
+# отправленный SL/TP/trailing РАВЕН уже стоящему на позиции. Значит защита
+# УЖЕ на месте (SL бандлится в order.create при открытии) → это НЕ ошибка,
+# а no-op. Раньше _post_http2/_post бросали RuntimeError на любой retCode≠0 и
+# ещё ретраили 3-4 раза впустую (инцидент с RH-EXIT). Трактуем как success.
+_BYBIT_NOOP_RET_CODES = {34040}  # not modified
 
 
 # FIX-8: разрешённые символы в symbol/qty/order_link_id — guard против
@@ -463,12 +471,20 @@ def _post_http2(endpoint: str, params: dict, retries: int = 2) -> dict:
             resp.raise_for_status()
             data = _json_loads(resp.content)
             ret_code = data.get("retCode", -1)
+            if ret_code in _BYBIT_NOOP_RET_CODES:
+                # «not modified» — SL/TP уже стоит. Success, без raise/ретраев.
+                return {"retCode": 0, "retMsg": "OK (not modified, no-op)",
+                        "result": data.get("result", {}), "_noop": True}
             if ret_code != 0:
                 raise RuntimeError(
                     f"Bybit error retCode={ret_code} msg={data.get('retMsg')} params={params}"
                 )
             return data
-        except Exception as e:  # noqa: BLE001
+        except RuntimeError:
+            # Бизнес-ошибка Bybit (retCode!=0) сама не починится ретраем — пробрасываем
+            # сразу, чтобы _trading_stop_settle разрулил (осёдка / снятие activePrice).
+            raise
+        except Exception as e:  # noqa: BLE001 — транспортные сбои httpx
             last_exc = e
             if attempt < retries:
                 time.sleep(0.1 * (attempt + 1))
@@ -493,30 +509,62 @@ _TPSL_SETTLE_RETRIES = int(os.getenv("TPSL_SETTLE_RETRIES", "8"))
 _TPSL_SETTLE_SLEEP = float(os.getenv("TPSL_SETTLE_SLEEP_MS", "300")) / 1000.0
 
 
+def _is_zero_position_err(low: str) -> bool:
+    """Подлинная гонка осёдки: позиция ещё не появилась на Bybit (retCode 10001
+    "...zero position"). НЕ путать с другими 10001-ошибками (валидация цены и т.п.)."""
+    return ("zero position" in low
+            or "position is closed" in low
+            or "position not exist" in low
+            or "position does not exist" in low)
+
+
+def _is_trailing_active_err(low: str) -> bool:
+    """activePrice невалидна: цена УЖЕ прошла точку активации трейлинга.
+    Пример Bybit: "TrailingProfit:... set for Sell position should be less than
+    ... last_price:...". Лечится снятием activePrice (немедленная активация)."""
+    return ("trailingprofit" in low
+            or ("trailing" in low and ("last_price" in low or "should be" in low)))
+
+
 def _trading_stop_settle(params: dict, tag: str = "") -> dict:
     """
-    Вызывает /v5/position/trading-stop с ретраями на 10001 "zero position"
-    (гонка осёдки позиции). Прочие ошибки пробрасываются сразу.
-    Возвращает data при успехе, либо raise после исчерпания ретраев.
+    /v5/position/trading-stop с устойчивыми ретраями:
+      • гонка осёдки позиции (10001 "zero position") → ждём _TPSL_SETTLE_SLEEP и повторяем;
+      • невалидная activePrice (цена делистнутой монеты уже прошла точку активации —
+        Bybit "...should be less than last_price...") → снимаем activePrice и повторяем
+        НЕМЕДЛЕННО (трейлинг активируется от текущей цены — то, что и нужно при дампе);
+      • прочие ошибки пробрасываем сразу.
+    Возвращает data при успехе, либо raise.
     """
+    params = dict(params)  # копия — не мутируем словарь вызывающего
+    settle_attempts = 0
+    stripped_active = False
     last_exc: Exception | None = None
-    for attempt in range(1, _TPSL_SETTLE_RETRIES + 1):
+    while True:
         try:
             return _post_http2("/v5/position/trading-stop", params)
         except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            is_zero_pos = ("10001" in msg and "position" in msg.lower()) or \
-                          "zero position" in msg.lower()
-            if not is_zero_pos:
-                raise  # не гонка осёдки — реальная ошибка, не ретраим
-            last_exc = e
-            if attempt < _TPSL_SETTLE_RETRIES:
-                print(f"[TP/SL SETTLE] {tag} zero-position, ждём осёдку "
-                      f"(попытка {attempt}/{_TPSL_SETTLE_RETRIES})", flush=True)
-                time.sleep(_TPSL_SETTLE_SLEEP)
-    # Исчерпали ретраи — пробрасываем последнюю ошибку.
-    assert last_exc is not None
-    raise last_exc
+            low = str(e).lower()
+            # (1) activePrice уже пройдена ценой → активируем трейлинг немедленно
+            if (not stripped_active and "activePrice" in params
+                    and _is_trailing_active_err(low)):
+                params.pop("activePrice", None)
+                stripped_active = True
+                print(f"[TP/SL SETTLE] {tag}: цена прошла точку активации — "
+                      f"активирую трейлинг немедленно (без activePrice)", flush=True)
+                continue  # немедленный повтор, не тратим попытку осёдки
+            # (2) подлинная осёдка нулевой позиции → ждём и ретраим
+            if _is_zero_position_err(low):
+                last_exc = e
+                settle_attempts += 1
+                if settle_attempts < _TPSL_SETTLE_RETRIES:
+                    print(f"[TP/SL SETTLE] {tag} zero-position, ждём осёдку "
+                          f"(попытка {settle_attempts}/{_TPSL_SETTLE_RETRIES})", flush=True)
+                    time.sleep(_TPSL_SETTLE_SLEEP)
+                    continue
+                raise  # исчерпали ретраи осёдки
+            # (3) прочее — реальная ошибка, не ретраим
+            raise
 
 
 def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
@@ -544,6 +592,9 @@ def _post(endpoint: str, params: dict, retries: int = 2) -> dict:
             resp.raise_for_status()
             data = _json_loads(resp.content)  # FIX-batch-1: orjson
             ret_code = data.get("retCode", -1)
+            if ret_code in _BYBIT_NOOP_RET_CODES:
+                return {"retCode": 0, "retMsg": "OK (not modified, no-op)",
+                        "result": data.get("result", {}), "_noop": True}
             if ret_code != 0:
                 raise RuntimeError(
                     f"Bybit error retCode={ret_code} msg={data.get('retMsg')} params={params}"
@@ -955,10 +1006,10 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
         print(f"[TP/SL SKIP] {e}")
         return "skip"
 
-    # Параметры стратегии (env-tunable)
-    sl_price = round(entry_price * (1 + DELIST_SL_PCT), 8)           # +5% аварийный стоп (цена ВЫШЕ входа для short)
-    trailing_distance = round(entry_price * DELIST_TRAILING_PCT, 8)  # 1% абсолютная дистанция в USDT
-    active_price = round(entry_price * (1 - DELIST_ACTIVE_PCT), 8)   # Активация после -1% (цена НИЖЕ входа для short)
+    # Параметры стратегии (env-tunable). Цена short'а: SL ВЫШЕ входа, активация НИЖЕ.
+    sl_price = round(entry_price * (1 + DELIST_SL_PCT), 8)           # аварийный стоп (+SL%)
+    trailing_distance = round(entry_price * DELIST_TRAILING_PCT, 8)  # дистанция трейлинга в USDT
+    active_price = round(entry_price * (1 - DELIST_ACTIVE_PCT), 8)   # активация после -ACTIVE%
 
     sl_size = str(_round_qty(amount, step))  # Вся позиция
 
@@ -967,29 +1018,55 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
         print(f"[TP/SL SKIP] {ticker_name}: slSize={sl_size} (amount={amount}, step={step}) — слишком мало")
         return "skip"
 
-    # Один вызов /v5/position/trading-stop с нативным trailing.
-    # FIX 2026-06-06: через _trading_stop_settle — ретраи на 10001 (осёдка).
-    _trading_stop_settle({
-        "category":     "linear",
-        "symbol":       symbol,
-        "positionIdx":  2,  # short-hedge
+    # FIX 2026-06-11: делистнутая монета часто УЖЕ падает ниже точки активации, пока
+    # позиция оседает. Для Sell Bybit требует activePrice < last_price, иначе отвергает
+    # ВЕСЬ вызов (10001) — и SL гибнет вместе с трейлингом (инцидент HIGH: позиция без
+    # защиты). Если уже прошли активацию — не шлём activePrice (трейлинг от текущей цены).
+    last = get_price(ticker_name)
+    past_activation = last is not None and last <= active_price
 
-        # Аварийный стоп (если цена пошла вверх против шорта)
-        "stopLoss":     str(sl_price),
-        "slTriggerBy":  "LastPrice",
-        "slSize":       sl_size,
+    base = {
+        "category":    "linear",
+        "symbol":      symbol,
+        "positionIdx": 2,  # short-hedge
+        "stopLoss":    str(sl_price),
+        "slTriggerBy": "LastPrice",
+        "slSize":      sl_size,
+    }
+    trail = {"trailingStop": str(trailing_distance)}  # tpslMode не указываем → Full mode
+    if not past_activation:
+        trail["activePrice"] = str(active_price)
 
-        # Нативный трейлинг (активируется после -1%)
-        "trailingStop": str(trailing_distance),
-        "activePrice":  str(active_price),
+    try:
+        _trading_stop_settle({**base, **trail}, tag=ticker_name)
+    except Exception as e_comb:  # noqa: BLE001
+        # Защита от «голой» позиции: ставим SL и трейлинг ПО ОТДЕЛЬНОСТИ — отказ одной
+        # защиты не должен оставлять позицию без другой.
+        print(f"[TP/SL] {ticker_name} комбинированный вызов упал: {e_comb} → "
+              f"ставлю SL и трейлинг по отдельности", flush=True)
+        done = []
+        try:
+            _trading_stop_settle(dict(base), tag=f"{ticker_name}-SL")
+            done.append("SL")
+        except Exception as e_sl:  # noqa: BLE001
+            print(f"[TP/SL] {ticker_name} SL-only упал: {e_sl}", flush=True)
+        try:
+            _trading_stop_settle({"category": "linear", "symbol": symbol,
+                                  "positionIdx": 2,
+                                  "trailingStop": str(trailing_distance)},
+                                 tag=f"{ticker_name}-TS")
+            done.append("trailing")
+        except Exception as e_ts:  # noqa: BLE001
+            print(f"[TP/SL] {ticker_name} trailing-only упал: {e_ts}", flush=True)
+        if not done:
+            raise  # пусть set_tp_sl залогирует громкий [TP/SL FAIL]
+        print(f"[TP/SL PARTIAL] {ticker_name}: выставлено {'+'.join(done)}", flush=True)
 
-        # tpslMode не указываем — trailing на всю позицию (Full mode по умолчанию)
-    }, tag=ticker_name)
-
+    act_txt = "немедленно (цена прошла активацию)" if past_activation else f"@{active_price:.6f}"
     print(
-        f"[TP/SL SET SHORT] {ticker_name} | entry={entry_price:.2f} | "
-        f"SL={sl_price:.2f}(+{DELIST_SL_PCT*100:.0f}%) | "
-        f"Trailing={DELIST_TRAILING_PCT*100:.1f}% (active@{active_price:.2f})"
+        f"[TP/SL SET SHORT] {ticker_name} | entry={entry_price:.6f} | "
+        f"SL={sl_price:.6f}(+{DELIST_SL_PCT*100:.1f}%) | "
+        f"Trailing={DELIST_TRAILING_PCT*100:.1f}% (active {act_txt})", flush=True
     )
     return "Выставил trailing stop"
 
@@ -1036,70 +1113,64 @@ _RE_DOLLAR_TKN  = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,9})\b")
 _RE_LINK_CONTEXT = re.compile(r"\b(?:SOURCE\s+)?LINK\b\s*:?", re.IGNORECASE)
 
 
+def _extract_from_segment(segment: str) -> list[str]:
+    """
+    Извлекает тикеры из захваченного делист-СЕГМЕНТА (то, что идёт после
+    «Will Delist»/«delisting of»…). Ловит и полные пары (ABCUSDT→ABC), и голые
+    тикеры (XNO, IQ). Всё фильтруется по реально торгуемым (Bybit ∪ Gate) —
+    отсекает английские слова из текста.
+    """
+    pairs = _RE_USDT.findall(segment)        # ABCUSDT / ABC-USDT → ABC
+    bare = _RE_PAIR_TOKENS.findall(segment)  # XNO, IQ, QUICK, DGB
+    return _filter_known(pairs + bare)
+
+
 def find_pairs(text: str) -> list[str]:
     """
-    Извлекает тикеры монет из полного текста статьи о делистинге.
-    Порядок поиска (от точного к общему):
-      1. Явные пары с USDT: ABC/USDT, ABC-USDT, ABCUSDT
-      2. Список после «Will Delist»: "Will Delist ABC, DEF, GHI on..."
-      3. Список после «delist»/«remove» + перечисление токенов
-      4. Аккуратный fallback по всему тексту
-    :param text: str - текст статьи о делистинге.
-    :return: list[str] - список тикеров монет.
+    Извлекает тикеры монет из текста статьи о делистинге.
+    Приоритет (FIX 2026-06-08): точный делист-список Binance — источник истины.
+      1. «Will Delist A, B, C on …» / monitoring-tag — ТЕРМИНАЛЬНО: тикеры идут
+         сразу за «Will Delist», берём ТОЛЬКО их (даже если пусто — значит ни
+         одна делистнутая монета у нас не торгуется, шортить нечего). Это убивает
+         класс ошибок «промо-пара из body (FORMUSDT) перебила реальный делист» —
+         инцидент: "Will Delist XNO,IQ,QUICK,DGB on" → шорт по FORM из тела.
+      2. Иначе → явные пары (ABCUSDT) → $TICKER → широкий delist-блок → fallback.
     """
-    # FIX-PERF: убраны print'ы "[FIND PAIRS] метод=..." — find_pairs
-    # вызывается в hot-path TG/article handler'а перед submit'ом, каждый
-    # print с PYTHONUNBUFFERED=1 ≈ ~0.5-1мс. "Монеты: [...]" в DELIST-блоке
-    # показывает найденные тикеры; method для debug — раскомментировать.
     text_upper = text.upper()
 
+    # ── 1. Точные делист-списки (тикеры сразу за словами) — терминально ─
+    for rx in (_RE_WILL_DELIST, _RE_MONITORING):
+        m = rx.search(text_upper)
+        if m:
+            return _extract_from_segment(m.group(1))
+
+    # ── 2. Явные USDT-пары (формат "FOOUSDT delisted") ─────────────
     usdt_pairs = _RE_USDT.findall(text_upper)
     if usdt_pairs:
         found = _filter_tokens(usdt_pairs)
         if found:
             return found
 
-    # FIX-batch-7: $TICKER маркеры (CLW: "Monitoring Tag Added – $ALCX...")
-    # FIX: нормализуем в uppercase — каналы изредка пишут "$alcx".
+    # FIX-batch-7: $TICKER маркеры ("Monitoring Tag Added – $ALCX…").
     dollar_pairs = [t.upper() for t in _RE_DOLLAR_TKN.findall(text)]
     if dollar_pairs:
         found = _filter_tokens(dollar_pairs)
         if found:
             return found
 
-    m = _RE_WILL_DELIST.search(text_upper)
-    if m:
-        tokens = _RE_PAIR_TOKENS.findall(m.group(1))
-        # FIX 2026-06-06: прозовый метод → фильтр по known_coins (мусор-слова).
-        found  = _filter_known(tokens)
-        if found:
-            return found
-
-    # FIX-batch-6: "Will Extend the Monitoring Tag to Include ALCX..."
-    m = _RE_MONITORING.search(text_upper)
-    if m:
-        tokens = _RE_PAIR_TOKENS.findall(m.group(1))
-        found  = _filter_known(tokens)
-        if found:
-            return found
-
+    # ── 3. Широкий delist-блок (loose) — только торгуемые ──────────
     m = _RE_DELIST_BLOCK.search(text_upper)
     if m:
-        tokens = _RE_PAIR_TOKENS.findall(m.group(1))
-        found  = _filter_known(tokens)
+        found = _extract_from_segment(m.group(1))
         if found:
             return found
 
-    # FIX 2026-06-06: вырезаем "source link"/"link:" контекст ПЕРЕД жадным
-    # fallback — иначе LINK (реальный Bybit-символ) выдирается из слова "link".
-    # Инцидент: "Pair: D/USDT ... Source link: Binance" → шорт по LINK вместо D.
+    # ── 4. Аккуратный fallback по всему тексту (только торгуемые) ───
+    # FIX: вырезаем "source link" контекст — иначе LINK выдирается из "link".
     cleaned = _RE_LINK_CONTEXT.sub(" ", text_upper)
     all_tokens = _RE_ALL_TOKENS.findall(cleaned)
-    # FIX: snapshot known_coins под lock — price_updater делает clear()+update(),
-    # между ними set пуст. Без snapshot fallback мог бы пропустить валидную монету.
-    with cache_lock:
-        known_snapshot = frozenset(known_coins)
-    return [t for t in _filter_tokens(all_tokens) if t in known_snapshot]
+    known = _known_union()
+    return [t for t in _filter_tokens(all_tokens) if t in known]
 
 
 def _filter_tokens(tokens: list[str]) -> list[str]:
@@ -1125,22 +1196,29 @@ def _filter_tokens(tokens: list[str]) -> list[str]:
     return result
 
 
+def _known_union() -> frozenset:
+    """Монеты, торгуемые на Bybit ИЛИ Gate (где можем реально открыть шорт).
+    Bybit-only known_coins пропускал Gate-делисты (XNO) → их не шортили."""
+    with cache_lock:
+        kb = frozenset(known_coins)
+    return kb | gate_known_snapshot()
+
+
 def _filter_known(tokens: list[str]) -> list[str]:
     """
     FIX 2026-06-06: как _filter_tokens, но дополнительно требует присутствия
-    в known_coins (реально торгуемые символы Bybit/Gate). Для ПРОЗОВЫХ методов
+    среди реально торгуемых символов (Bybit ∪ Gate). Для ПРОЗОВЫХ методов
     извлечения (_RE_WILL_DELIST/_RE_MONITORING/_RE_DELIST_BLOCK), где захват
     может содержать английские слова из текста статьи. Инцидент: body
     "...delist... our priority ensure best while continuing adapt evolving
     market dynamics" → шорты по 10 словам-мусору. Реальные делист-тикеры всегда
-    торгуются (делистят то что есть на бирже) → known_coins их не отсекает.
+    торгуются (делистят то что есть на бирже) → отсекаем мусор.
     """
     base = _filter_tokens(tokens)
     if not base:
         return []
-    with cache_lock:
-        known_snapshot = frozenset(known_coins)
-    return [t for t in base if t in known_snapshot]
+    known = _known_union()
+    return [t for t in base if t in known]
 
 
 def _dedupe(tokens: list[str]) -> list[str]:
@@ -1162,6 +1240,17 @@ def warmup_bybit_connection() -> None:
         print("[WARMUP] Bybit соединение прогрето")
     except Exception as e:
         print(f"[WARMUP ERROR] {e}")
+    # FIX 2026-06-10: HTTP/2-клиент для TP/SL/trailing (_post_http2) создавался
+    # лениво на ПЕРВОЙ постановке стопа → первый листинг платил cold-init httpx
+    # + TCP+TLS+H2 handshake (видно как 64мс vs 9мс). Прогреваем здесь: создаём
+    # клиент и открываем TLS публичным GET (без подписи). Best-effort.
+    try:
+        _client = _get_httpx_client()
+        if _client is not None:
+            _client.get(BYBIT_BASE_URL + "/v5/market/time", timeout=3)
+            print("[WARMUP] Bybit HTTP/2-клиент прогрет (TP/SL путь)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARMUP HTTP2] {e}")
 
 
 # ── TLS heartbeat: держим pool горячим ───────────────────────────

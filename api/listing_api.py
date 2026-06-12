@@ -83,12 +83,12 @@ __all__ = [
 _SL_MULT       = 0.99    # стоп-лосс: -1% от entry (было -8%)
 _TRAIL_PCT     = 0.01    # трейлинг-дистанция: 1% (было 3.5%)
 _TRAIL_ACT     = 1.01    # активация трейлинга: +1% от entry (было +3.5%)
-# Robinhood time-based exit (см. set_robinhood_exit).
-_RH_BE_MULT    = 1.002   # стоп в БУ после первого тейка: entry + 0.2%
-_RH_FRACTION   = 0.30    # доля на каждый из первых двух партиалов
-_RH_T1_SEC     = 25      # первый партиал (30%) — t+25с
-_RH_T2_SEC     = 180     # второй партиал (30%) — t+3мин
-_RH_T3_SEC     = 900     # остаток (40%) — t+15мин
+# Robinhood exit: тугой трейлинг + страховочный стоп (см. set_robinhood_exit).
+# FIX 2026-06-09: было time-based (партиалы 30/30/40 + БУ) → теперь чистый
+# трейлинг 0.75% + страховочный SL 0.5% на всю позицию.
+_RH_SL_MULT    = 0.995    # страховочный SL: -0.5% от entry
+_RH_TRAIL_PCT  = 0.0075   # трейлинг-дистанция: 0.75%
+_RH_TRAIL_ACT  = 1.0075   # активация трейлинга: +0.75% от entry
 
 # FIX 2026-06-05: ретраи на price-cap reject (30208 "order price higher than
 # maximum buying price") — на быстром листинге цена уходит за cap Bybit.
@@ -372,76 +372,21 @@ def set_tp_sl_long(ticker_name: str, entry_price: float, amount: float) -> str:
         return "error"
 
 
-# ── Robinhood time-based exit ─────────────────────────────────────
-# Robinhood-листинги закрываются НЕ по трейлингу, а по времени:
-#   t+25с  → 30% reduce-only + перенос SL остатка в БУ (entry × 1.002)
-#   t+180с → ещё 30% reduce-only
-#   t+900с → закрыть остаток (40%)
-# Сразу при открытии ставится только аварийный SL -1% (на всю позицию).
+# ── Robinhood exit: трейлинг 0.75% + страховочный SL 0.5% ─────────
+# FIX 2026-06-09: time-based партиалы (30/30/40 + БУ) заменены на тугой
+# нативный трейлинг 0.75% + аварийный стоп 0.5% на всю позицию.
 
-def close_reduce_long(ticker_name: str, qty: float) -> bool:
+def set_robinhood_exit(ticker_name: str, entry_price: float, amount: float,
+                       venue: str = "bybit") -> str:
     """
-    Закрывает часть лонга reduce-only Market Sell на Bybit. positionIdx=1.
-    reduce_only гарантирует, что ордер только уменьшает позицию (не откроет
-    шорт, если qty случайно больше остатка). Возвращает True при отправке.
+    Robinhood-стратегия выхода: нативный трейлинг 0.75% + страховочный SL 0.5%
+    на всю позицию (туже обычного листинга 1%/1%). Bybit — через trading-stop
+    (Full-режим), Gate — через gate_set_tp_sl_long с теми же процентами.
     """
-    symbol = f"{ticker_name}USDT"
-    try:
-        step = _get_qty_step(symbol)
-        qty_r = _round_qty(qty, step)
-        if qty_r <= 0:
-            print(f"[RH-EXIT] {ticker_name}: qty={qty}→0 после округления, skip")
-            return False
-        post_order(symbol, "Sell", str(qty_r), 1,
-                   order_link_id=new_order_link_id(), reduce_only=True)
-        return True
-    except Exception as e:  # noqa: BLE001
-        print(f"[RH-EXIT] {ticker_name}: reduce-only close упал: {e!r}")
-        return False
+    if (venue or "").lower() == "gate":
+        return gate_set_tp_sl_long(ticker_name, entry_price, amount,
+                                   sl_pct=(1.0 - _RH_SL_MULT), trail_pct=_RH_TRAIL_PCT)
 
-
-def _set_sl_breakeven_long(ticker_name: str, entry_price: float) -> None:
-    """Переносит SL лонга в безубыток (entry × _RH_BE_MULT) на остаток позиции."""
-    symbol = f"{ticker_name}USDT"
-    be_price = round(entry_price * _RH_BE_MULT, 8)
-    try:
-        _post_http2("/v5/position/trading-stop", {
-            "category":    "linear",
-            "symbol":      symbol,
-            "positionIdx": 1,
-            "stopLoss":    str(be_price),
-            "slTriggerBy": "LastPrice",
-            # Full-режим: SL на всю оставшуюся позицию.
-        })
-        print(f"[RH-EXIT] {ticker_name}: SL → БУ {be_price} (entry+0.2%)")
-    except Exception as e:  # noqa: BLE001
-        print(f"[RH-EXIT] {ticker_name}: перенос SL в БУ упал: {e!r}")
-
-
-def _robinhood_exit_scheduler(ticker_name: str, entry_price: float,
-                              amount: float) -> None:
-    """Фоновый планировщик партиалов Robinhood (запускается в отдельном потоке)."""
-    import time as _t
-    part = amount * _RH_FRACTION  # 30% на каждый из первых двух тейков
-    # t+25с: первый партиал 30% + SL остатка в БУ.
-    _t.sleep(_RH_T1_SEC)
-    if close_reduce_long(ticker_name, part):
-        _set_sl_breakeven_long(ticker_name, entry_price)
-    # t+180с: второй партиал 30%.
-    _t.sleep(max(0, _RH_T2_SEC - _RH_T1_SEC))
-    close_reduce_long(ticker_name, part)
-    # t+900с: закрыть остаток (40% + всё что не закрылось reduce-only безопасно).
-    _t.sleep(max(0, _RH_T3_SEC - _RH_T2_SEC))
-    # Остаток = всё что есть (reduce_only обрежет до реального размера).
-    close_reduce_long(ticker_name, amount)
-    print(f"[RH-EXIT] {ticker_name}: time-based exit завершён (t+{_RH_T3_SEC}с)")
-
-
-def set_robinhood_exit(ticker_name: str, entry_price: float, amount: float) -> str:
-    """
-    Robinhood-стратегия: аварийный SL -1% сразу + time-based партиалы в фоне.
-    Только Bybit (вызывается из воркера лишь когда venue==bybit).
-    """
     symbol = f"{ticker_name}USDT"
     try:
         step = _get_qty_step(symbol)
@@ -449,34 +394,34 @@ def set_robinhood_exit(ticker_name: str, entry_price: float, amount: float) -> s
         print(f"[RH-EXIT SKIP] {e}")
         return "skip"
 
-    sl = round(entry_price * _SL_MULT, 8)               # -1% аварийный
-    sl_size = str(_round_qty(amount, step))
+    sl = round(entry_price * _RH_SL_MULT, 8)                  # -0.5% страховочный
+    trailing_distance = round(entry_price * _RH_TRAIL_PCT, 8)  # 0.75% дистанция
+    active_price = round(entry_price * _RH_TRAIL_ACT, 8)       # активация +0.75%
+
+    sl_size = str(_round_qty(amount, step))                   # вся позиция
     if sl_size == "0.0" or float(sl_size) <= 0:
         print(f"[RH-EXIT SKIP] {ticker_name}: slSize={sl_size} — слишком мало")
         return "skip"
 
     try:
-        # FIX 2026-06-06: ретрай на осёдку позиции (SL ставится сразу после open).
+        # FIX 2026-06-06: ретрай на осёдку позиции (ставится сразу после open).
         _trading_stop_settle({
-            "category":    "linear",
-            "symbol":      symbol,
-            "positionIdx": 1,
-            "stopLoss":    str(sl),
-            "slTriggerBy": "LastPrice",
-            "slSize":      sl_size,
-            # БЕЗ trailing/TP — выход по времени.
+            "category":     "linear",
+            "symbol":       symbol,
+            "positionIdx":  1,
+            "stopLoss":     str(sl),
+            "slTriggerBy":  "LastPrice",
+            "slSize":       sl_size,
+            "trailingStop": str(trailing_distance),
+            "activePrice":  str(active_price),
+            # tpslMode не указываем → Full-режим (trailing на всю позицию)
         }, tag=ticker_name)
     except Exception as e:  # noqa: BLE001
-        print(f"[RH-EXIT] {ticker_name}: аварийный SL упал: {e!r}")
+        print(f"[RH-EXIT] {ticker_name}: trailing/SL упал: {e!r}")
 
-    threading.Thread(
-        target=_robinhood_exit_scheduler,
-        args=(ticker_name, entry_price, amount),
-        daemon=True, name=f"rh-exit-{ticker_name}",
-    ).start()
-    print(f"[RH-EXIT SET] {ticker_name} | entry={entry_price} | SL={sl}(-1%) | "
-          f"партиалы: 30%@{_RH_T1_SEC}с→БУ, 30%@{_RH_T2_SEC}с, остаток@{_RH_T3_SEC}с")
-    return "Robinhood time-based exit запущен"
+    print(f"[RH-EXIT SET] {ticker_name} | entry={entry_price} | "
+          f"SL={sl}(-0.5%) | Trailing=0.75% (active@{active_price})")
+    return "Robinhood trailing 0.75% + SL 0.5%"
 
 
 # ── Парсинг тикера из TG-сообщения ───────────────────────────────

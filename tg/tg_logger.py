@@ -57,7 +57,7 @@ def _escape_for_html(msg: str) -> str:
     return tmp
 
 
-def _tg_log_blocking(msg: str) -> None:
+def _tg_log_blocking(msg: str, reply_markup=None) -> None:
     """Sync-отправка в Telegram. Вызывается из _tg_log_executor в фоне."""
     if not _CHAT_ID or not TG_LOG_BOT_TOKEN:
         return
@@ -65,25 +65,20 @@ def _tg_log_blocking(msg: str) -> None:
     url = f"https://api.telegram.org/bot{TG_LOG_BOT_TOKEN}/sendMessage"
     text = _escape_for_html(msg)
 
+    payload = {"chat_id": _CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
     try:
-        resp = _session.post(
-            url,
-            json={
-                "chat_id": _CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-            },
-            timeout=5,
-        )
+        resp = _session.post(url, json=payload, timeout=5)
         if not resp.ok:
             # FIX: если HTML парсинг падает (битый тег / спецсимволы) —
             # повторяем БЕЗ parse_mode, чтобы сообщение всё-таки дошло.
             if resp.status_code == 400 and "parse" in resp.text.lower():
-                resp = _session.post(
-                    url,
-                    json={"chat_id": _CHAT_ID, "text": html.escape(msg)},
-                    timeout=5,
-                )
+                payload2 = {"chat_id": _CHAT_ID, "text": html.escape(msg)}
+                if reply_markup is not None:
+                    payload2["reply_markup"] = reply_markup
+                resp = _session.post(url, json=payload2, timeout=5)
                 if resp.ok:
                     return
             print(f"[TG LOG ERR] HTTP {resp.status_code} | {resp.text[:160]}")
@@ -91,10 +86,13 @@ def _tg_log_blocking(msg: str) -> None:
         print(f"[TG LOG ERR] {e}")
 
 
-def tg_log(msg: str) -> None:
+def tg_log(msg: str, reply_markup=None) -> None:
     """
     Fire-and-forget отправка в TG лог-чат. Возвращается мгновенно (~5-20мкс),
     реальный HTTP-запрос идёт в _tg_log_executor.
+
+    reply_markup — опциональная inline-клавиатура (dict). Используется 6ч-итогами
+    стратегий: кнопки-стратегии под карточкой → тап даёт описание.
 
     FIX-PERF: раньше был sync requests.post — блокировал worker в hot-path
     на 50-300мс (RTT до Telegram) после открытия позиции. Это держало GIL
@@ -107,7 +105,7 @@ def tg_log(msg: str) -> None:
         print("[TG LOG] токен или chat_id не заданы в .env, сообщение пропущено")
         return
     try:
-        _tg_log_executor.submit(_tg_log_blocking, msg)
+        _tg_log_executor.submit(_tg_log_blocking, msg, reply_markup)
     except RuntimeError:
         # Executor закрыт (на shutdown) — игнор.
         pass

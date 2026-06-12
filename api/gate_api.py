@@ -45,6 +45,16 @@ _TRAILING_MAX_LIFETIME = 24 * 3600   # FIX: трейлинг не висит д�
 gate_price_cache: dict[str, float] = {}   # {"BTC": 65000.0, ...}
 gate_known_coins: set[str]         = set()
 _cache_lock = threading.Lock()
+
+
+def gate_known_snapshot() -> frozenset:
+    """Потокобезопасный снимок монет, торгуемых на Gate-фьючерсах (USDT-перпы).
+    Нужен delist-парсеру: Gate-only делисты (например XNO) распознаются и
+    шортятся на Gate, хотя их нет на Bybit."""
+    with _cache_lock:
+        return frozenset(gate_known_coins)
+
+
 # FIX (review high): age-gate против money-losing сайзинга по замороженной
 # цене при сбое Gate. gate_get_price → 0 если кэш протух → caller не торгует
 # по старой цене (market_open_* трактует 0 как "нет цены").
@@ -54,6 +64,22 @@ _GATE_STALE_SEC = 10.0   # обновление каждые 3с → 3 проп�
 # ── HTTP сессия ───────────────────────────────────────────────────
 _session = requests.Session()
 _session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+
+# ── Gate WS Trade ──────────────────────────────────────────────────
+# FIX 2026-06-06: перенос ордеров с REST на WebSocket — убирает один
+# HMAC+HTTP+TLS roundtrip (~200-700мс → ~50-100мс). Модель как Bybit sync WS.
+try:
+    from api.gate_ws import init as _gate_ws_init, warmup_gate_ws, \
+        place_order_ws as _gate_ws_order, get_client as _gate_ws_client
+    _gate_ws_init(GATEIO_API_KEY, GATEIO_SECRET_KEY)
+    _gate_ws_available = True
+except Exception as _gwse:  # noqa: BLE001
+    print(f"[GATE-WS] модуль не подгружен: {_gwse!r} — будет только REST")
+    # заглушки чтобы не засорять _gate_open условиями
+    def warmup_gate_ws(timeout: float = 10.0) -> bool:  # type: ignore[no-redef]
+        return False
+    def _gate_ws_order(args: dict, timeout: float = 3.0) -> dict | None:  # type: ignore[no-redef]
+        return None
 
 # FIX: кэш установленных плеч, чтобы не дёргать API перед каждым ордером.
 _leverage_set_for: set[str] = set()
@@ -312,6 +338,40 @@ def _is_leverage_margin_error(exc: Exception) -> bool:
     return any(k in label for k in ("LEVERAGE", "MARGIN", "INSUFFICIENT", "RISK_LIMIT"))
 
 
+def _is_trigger_passed_error(exc) -> bool:
+    """
+    True, если Gate отверг постановку стоп-триггера, потому что цена УЖЕ за ним
+    (AUTO_TRIGGER_PRICE_LESS_LAST для лонга / GREATER для шорта). Значит позиция
+    уже пробила стоп → её надо закрыть по рынку немедленно.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    try:
+        label = str((resp.json() or {}).get("label", ""))
+    except Exception:  # noqa: BLE001
+        label = getattr(resp, "text", "") or ""
+    return "AUTO_TRIGGER_PRICE" in label.upper()
+
+
+def _gate_market_close(ticker: str, contracts: int, is_long: bool) -> bool:
+    """Немедленное закрытие позиции по рынку (reduce-only IOC). True = ушло.
+    Лонг → size<0 (продаём), шорт → size>0 (выкупаем)."""
+    contract = f"{ticker}_USDT"
+    size = -int(abs(contracts)) if is_long else int(abs(contracts))
+    try:
+        _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
+            "contract": contract, "size": size, "price": "0",
+            "tif": "ioc", "reduce_only": True,
+        })
+        print(f"{_tag('GATE SL→MARKET', RED)} {BOLD}{ticker}{RESET} | "
+              f"цена уже за SL → закрыто по рынку ({abs(contracts)} контр.)")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"{_tag('GATE CLOSE ERR', RED)} {ticker}: {e}")
+        return False
+
+
 def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, float]:
     """
     Общая функция открытия позиции на Gate.io (лонг или шорт).
@@ -357,18 +417,19 @@ def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, f
         "reduce_only": False,
         "auto_size":   "",
     }
-    try:
-        result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
-    except requests.HTTPError as e:
-        # M9 self-heal: фоновая установка плеча могла не успеть (или дефолт
-        # аккаунта ниже _LEVERAGE) → Gate отверг по марже/плечу. Ставим плечо
-        # СИНХРОННО и повторяем РОВНО один раз. Отвергнутый ордер позиции не
-        # создал → повтор безопасен (без double-position).
-        if not _is_leverage_margin_error(e):
-            raise
-        print(f"{_tag('GATE RETRY-LEV', YELLOW)} {BOLD}{contract}{RESET} | margin/leverage reject → sync set + retry")
-        _gate_set_leverage(contract, _LEVERAGE, cross=True)
-        result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
+    # FIX 2026-06-06: WS Trade быстрее REST (~50-100мс вместо 200-700мс).
+    # Если WS не готов — автоматический fallback на HTTP (_post_signed).
+    result = _gate_ws_order(_order_body)
+    if result is None:
+        try:
+            result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
+        except requests.HTTPError as e:
+            # M9 self-heal: leverage/margin reject → sync set + retry ONCE.
+            if not _is_leverage_margin_error(e):
+                raise
+            print(f"{_tag('GATE RETRY-LEV', YELLOW)} {BOLD}{contract}{RESET} | margin/leverage reject → sync set + retry")
+            _gate_set_leverage(contract, _LEVERAGE, cross=True)
+            result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
 
     # M1: IOC market-ордер мог быть ПРИНЯТ (HTTP 200), но не исполнен —
     # на свежем листинге с тонкой ликвидностью. Раньше `or price` подставлял
@@ -678,18 +739,20 @@ def gate_start_trailing_short(ticker: str, entry_price: float, contracts: int,
 
 # ── TP/SL для лонга на Gate.io ────────────────────────────────────
 
-def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
+def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float,
+                        sl_pct: float = 0.01, trail_pct: float = 0.01) -> str:
     """
-    FIX 2026-06-04: новая стратегия — только SL -1% + trailing 1% на всю
-    позицию. Фиксированный TP убран (синхрон с Bybit listing_api).
-      - SL  -1%  на 100% позиции (price_order reduce-only)
-      - Trailing 1% на 100% позиции (через поллинг-поток _run_trailing_stop)
+    SL -sl_pct + trailing trail_pct на всю позицию (синхрон с Bybit listing_api).
+    Дефолт 1%/1% (обычный листинг); Robinhood зовёт с 0.5%/0.75%.
+      - SL  на 100% позиции (price_order reduce-only)
+      - Trailing на 100% позиции (через поллинг-поток _run_trailing_stop)
     """
     contract = f"{ticker}_USDT"
-    sl = round(entry_price * 0.99, 8)   # -1%
+    sl = round(entry_price * (1.0 - sl_pct), 8)
     sl_contracts = int(amount)
 
-    def _place_price_order(trigger: float, order_price: float, size: int, label: str) -> None:
+    def _place_price_order(trigger: float, order_price: float, size: int, label: str) -> str:
+        """Возвращает 'ok' / 'fail' / 'closed' (закрыто по рынку — цена за стопом)."""
         try:
             price_str   = _gate_round_price(ticker, order_price)
             trigger_str = _gate_round_price(ticker, trigger)
@@ -715,7 +778,18 @@ def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
                 f"{_tag('GATE ORDER', color)} {ticker} | "
                 f"{label} → trigger={trigger_str} | size={size} контрактов"
             )
+            return "ok"
         except Exception as e:
+            # FIX 2026-06-09: цена УЖЕ за SL (медленный листинг съел время) →
+            # триггер reject'нут. Стоп уже должен был сработать → закрываем по
+            # рынку немедленно, иначе защиты -1% нет (раньше молча падали на
+            # трейлинг → закрытие на гэпе по -4%).
+            if order_price < entry_price and _is_trigger_passed_error(e):
+                print(f"{_tag('GATE SL PASSED', RED)} {ticker}: цена уже ниже SL "
+                      f"-1% → market-close")
+                # Закрыли по рынку → 'closed' (трейлинг не нужен). Если закрытие
+                # упало — НЕ глушим: возвращаем 'fail', чтобы трейлинг стал бэкстопом.
+                return "closed" if _gate_market_close(ticker, size, is_long=True) else "fail"
             if hasattr(e, "response") and getattr(e, "response", None) is not None:
                 resp = e.response
                 print(
@@ -724,16 +798,20 @@ def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
                 )
             else:
                 print(f"{_tag('GATE TP/SL ERR', RED)} {ticker} [{label}]: {e}")
+            return "fail"
 
-    _place_price_order(sl, sl, sl_contracts, "SL -1%")
+    _sl_lbl = f"SL -{sl_pct * 100:.2f}%"
+    if _place_price_order(sl, sl, sl_contracts, _sl_lbl) == "closed":
+        return "Gate: цена уже за SL — закрыто по рынку"
 
-    # Trailing 1% на всю позицию (поллинг-поток).
+    # Trailing на всю позицию (поллинг-поток).
     if sl_contracts > 0:
-        gate_start_trailing(ticker, entry_price, sl_contracts, trail_pct=0.01)
+        gate_start_trailing(ticker, entry_price, sl_contracts, trail_pct=trail_pct)
 
     print(
         f"{_tag('GATE TP/SL SET', CYAN)} {BOLD}{ticker}{RESET} | "
-        f"SL={sl}(-1%/100%) | Trailing=1%(100%/{sl_contracts}контр)"
+        f"SL={sl}(-{sl_pct * 100:.2f}%/100%) | "
+        f"Trailing={trail_pct * 100:.2f}%(100%/{sl_contracts}контр)"
     )
     return "Gate TP/SL выставлен"
 
@@ -752,7 +830,8 @@ def gate_set_tp_sl_short(ticker: str, entry_price: float, amount: float) -> str:
     sl = round(entry_price * 1.01, 8)   # +1% — стоп выше входа
     sl_contracts = int(amount)
 
-    def _place(trigger: float, order_price: float, size: int, label: str) -> None:
+    def _place(trigger: float, order_price: float, size: int, label: str) -> str:
+        """Возвращает 'ok' / 'fail' / 'closed' (закрыто по рынку — цена за стопом)."""
         try:
             price_str   = _gate_round_price(ticker, order_price)
             trigger_str = _gate_round_price(ticker, trigger)
@@ -777,10 +856,19 @@ def gate_set_tp_sl_short(ticker: str, entry_price: float, amount: float) -> str:
                 f"{_tag('GATE ORDER', RED)} {ticker} | "
                 f"{label} → trigger={trigger_str} | size={size} контрактов"
             )
+            return "ok"
         except Exception as e:
+            # FIX 2026-06-09: цена УЖЕ выше SL шорта → триггер reject'нут →
+            # закрываем (выкупаем) по рынку немедленно, иначе защиты +1% нет.
+            if order_price > entry_price and _is_trigger_passed_error(e):
+                print(f"{_tag('GATE SL PASSED', RED)} {ticker}: цена уже выше SL "
+                      f"+1% → market-close")
+                return "closed" if _gate_market_close(ticker, size, is_long=False) else "fail"
             print(f"{_tag('GATE TP/SL ERR', RED)} {ticker} [{label}]: {e}")
+            return "fail"
 
-    _place(sl, sl, sl_contracts, "SL +1%")
+    if _place(sl, sl, sl_contracts, "SL +1%") == "closed":
+        return "Gate: цена уже за SL — закрыто по рынку"
 
     if sl_contracts > 0:
         gate_start_trailing_short(ticker, entry_price, sl_contracts, trail_pct=0.005)
@@ -793,12 +881,18 @@ def gate_set_tp_sl_short(ticker: str, entry_price: float, amount: float) -> str:
 
 
 def warmup_gate_connection() -> None:
-    """Прогревает HTTP соединение с Gate.io заранее."""
+    """Прогревает HTTP + WS соединения с Gate.io заранее."""
     try:
         _get(f"/api/v4/futures/{_SETTLE}/tickers", {"limit": 1})
-        print(f"{_tag('GATE WARMUP', CYAN)} соединение прогрето")
+        print(f"{_tag('GATE WARMUP', CYAN)} REST соединение прогрето")
     except Exception as e:
         print(f"{_tag('GATE WARMUP ERR', RED)} {e}")
+    # FIX 2026-06-06: прогрев WS соединения — убирает холодный TCP+TLS
+    # (~300-500мс) с первого ордера.
+    try:
+        warmup_gate_ws(timeout=10.0)
+    except Exception as e:
+        print(f"[GATE WS WARMUP ERR] {e}")
 
 
 # ── Pre-set leverage sweep ────────────────────────────────────────

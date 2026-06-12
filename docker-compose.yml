@@ -50,21 +50,20 @@ services:
       start_period: 60s
     command: ["python", "-u", "parsers/parser_listing.py"]
 
-  # FIX: arbitrage был объявлен, но parser_arbitrage.py отсутствует в проекте.
-  # Раскомментируй после того как добавишь parsers/parser_arbitrage.py.
-  # arbitrage:
-  #   image: sseconddooption/arbitrage
-  #   environment:
-  #     - PYTHONPATH=/Parsers
-  #     - PYTHONUNBUFFERED=1
-  #     - HEARTBEAT_FILE=/tmp/arbitrage_heartbeat
-  #   volumes:
-  #     - /root/Parsers/.env:/Parsers/.env
-  #   restart: always
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "test -f /tmp/arbitrage_heartbeat && [ $$(($$(date +%s) - $$(stat -c %Y /tmp/arbitrage_heartbeat))) -lt 300 ]"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 60s
-  #   command: ["python", "-u", "parsers/parser_arbitrage.py"]
+  # Интерактивный лог-бот: кнопки (стата за месяц / итоги стратегий) + приём
+  # callback'ов. РОВНО один инстанс — единственный владелец getUpdates (иначе
+  # апдейты делятся между процессами). Переиспользует образ listing (общий
+  # codebase, Dockerfile COPY . .) — отдельный образ не нужен. Креды/чат —
+  # те же, что у лог-бота (TG_LOG_BOT_TOKEN / TG_LOG_CHAT_ID из .env). Читает
+  # *_signal_events.jsonl и *_strategy_results.jsonl из общего /Parsers/state.
+  logbot:
+    image: sseconddooption/logbot
+    environment:
+      - PYTHONPATH=/Parsers
+      - PYTHONUNBUFFERED=1
+      - STATE_DIR=/Parsers/state
+    volumes:
+      - /root/Parsers/.env:/Parsers/.env
+      - /root/Parsers/state:/Parsers/state
+    restart: always
+    command: ["python", "-u", "tg/log_bot.py"]

@@ -193,6 +193,7 @@ def _classify(text: str) -> str | None:
 async def _listener(
     delist_callback: Callable[[str, float], None] | None,
     listing_callback: Callable[[str, float, str], None] | None,
+    on_disconnect: Callable[[], None] | None = None,
 ) -> None:
     """
     Основной цикл WS-листенера. Reconnect с exp backoff.
@@ -201,6 +202,8 @@ async def _listener(
     ("Binance"/"Upbit"/...) для per-exchange L2-дедупа. Оба должны быть
     thread-safe и БЫСТРЫЕ (не блокировать loop) — в идеале запускают
     threading.Thread.
+    on_disconnect() — опциональный thread-safe колбэк, вызывается при каждом
+    разрыве WS (для health-метрики disconnect). Должен быть быстрым и не падать.
     """
     delay = _RECONNECT_DELAY_MIN
 
@@ -250,8 +253,18 @@ async def _listener(
 
         except (ConnectionClosedError, OSError, asyncio.TimeoutError) as e:
             print(f"[TOA-WS] разрыв: {e} — переподключение через {delay:.0f}с", flush=True)
+            if on_disconnect is not None:
+                try:
+                    on_disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:
             print(f"[TOA-WS] неожиданная ошибка: {e!r}", flush=True)
+            if on_disconnect is not None:
+                try:
+                    on_disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
 
         await asyncio.sleep(delay)
         delay = min(delay * 2, _RECONNECT_DELAY_MAX)
@@ -260,6 +273,7 @@ async def _listener(
 def run_tree_of_alpha_listener(
     delist_callback: Callable[[str, float], None] | None = None,
     listing_callback: Callable[[str, float, str], None] | None = None,
+    on_disconnect: Callable[[], None] | None = None,
 ) -> None:
     """
     Точка входа для запуска в отдельном thread.
@@ -291,7 +305,7 @@ def run_tree_of_alpha_listener(
         _last_crash_at = 0.0
         while consecutive_failures < 5:
             try:
-                loop.run_until_complete(_listener(delist_callback, listing_callback))
+                loop.run_until_complete(_listener(delist_callback, listing_callback, on_disconnect))
                 # _listener вернулся без исключения (что нормально только при stop) — выходим.
                 break
             except Exception as e:  # noqa: BLE001
