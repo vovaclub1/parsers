@@ -219,6 +219,12 @@ _fired_lock     = threading.Lock()
 
 # L1: короткоживущая защита от near-simultaneous дублей.
 _recent_signals: dict[tuple[str, str], float] = {}   # (coin, source) -> expiry
+# FIX-AUDIT (perf): индекс L1 по монете. _recent_signals ключуется парой
+# (coin, source), поэтому проверка «занята ли монета любым источником»
+# раньше требовала полного скана словаря O(n) в hot-path. Держим отдельный
+# coin -> expiry, чтобы _try_claim работал за O(1). Оба словаря живут под
+# _fired_lock и чистятся одним sweeper'ом.
+_coin_claim_expiry: dict[str, float] = {}
 _FIRED_TTL      = 60
 
 # FIX: метрика отставания между источниками. Для каждой свежеcклеймленной
@@ -370,16 +376,27 @@ def _try_claim(coin: str, source: str) -> bool:
     L1: ставим claim в окно TTL чтобы шум из множества каналов в течение
     секунд не открывал дубль. L2 — проверяем «уже торговали» перед claim'ом.
     L2 ЗАПИСЫВАЕТСЯ только после успешного open (см. _mark_opened).
+
+    FIX-AUDIT (perf): раньше L1-проверка линейно сканировала весь
+    _recent_signals, сравнивая `c == coin` по каждому ключу (coin, source).
+    Это O(n) в самом горячем месте — между приходом сигнала и отправкой
+    ордера, под общим _fired_lock, который держат ещё и sweeper с
+    _measure_lag. При заметном числе живых claim'ов скан добавлял задержку
+    ровно там, где мы боремся за миллисекунды.
+
+    Теперь L1 индексирован по монете: _coin_claim_expiry[coin] -> expiry.
+    Проверка и вставка — O(1).
     """
     now = time.monotonic()
     with _fired_lock:
         if _is_already_fired(coin, source):
             return False
-        # L1: уже взят (любым источником) в пределах TTL → skip.
-        for (c, _src), ts in _recent_signals.items():
-            if c == coin and ts > now:
-                return False
+        # L1: уже взят (любым источником) в пределах TTL → skip. O(1).
+        expiry = _coin_claim_expiry.get(coin)
+        if expiry is not None and expiry > now:
+            return False
         _recent_signals[(coin, source)] = now + _FIRED_TTL
+        _coin_claim_expiry[coin] = now + _FIRED_TTL
         # FIX: запоминаем первый источник, который заявил эту монету.
         # _first_claim_ts заполняется только один раз — пока запись жива,
         # последующие claim'ы по этой монете уйдут в _is_already_fired/L1
@@ -456,6 +473,11 @@ def _fired_sweeper() -> None:
             expired = [k for k, ts in _recent_signals.items() if ts <= now]
             for k in expired:
                 _recent_signals.pop(k, None)
+            # FIX-AUDIT: чистим индекс L1 синхронно с _recent_signals —
+            # иначе протухшая запись навсегда заблокировала бы монету.
+            expired_coins = [c for c, ts in _coin_claim_expiry.items() if ts <= now]
+            for c in expired_coins:
+                _coin_claim_expiry.pop(c, None)
             # FIX: чистим _first_claim_ts по TTL, иначе на длинной дистанции
             # словарь растёт неограниченно (1 запись на каждую монету,
             # которая когда-либо стреляла).
