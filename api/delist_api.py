@@ -123,37 +123,56 @@ _bybit_session.headers.update({
 })
 
 # ── Слова-исключения ──────────────────────────────────────────────
-EXCLUDED_TOKENS = {
-    "USDT", "BUSD", "USDC", "TUSD", "DAI",
+#
+# FIX-AUDIT (важно): раньше здесь лежали токены, которые ОДНОВРЕМЕННО
+# являются реально торгуемыми тикерами. Проверка по живым API Bybit /
+# Binance Futures / Upbit / Bithumb (2026-07-30) нашла 19 таких коллизий:
+#
+#   THE (Thena), AT (AITECH), OPEN, ORDER, CROSS, APR, IN, TAG, BE,
+#   COIN, BOT, NOT, ON, ALL, NFT, MAY, USDS, USDC, USDT
+#
+# Каждый из них — делистинг/листинг, который бот молча пропускал.
+# Реальный пример из Binance-каталога:
+#   "Binance Margin And Loan Will Delist HOT, THE on 2026-07-03"
+#   -> find_pairs() возвращал ['HOT'], тикер THE терялся.
+#
+# Решение: стоп-лист разбит на два уровня.
+#   ALWAYS_EXCLUDED   — служебные слова, которые НИКОГДА не тикеры
+#                       (стейблкоины-квоты и грамматика вроде THIS/PLEASE).
+#   AMBIGUOUS_TOKENS  — слова, которые бывают и тикерами тоже. Они
+#                       отбрасываются ТОЛЬКО если не подтверждены
+#                       known_coins (живой список инструментов биржи).
+#
+# Так «THE» в тексте делистинга проходит (он есть в known_coins), а «THE»
+# как английский артикль в теле статьи — нет.
+
+# Квотируемые валюты: как база для шорта не рассматриваем никогда.
+_QUOTE_ASSETS = {
+    "USDT", "BUSD", "TUSD", "DAI", "USD",
+}
+
+ALWAYS_EXCLUDED = {
+    *_QUOTE_ASSETS,
     "BINANCE", "SPOT", "MARGIN", "FUTURES", "EARN",
-    "WILL", "AND", "ON", "FOR", "THE", "ALL",
-    "USD", "UTC", "API", "VIP", "KYC", "AML",
-    "FAQ", "TBA", "TBD", "NFT", "DEFI",
+    "WILL", "AND", "FOR", "THE_ARTICLE_PLACEHOLDER",
+    "UTC", "API", "VIP", "KYC", "AML",
+    "FAQ", "TBA", "TBD", "DEFI",
     "P2P", "OTC", "IPO", "ICO", "IEO",
     "THIS", "IS", "GENERAL", "EXCHANGE", "NOTICE", "PRODUCTS", "SERVICES",
-    "REFERRED", "TO", "HERE", "MAY", "NOT", "BE", "IN", "YOUR", "REGION",
+    "REFERRED", "TO", "HERE", "YOUR", "REGION",
     "FELLOW", "CLOSE", "CONDUCT", "AN", "SUPPORT", "AIRDROP", "PLAN",
-    "COIN", "MULTIPLE", "WITH", "FROM", "THAT", "ALSO", "HAVE",
-    # FIX-batch-6: расширение под форматы каналов пользователя
-    # (Monitoring Tag, removed from spot, alpha removals и т.п.)
-    "MONITORING", "TAG", "EXTEND", "EXTENDED", "INCLUDE", "INCLUDED",
+    "MULTIPLE", "WITH", "FROM", "THAT", "ALSO", "HAVE",
+    "MONITORING", "EXTEND", "EXTENDED", "INCLUDE", "INCLUDED",
     "DELIST", "DELISTS", "DELISTED", "DELISTING", "DELISTINGS",
     "REMOVE", "REMOVED", "REMOVING", "REMOVAL", "REMOVES",
     "LIST", "LISTED", "LISTING", "LISTINGS",
     "ALPHA", "BUY", "SELL", "TRADE", "TRADING",
     "POSTPONED", "PERPETUAL", "PERPETUALS", "LAUNCH", "LAUNCHED",
-    "OPEN", "OPENED", "OPENS", "ADD", "ADDED", "ADDS",
+    "OPENED", "OPENS", "ADD", "ADDED", "ADDS",
     "NEW", "TOKEN", "TOKENS", "POOL", "POOLS", "PAIRS", "PAIR",
     "BORROW", "LOAN", "LOANS", "SIMPLE", "BUYBACK",
-    # FIX: убрана "USDⓈ" — regex [A-Z0-9] её никогда не вернёт (Ⓢ U+24C8 не ASCII).
-    "USDS",  # Binance liquid staking
     "ANNOUNCEMENT", "ANNOUNCEMENTS",
-    # FIX: ложные срабатывания на «margin trading pairs» нотисах
-    # (см. инцидент 2026-05-25: матчилось 'FOLLOWING' и 'AT',
-    # последнее реально шортилось как тикер AT). Расширяем список
-    # самыми частыми «английскими словами длиной 2-8», которые могут
-    # появиться в теле уведомления и пройти regex [A-Z0-9]{2,10}.
-    "AT", "AS", "BY", "OR", "OF", "IT", "IF", "SO", "DO",
+    "AS", "BY", "OR", "OF", "IT", "IF", "SO", "DO",
     "FOLLOWING", "FOLLOWED", "FOLLOWS",
     "PLEASE", "NOTE", "NOTED", "NOTES",
     "EFFECTIVE", "STARTING", "BEGINNING", "ENDING", "ENDS",
@@ -161,24 +180,18 @@ EXCLUDED_TOKENS = {
     "USERS", "USER", "CLIENTS", "CLIENT",
     "WITHDRAWAL", "WITHDRAWALS", "WITHDRAW",
     "DEPOSIT", "DEPOSITS",
-    "ORDER", "ORDERS", "POSITION", "POSITIONS",
+    "ORDERS", "POSITION", "POSITIONS",
     "BALANCE", "BALANCES", "ACCOUNT", "ACCOUNTS",
     "FUND", "FUNDS", "FUNDING",
-    "ISOLATED", "CROSS", "LEVERAGE", "LEVERAGED",
+    "ISOLATED", "LEVERAGE", "LEVERAGED",
     "CONVERT", "CONVERTED", "CONVERTING",
-    "COPY", "BOT", "BOTS",
-    "REGION", "REGIONS", "COUNTRY", "COUNTRIES",
+    "COPY", "BOTS",
+    "REGIONS", "COUNTRY", "COUNTRIES",
     "SUBJECT", "TERMS", "AGREEMENT", "POLICY", "POLICIES",
     "DUE", "PER", "VIA", "INTO", "OUT", "AFTER", "BEFORE",
     "ABOVE", "BELOW", "BETWEEN",
     "DETAILS", "DETAIL", "MORE", "LESS", "ABOUT",
-    # FIX: словарные английские слова из Binance Earn / Launchpool /
-    # promo-заголовков. Метод 5 (fallback по known_coins) в
-    # find_listing_pairs выдирает любые \b[A-Z0-9]{2,8}\b слова и
-    # отсеивает по EXCLUDED_TOKENS + known_coins. На длинных промо-
-    # текстах ('Subscribe to ... Locked Products ... Enjoy 200% APR
-    # for 7 Days') проходило APR/DAYS/etc. Все они тут.
-    "APR", "APY",
+    "APY",
     "DAYS", "DAY", "WEEK", "WEEKS", "MONTH", "MONTHS", "YEAR", "YEARS",
     "SPECIAL", "OFFER", "OFFERS",
     "SUBSCRIBE", "SUBSCRIPTION",
@@ -190,10 +203,22 @@ EXCLUDED_TOKENS = {
     "LAUNCHPOOL", "MEGADROP", "AIRDROPS",
     "BONUS", "BONUSES",
     "LIMITED", "EXCLUSIVE",
-    # Часто встречаются в Bithumb/Upbit заголовках на корейском
-    # транслите/английском, но не тикеры:
     "EVENT", "EVENTS", "CELEBRATION", "CELEBRATE",
 }
+ALWAYS_EXCLUDED.discard("THE_ARTICLE_PLACEHOLDER")
+
+# Слова, которые встречаются в тексте анонсов, НО одновременно являются
+# реальными тикерами. Пропускаем только при подтверждении known_coins.
+AMBIGUOUS_TOKENS = {
+    "THE", "AT", "ON", "IN", "ALL", "NOT", "BE", "MAY",
+    "OPEN", "ORDER", "CROSS", "TAG", "COIN", "BOT",
+    "APR", "NFT", "USDC", "USDS",
+}
+
+# Обратная совместимость: внешний код (и старые тесты) импортируют
+# EXCLUDED_TOKENS. Оставляем как объединение — но фильтрация
+# в _filter_tokens теперь смотрит на два множества раздельно.
+EXCLUDED_TOKENS = ALWAYS_EXCLUDED
 
 # ── Кэш цен ──────────────────────────────────────────────────────
 price_cache: dict[str, float] = {}
@@ -653,20 +678,39 @@ _qty_precision_cache: dict[float, int] = {}
 
 def _round_qty(qty: float, step: float) -> float:
     """
-    Округляет количество вниз до ближайшего шага лота.
+    Округляет количество ВНИЗ до ближайшего шага лота.
 
     FIX: считаем precision через Decimal, потому что str(1e-05) == '1e-05'
     и старый код возвращал precision=0 (нет точки → ветка else), а потом
     round(..., 0) обнулял дробную часть → qty=0 → ордер не размещался либо
     падал на минимальный 1 контракт.
+
+    FIX-AUDIT (критично): floor-division на float'ах теряла целый шаг лота.
+    `5.0 // 0.1` == 49.0, а не 50.0, потому что 0.1 в двоичном виде чуть
+    больше десятой. Итог — систематически заниженный объём позиции:
+
+        _round_qty(5.0,  0.1  ) -> 4.9    (-2.0 %)
+        _round_qty(3.0,  0.1  ) -> 2.9    (-3.3 %)
+        _round_qty(0.3,  0.1  ) -> 0.2    (-33  %)
+        _round_qty(1.0,  0.001) -> 0.999  (-0.1 %)
+
+    Считаем через Decimal: точное деление, floor, обратно в float.
     """
+    if step <= 0:
+        raise ValueError(f"qty step должен быть > 0, получен {step!r}")
+
     precision = _qty_precision_cache.get(step)
     if precision is None:
         exponent  = _Decimal(str(step)).as_tuple().exponent
         precision = max(0, -int(exponent))
         _qty_precision_cache[step] = precision
-    rounded = (qty // step) * step
-    return round(rounded, precision)
+
+    # Decimal(str(x)) — точное десятичное представление того, что видит
+    # пользователь ("0.1", а не 0.1000000000000000055511151231257827).
+    d_qty  = _Decimal(str(qty))
+    d_step = _Decimal(str(step))
+    steps  = int(d_qty / d_step)          # усечение вниз, без float-дрейфа
+    return float(round(steps * d_step, precision))
 
 
 # Биржа на которой открыт шорт — нужна для роутера set_tp_sl
@@ -950,26 +994,55 @@ def find_pairs(text: str) -> list[str]:
         if found:
             return found
 
+    # Широкий fallback-скан всего текста. Здесь любое английское слово может
+    # случайно совпасть с тикером, поэтому AMBIGUOUS_TOKENS режем безусловно
+    # (allow_ambiguous=False) — иначе артикль «the» в «Notice Regarding the
+    # Removal of AEUR» дал бы ложный сигнал шортить THE.
     all_tokens = _RE_ALL_TOKENS.findall(text_upper)
-    return [t for t in _filter_tokens(all_tokens) if t in known_coins]
+    return [
+        t for t in _filter_tokens(all_tokens, allow_ambiguous=False)
+        if t in known_coins
+    ]
 
 
-def _filter_tokens(tokens: list[str]) -> list[str]:
+def _filter_tokens(tokens: list[str], allow_ambiguous: bool = True) -> list[str]:
     """
-    Фильтрует список токенов: убирает стоп-слова, дубликаты и слишком короткие/длинные.
-    Также отсеивает токены состоящие только из цифр.
+    Фильтрует список токенов: убирает стоп-слова, дубликаты и слишком
+    короткие/длинные. Также отсеивает токены состоящие только из цифр.
+
+    FIX-AUDIT: двухуровневый стоп-лист.
+      • ALWAYS_EXCLUDED  — режем всегда (грамматика, квоты, служебные слова).
+      • AMBIGUOUS_TOKENS — слово И тикер одновременно (THE, AT, OPEN, ORDER…).
+
+    :param allow_ambiguous:
+        True  — «явный» контекст: токен извлечён из структурированного
+                паттерна ("Will Delist X, Y on ...", "$TICKER", "ABCUSDT").
+                Здесь AMBIGUOUS_TOKENS пропускаются при подтверждении
+                known_coins — так «Will Delist HOT, THE» больше не теряет
+                THE (Thena).
+        False — «широкий» fallback-скан всего текста статьи. Тут любое
+                английское слово может случайно совпасть с тикером, поэтому
+                AMBIGUOUS_TOKENS режем безусловно. Иначе на заголовке
+                «Notice Regarding the Removal of AEUR» артикль «the»
+                превращался бы в сигнал шортить THE.
+
     :param tokens: list[str] - список токенов из regex.
     :return: list[str] - отфильтрованный список тикеров.
     """
     seen:   set[str]  = set()
     result: list[str] = []
     for t in tokens:
-        if t in EXCLUDED_TOKENS:
+        if t in ALWAYS_EXCLUDED:
             continue
         if not (2 <= len(t) <= 10):
             continue
         if t.isdigit():
             continue
+        if t in AMBIGUOUS_TOKENS:
+            # В широком скане — никогда. В явном — только если биржа
+            # действительно торгует такой инструмент.
+            if not allow_ambiguous or t not in known_coins:
+                continue
         if t in seen:
             continue
         seen.add(t)

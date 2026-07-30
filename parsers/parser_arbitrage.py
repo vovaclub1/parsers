@@ -31,9 +31,9 @@ from api.hl_api import (
 from api.arbitrage_api import (
     get_spread,
     get_combined_hourly_funding,
-    get_bybit_funding,
-    get_gate_funding,
-    get_hl_funding,
+    get_bybit_funding,   # noqa: F401 — публичное API модуля
+    get_gate_funding,    # noqa: F401
+    get_hl_funding,      # noqa: F401
     calc_hourly_funding,
     get_all_bybit_funding,
     get_all_gate_funding,

@@ -1,0 +1,44 @@
+# FIX-AUDIT: без .dockerignore инструкция `COPY . .` в Dockerfile затаскивает
+# в образ секреты и состояние — .env с боевыми API-ключами Bybit/Gate/Telegram,
+# .session-файлы Telethon (позволяют войти в аккаунт), .git с историей.
+# Образ пушится в публичный registry (sseconddooption/*), так что это прямая
+# утечка ключей от торгового счёта.
+
+# ── Секреты и учётные данные ──────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+auth.json
+*.pem
+*.key
+
+# ── Состояние времени выполнения ──────────────────────────────────
+delist_fired.json
+listing_fired.json
+*.log
+
+# ── VCS / IDE ─────────────────────────────────────────────────────
+.git
+.gitignore
+.github
+.idea
+.vscode
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# ── Тесты и документация (в рантайме не нужны) ────────────────────
+tests/
+README.md
+docs/

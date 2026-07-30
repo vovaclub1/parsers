@@ -8,6 +8,12 @@ services:
     volumes:
       - /root/Parsers/.env:/Parsers/.env
       - /root/Parsers/delist_session.session:/Parsers/delist_session.session
+      # FIX-AUDIT: L2-дедуп («эту монету уже шортили») хранится в
+      # $SESSION_DIR/delist_fired.json. Без монтирования файл жил внутри
+      # контейнера и стирался при каждом `docker compose up --force-recreate`
+      # / обновлении образа — после чего бот мог повторно открыть шорт по
+      # уже отработанной монете. Монтируем каталог состояния наружу.
+      - /root/Parsers/state:/Parsers/state
     restart: always
     # FIX: реальный healthcheck — проверяет что heartbeat-файл свежий (< 5мин).
     # Парсер пишет touch(/tmp/delist_heartbeat) раз в минуту.
@@ -17,6 +23,17 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    # FIX-AUDIT: ограничиваем ресурсы — при утечке памяти в WS-клиенте
+    # контейнер не должен утащить весь хост в OOM.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     command: ["python", "-u", "parsers/parser_delist.py"]
 
   listing:
@@ -28,6 +45,9 @@ services:
     volumes:
       - /root/Parsers/.env:/Parsers/.env
       - /root/Parsers/listing_session.session:/Parsers/listing_session.session
+      # FIX-AUDIT: см. комментарий выше — listing_fired.json обязан переживать
+      # пересоздание контейнера, иначе L2-дедуп бесполезен.
+      - /root/Parsers/state:/Parsers/state
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/listing_heartbeat && [ $$(($$(date +%s) - $$(stat -c %Y /tmp/listing_heartbeat))) -lt 300 ]"]
@@ -35,10 +55,21 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     command: ["python", "-u", "parsers/parser_listing.py"]
 
-  # FIX: arbitrage был объявлен, но parser_arbitrage.py отсутствует в проекте.
-  # Раскомментируй после того как добавишь parsers/parser_arbitrage.py.
+  # FIX: arbitrage был объявлен, но parser_arbitrage.py отсутствовал в проекте.
+  # Сейчас файл есть (parsers/parser_arbitrage.py), но сервис остаётся
+  # выключенным до отдельного ревью его торговой логики — включать только
+  # осознанно.
   # arbitrage:
   #   image: sseconddooption/arbitrage
   #   environment:
@@ -47,6 +78,7 @@ services:
   #     - HEARTBEAT_FILE=/tmp/arbitrage_heartbeat
   #   volumes:
   #     - /root/Parsers/.env:/Parsers/.env
+  #     - /root/Parsers/state:/Parsers/state
   #   restart: always
   #   healthcheck:
   #     test: ["CMD-SHELL", "test -f /tmp/arbitrage_heartbeat && [ $$(($$(date +%s) - $$(stat -c %Y /tmp/arbitrage_heartbeat))) -lt 300 ]"]

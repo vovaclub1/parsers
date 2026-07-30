@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -30,21 +31,43 @@ except (TypeError, ValueError):
     _CHAT_ID = TG_LOG_CHAT_ID or ""
 
 
+_ALLOWED_TG_TAGS = ("b", "i", "u", "s", "code", "pre", "a")
+
+# Матчит только НАШИ разрешённые теги: <b>, </b>, <code>, <a href="...">.
+_ALLOWED_TAG_RE = re.compile(
+    r"</?(?:" + "|".join(_ALLOWED_TG_TAGS) + r")(?:\s[^<>]*)?>",
+    re.IGNORECASE,
+)
+
+
 def _escape_for_html(msg: str) -> str:
     """
-    Telegram parse_mode=HTML кидает 400 если в тексте есть несбалансированные
-    <, > или &. Эскейпируем всё, кроме разрешённых тегов <b>, <i>, <code>.
+    Экранирует текст для Telegram parse_mode=HTML, СОХРАНЯЯ разрешённые теги.
+
+    FIX-AUDIT: раньше обе ветки функции возвращали `msg` без изменений —
+    экранирования не происходило вообще. Любое сообщение с '<', '>' или '&'
+    (например «price < 5 & qty > 3» или тикер вида '<UNKNOWN>') получало от
+    Telegram HTTP 400 «can't parse entities», и алерт о реальной сделке
+    молча терялся.
+
+    Стратегия: вырезаем разрешённые теги в плейсхолдеры, экранируем
+    остальное через html.escape, возвращаем теги на место.
     """
-    # html.escape экранирует < > & — оставит только нужные нам теги если
-    # их добавим обратно. Самый простой способ: эскейпим всё кроме явных
-    # вызовов клиента (которые делают <b>foo</b> сами и должны быть валидны).
-    # Здесь мы НЕ заменяем — оставляем теги как есть, но эскейпируем
-    # все & которые не часть entity.
-    # Простая стратегия: если в сообщении есть валидные теги — оставляем
-    # как есть. Иначе — html.escape.
-    if "<" not in msg and "&" not in msg:
+    if "<" not in msg and "&" not in msg and ">" not in msg:
         return msg
-    return msg
+
+    saved: list[str] = []
+
+    def _stash(m: re.Match[str]) -> str:
+        saved.append(m.group(0))
+        return f"\x00{len(saved) - 1}\x00"
+
+    stashed = _ALLOWED_TAG_RE.sub(_stash, msg)
+    escaped = html.escape(stashed, quote=False)
+
+    for i, tag in enumerate(saved):
+        escaped = escaped.replace(f"\x00{i}\x00", tag)
+    return escaped
 
 
 def _tg_log_blocking(msg: str) -> None:

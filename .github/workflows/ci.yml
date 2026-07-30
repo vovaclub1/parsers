@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/**", "feat/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov ruff
+
+      - name: Lint (ruff — только реальные ошибки, не стиль)
+        run: |
+          ruff check --select=E9,F63,F7,F82,F401,B,S102,S307,RUF012 \
+                     --ignore=E501 .
+
+      - name: Syntax check всех модулей
+        run: python -m compileall -q api parsers config tg
+
+      - name: Run tests
+        env:
+          # Заглушки — тесты не должны ходить в сеть и не требуют боевых ключей.
+          BYBIT_API_KEY: test-key
+          BYBIT_SECRET_KEY: test-secret
+          SESSION_DIR: /tmp
+          STATE_DIR: /tmp/state
+          TREE_OF_ALPHA_WS_ENABLED: "0"
+          BYBIT_WS_TRADE_ENABLED: "0"
+        run: pytest tests/ -v --cov=api --cov=parsers --cov=tg --cov-report=term-missing
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Убедиться, что секреты не закоммичены
+        run: |
+          set -e
+          fail=0
+          # .env с боевыми ключами не должен попадать в репозиторий
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env закоммичен в репозиторий"
+            fail=1
+          fi
+          # Telethon-сессии = полный доступ к Telegram-аккаунту
+          if git ls-files | grep -E '\.session$'; then
+            echo "::error::Telethon .session закоммичен в репозиторий"
+            fail=1
+          fi
+          # Реальные API-ключи в коде
+          if git grep -nE '(ghp_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9]{20,})' -- ':!*.md' ':!.github'; then
+            echo "::error::В коде найден похожий на API-ключ литерал"
+            fail=1
+          fi
+          exit $fail
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build образа (проверка, что Dockerfile валиден)
+        run: docker build -t parsers:ci .
+
+      - name: Убедиться, что секреты не попали в образ
+        run: |
+          set -e
+          # .dockerignore обязан отсечь .env и .session из слоёв образа
+          if docker run --rm --entrypoint sh parsers:ci -c 'ls /Parsers/.env' 2>/dev/null; then
+            echo "::error::.env попал внутрь образа — проверь .dockerignore"
+            exit 1
+          fi
+          if docker run --rm --entrypoint sh parsers:ci -c 'ls /Parsers/*.session' 2>/dev/null; then
+            echo "::error::.session попал внутрь образа — проверь .dockerignore"
+            exit 1
+          fi
+          echo "OK: секретов в образе нет"

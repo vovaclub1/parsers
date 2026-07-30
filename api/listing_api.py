@@ -9,7 +9,6 @@ import re
 import threading
 
 from api.delist_api import (
-    _post,
     _post_http2,             # FIX: HTTP/2 client для background TP/SL
     post_order,              # FIX-10: публичный алиас вместо _post_order
     new_order_link_id,       # FIX-10: публичный алиас вместо _new_order_link_id
@@ -18,6 +17,7 @@ from api.delist_api import (
     get_price,
     known_coins,
     EXCLUDED_TOKENS,
+    AMBIGUOUS_TOKENS,
     price_updater,
     warmup_bybit_connection,
     start_bybit_heartbeat,   # FIX: TLS pool heartbeat
@@ -393,10 +393,14 @@ def find_listing_pairs(text: str) -> list[str]:
     if usdt_tickers:
         return usdt_tickers
 
-    # Метод 5: fallback по known_coins
+    # Метод 5: fallback по known_coins.
+    # FIX-AUDIT: AMBIGUOUS_TOKENS (THE/AT/OPEN/ORDER/...) режем безусловно —
+    # это широкий скан произвольного текста, где английские слова легко
+    # совпадают с тикерами и дают ложные лонги.
     return list(dict.fromkeys(
         t for t in _RE_TICKER_PLAIN.findall(text_upper)
         if t not in EXCLUDED_TOKENS
+        and t not in AMBIGUOUS_TOKENS
         and 2 <= len(t) <= 8
         and not t.isdigit()
         and t in known_coins

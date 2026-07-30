@@ -66,7 +66,7 @@ except ImportError:
 from tg.tg_logger import tg_log
 from api.coinlisting_ws import run_coinlisting
 from config.config import (
-    TG_API_ID, TG_API_HASH, SESSION_DIR,
+    TG_API_ID, TG_API_HASH, SESSION_DIR, STATE_DIR,
     EXTRA_LISTING_CHANNELS, parse_channels,    # FIX-batch-3: multi-channel
     TREE_OF_ALPHA_WS_ENABLED,                   # FIX-batch-4: TOA WS
     BYBIT_WS_TRADE_ENABLED,                     # FIX-batch-5: Bybit WS Trade
@@ -168,6 +168,39 @@ POLL_ERROR_BACKOFF  = 3.0
 
 WATCHDOG_TIMEOUT    = 60   # секунд
 
+# ── Защита от массового открытия позиций ──────────────────────────
+# FIX-AUDIT (CRITICAL): если стартовая загрузка списка тикеров падает
+# (таймаут / 403 Cloudflare / сетевой сбой), except-ветка ставила
+# known = set(), а значит ever_seen = set(). Первый же УСПЕШНЫЙ poll
+# возвращал весь рынок — 276 KRW-тикеров у Upbit — и каждый считался
+# «новым листингом». Результат: process_signal открывал лонги по всему
+# рынку сразу.
+#
+# У Bithumb и Binance guard `len(new) > 10` был. У Upbit — нет.
+# Выносим порог в константу и применяем во ВСЕХ трёх поллерах.
+MAX_NEW_TICKERS_PER_TICK = 10
+
+
+def _is_bulk_update(new_tickers: set[str]) -> bool:
+    """
+    True, если за один тик появилось подозрительно много «новых» тикеров.
+
+    Настоящий листинг — это 1-3 монеты. Десятки одновременно означают
+    восстановление после сбоя, окончание maintenance биржи или первый
+    успешный poll после неудачной инициализации. Торговать по такому
+    событию нельзя.
+    """
+    return len(new_tickers) > MAX_NEW_TICKERS_PER_TICK
+
+
+# Удался ли стартовый снимок рынка для каждого поллера. Пока False —
+# поллер НЕ торгует: первый валидный ответ используется только как baseline.
+_initial_snapshot_ok: dict[str, bool] = {
+    "UPBIT": False,
+    "BITHUMB": False,
+    "BINANCE": False,
+}
+
 # ── Дедуп: L1 (TTL) + L2 (permanent persisted) ────────────────────
 # L1 — отсекает шумовые дубли в окне нескольких секунд (несколько каналов
 #      пишут об одном листинге). L2 — «уже торговали эту монету» навсегда.
@@ -211,7 +244,8 @@ _ANNOUNCEMENT_SOURCE_PREFIXES = ("TG:", "TOA-", "COINLISTING-")
 # Источники прямого детектора листингов (без анонса).
 _DIRECT_POLL_SOURCES = {"UPBIT", "BITHUMB", "BINANCE"}
 
-_FIRED_FILE = Path(SESSION_DIR) / "listing_fired.json"
+# FIX-AUDIT: см. config.config.STATE_DIR — состояние вне образа.
+_FIRED_FILE = Path(STATE_DIR) / "listing_fired.json"
 
 # FIX-PERF: dirty-flag для фонового L2-writer'а — вместо thread.start() на
 # каждый успешный open (то стоило ~3-15мс в hot-path worker'а под GIL contention).
@@ -734,14 +768,24 @@ def run_upbit_poller() -> None:
     session.headers.update({"Accept": "application/json"})
 
     log_ok("UPBIT", "Загружаем начальный список тикеров...")
+    # FIX-AUDIT (CRITICAL): отслеживаем, удалась ли стартовая загрузка.
+    # Раньше при сбое known=set() и первый успешный poll принимал ВЕСЬ
+    # рынок (276 тикеров) за пачку листингов.
+    snapshot_ok = False
+    known: set[str] = set()
     try:
-        known: set[str] = _load_upbit_tickers(session)
+        known = _load_upbit_tickers(session)
+        snapshot_ok = bool(known)
         log_ok("UPBIT", f"Загружено {len(known)} тикеров, жду новые (poll {POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
             _upbit_last_ts = time.monotonic()
     except Exception as e:
         log_err("UPBIT", f"Ошибка инициализации: {e}")
-        known = set()
+
+    _initial_snapshot_ok["UPBIT"] = snapshot_ok
+    if not snapshot_ok:
+        log_warn("UPBIT", "Стартовый снимок не получен — торговля отложена "
+                          "до первого валидного ответа (защита от массового открытия)")
 
     ever_seen: set[str] = set(known)
 
@@ -759,7 +803,23 @@ def run_upbit_poller() -> None:
             with _ts_lock:
                 _upbit_last_ts = time.monotonic()
 
+            # FIX-AUDIT: стартовый снимок не удался — первый валидный ответ
+            # используем как baseline, НЕ торгуем по нему.
+            if not _initial_snapshot_ok.get("UPBIT"):
+                ever_seen |= current
+                _initial_snapshot_ok["UPBIT"] = True
+                log_ok("UPBIT", f"Baseline восстановлен ({len(current)} тикеров) — "
+                                f"торговля активна")
+                continue
+
             new_tickers = current - ever_seen
+
+            # FIX-AUDIT (CRITICAL): bulk-guard, которого у Upbit не было.
+            if _is_bulk_update(new_tickers):
+                log_warn("UPBIT", f"Подозрительно много новых тикеров "
+                                  f"({len(new_tickers)}), пропускаем")
+                ever_seen |= current
+                continue
 
             if new_tickers:
                 fetch_ms = (t_recv - t_send) * 1000
@@ -814,14 +874,21 @@ def run_bithumb_poller() -> None:
     session.headers.update({"Accept": "application/json"})
 
     log_ok("BITHUMB", "Загружаем начальный список тикеров...")
+    snapshot_ok = False
+    known: set[str] = set()
     try:
-        known: set[str] = _load_bithumb_tickers(session)
+        known = _load_bithumb_tickers(session)
+        snapshot_ok = bool(known)
         log_ok("BITHUMB", f"Загружено {len(known)} тикеров, жду новые (poll {POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
             _bithumb_last_ts = time.monotonic()
     except Exception as e:
         log_err("BITHUMB", f"Ошибка инициализации: {e}")
-        known = set()
+
+    _initial_snapshot_ok["BITHUMB"] = snapshot_ok
+    if not snapshot_ok:
+        log_warn("BITHUMB", "Стартовый снимок не получен — торговля отложена "
+                            "до первого валидного ответа")
 
     ever_seen: set[str] = set(known)
 
@@ -836,11 +903,18 @@ def run_bithumb_poller() -> None:
             with _ts_lock:
                 _bithumb_last_ts = time.monotonic()
 
+            # FIX-AUDIT: baseline после неудачного старта — без торговли.
+            if not _initial_snapshot_ok.get("BITHUMB"):
+                ever_seen |= current
+                _initial_snapshot_ok["BITHUMB"] = True
+                log_ok("BITHUMB", f"Baseline восстановлен ({len(current)} тикеров)")
+                continue
+
             new_tickers = current - ever_seen
 
             # FIX: порог 3 → 10. После maintenance Bithumb может разово отдать
             # 5-8 новых тикеров — мы их пропускали все, теряя реальный листинг.
-            if len(new_tickers) > 10:
+            if _is_bulk_update(new_tickers):
                 log_warn("BITHUMB", f"Подозрительно много новых тикеров ({len(new_tickers)}), пропускаем")
                 ever_seen |= current
                 continue
@@ -922,15 +996,22 @@ def run_binance_futures_poller() -> None:
     })
 
     log_ok("BINANCE", "Загружаем начальный список futures-тикеров...")
+    snapshot_ok = False
+    known: set[str] = set()
     try:
-        known: set[str] = _load_binance_futures_tickers(session)
+        known = _load_binance_futures_tickers(session)
+        snapshot_ok = bool(known)
         log_ok("BINANCE", f"Загружено {len(known)} тикеров, жду новые "
                           f"(poll {BINANCE_POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
             _binance_last_ts = time.monotonic()
     except Exception as e:
         log_err("BINANCE", f"Ошибка инициализации: {e}")
-        known = set()
+
+    _initial_snapshot_ok["BINANCE"] = snapshot_ok
+    if not snapshot_ok:
+        log_warn("BINANCE", "Стартовый снимок не получен — торговля отложена "
+                            "до первого валидного ответа")
 
     ever_seen: set[str] = set(known)
 
@@ -944,12 +1025,19 @@ def run_binance_futures_poller() -> None:
             with _ts_lock:
                 _binance_last_ts = time.monotonic()
 
+            # FIX-AUDIT: baseline после неудачного старта — без торговли.
+            if not _initial_snapshot_ok.get("BINANCE"):
+                ever_seen |= current
+                _initial_snapshot_ok["BINANCE"] = True
+                log_ok("BINANCE", f"Baseline восстановлен ({len(current)} тикеров)")
+                continue
+
             new_tickers = current - ever_seen
 
             # Защита от bulk-апдейта (рестарт API / временная подгрузка
             # списка после maintenance): >10 новых за тик — почти точно
             # not-a-listing event.
-            if len(new_tickers) > 10:
+            if _is_bulk_update(new_tickers):
                 log_warn("BINANCE", f"Подозрительно много новых тикеров "
                                     f"({len(new_tickers)}), пропускаем")
                 ever_seen |= current

@@ -38,6 +38,13 @@ COINLISTING_API_KEY = os.getenv("COINLISTING_API_KEY", "")
 # теперь конфигурируется через env (по умолчанию /Parsers для Docker).
 SESSION_DIR = os.getenv("SESSION_DIR", "/Parsers")
 
+# FIX-AUDIT: каталог для персистентного состояния (L2-дедуп отстрелянных
+# монет: delist_fired.json / listing_fired.json). Раньше он совпадал с
+# SESSION_DIR=/Parsers, который в Docker лежит ВНУТРИ образа — файл стирался
+# при каждом пересоздании контейнера, и бот мог повторно открыть позицию по
+# уже отработанной монете. Выносим в отдельный смонтированный volume.
+STATE_DIR = os.getenv("STATE_DIR", os.path.join(SESSION_DIR, "state"))
+
 # FIX-batch-3: дополнительные TG-каналы для multi-source first-wins listener.
 # CSV: username каналов без @ или ID (число с -100...). Дубликаты сигналов
 # отсекаются через _fired_coins (TTL 60с), так что first-wins.

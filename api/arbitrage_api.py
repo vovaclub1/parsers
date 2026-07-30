@@ -19,29 +19,29 @@ from api.delist_api import (
     _get_qty_step,
     _round_qty,
     get_price,
-    known_coins,
+    known_coins,          # noqa: F401 — re-export для parser_arbitrage
 )
 from api.gate_api import (
     gate_get_price,
     gate_open_long,
-    gate_open_short,
+    gate_open_short,      # noqa: F401 — re-export для parser_arbitrage
     gate_open_short_by_contracts,
-    gate_known_coins,
+    gate_known_coins,     # noqa: F401 — re-export для parser_arbitrage
     _get as gate_get,
     _post_signed as gate_post_signed,
     _SETTLE,
-    _LEVERAGE as _GATE_LEVERAGE_INTERNAL,
+    _LEVERAGE as _GATE_LEVERAGE_INTERNAL,  # noqa: F401 — re-export
 )
 from api.hl_api import (
     hl_get_price,
-    hl_known_coins,
-    hl_price_updater,
+    hl_known_coins,       # noqa: F401 — re-export для parser_arbitrage
+    hl_price_updater,     # noqa: F401 — re-export для parser_arbitrage
     hl_open_long,
     hl_open_short,
-    hl_open_short_by_usdt,
+    hl_open_short_by_usdt,  # noqa: F401 — re-export
     hl_close_position,
     hl_get_funding,
-    warmup_hl_connection,
+    warmup_hl_connection, # noqa: F401 — re-export для parser_arbitrage
 )
 from tg.tg_logger import tg_log
 
