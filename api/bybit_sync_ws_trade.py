@@ -80,10 +80,59 @@ _AUTH_EXPIRES_SEC = 60
 _ORDER_ACK_TIMEOUT = 1.5
 
 # Таймаут recv() в reader-loop'е. Используется чтобы периодически
-# проверять _stop. На самом recv внутри websockets.sync есть свой
-# keepalive-thread с ping/pong, так что connection-drop замечается
-# независимо от этого таймаута.
+# проверять _stop и (при отсутствии keepalive в библиотеке) активно
+# пинговать соединение.
+#
+# FIX-AUDIT: прежний комментарий утверждал, что «внутри websockets.sync есть
+# свой keepalive-thread с ping/pong». Для websockets 12.x это НЕВЕРНО:
+# keepalive у sync-клиента появился только в 13.0. Проверено по исходникам
+# 12.0 — в websockets/sync/connection.py нет ни keepalive, ни ping_interval.
 _READER_RECV_TIMEOUT = 30.0
+
+# FIX-AUDIT: ping_interval/ping_timeout поддерживаются sync-клиентом только
+# с websockets 13.0. Определяем это по сигнатуре, а не по номеру версии —
+# так код работает и на 12.x (pinned в requirements), и после апгрейда.
+#
+# Без keepalive обрыв соединения не детектируется: reader висит в recv,
+# _connected остаётся выставленным, а первый send() в half-open TCP проходит
+# успешно (ядро буферизует) — ордер уходит в никуда, и REST-fallback НЕ
+# срабатывает, потому что place_order_fast вернул {"sent": True}.
+# Воспроизведено на сокете: 1-й send в закрытый peer'ом сокет проходит
+# без ошибки, BrokenPipeError прилетает только на 2-м.
+_WS_PING_INTERVAL = 20.0
+_WS_PING_TIMEOUT = 10.0
+
+
+def _detect_keepalive_kwargs() -> dict:
+    """Возвращает keepalive-kwargs, если их принимает установленный websockets."""
+    try:
+        import inspect
+
+        from websockets.sync.client import connect as _sync_connect
+
+        params = inspect.signature(_sync_connect).parameters
+        if "ping_interval" in params and "ping_timeout" in params:
+            return {
+                "ping_interval": _WS_PING_INTERVAL,
+                "ping_timeout": _WS_PING_TIMEOUT,
+            }
+    except Exception:  # noqa: BLE001 — библиотека может отсутствовать
+        pass
+    return {}
+
+
+_KEEPALIVE_KW = _detect_keepalive_kwargs()
+
+# Если библиотека keepalive не умеет — держим соединение живым сами:
+# reader-thread после каждого idle-таймаута шлёт application-level ping
+# и проверяет, что pong пришёл. Bybit V5 Trade поддерживает {"op":"ping"}.
+_MANUAL_PING_NEEDED = not _KEEPALIVE_KW
+
+# Сколько idle-таймаутов подряд (по _READER_RECV_TIMEOUT каждый) терпим без
+# единого фрейма от Bybit, прежде чем признать соединение мёртвым.
+# 2 x 30с = 60с тишины при том, что мы шлём ping каждые 30с и periodic
+# warmup идёт каждые 45с — на живом соединении такого не бывает.
+_MAX_SILENT_TIMEOUTS = 2
 
 
 class BybitSyncWsTrade:
@@ -148,6 +197,30 @@ class BybitSyncWsTrade:
             except Exception:
                 pass
 
+    def force_reconnect(self) -> None:
+        """
+        Принудительно рвёт текущее соединение, НЕ останавливая manager-loop —
+        он тут же поднимет новое.
+
+        FIX-AUDIT: нужно для случая «сокет формально открыт, но Bybit не
+        отвечает». Без этого _connected оставался выставленным, а
+        place_order_fast возвращал {"sent": True} на half-open TCP, и ордер
+        терялся молча — REST-fallback не срабатывал.
+
+        Сначала снимаем _connected, чтобы hot-path немедленно перестал
+        считать канал живым и ушёл на REST/async, и только потом закрываем
+        сокет.
+        """
+        self._connected.clear()
+        with self._ws_lock:
+            ws = self._ws
+            self._ws = None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:  # noqa: BLE001 — сокет уже мёртв, это норма
+                pass
+
     # ── manager-loop: connect + auth + reader, с reconnect ──────────
     def _mgr_loop(self) -> None:
         # Импорты в функции: модуль bybit_sync_ws_trade грузится из
@@ -164,18 +237,29 @@ class BybitSyncWsTrade:
         while not self._stop:
             try:
                 print(f"[BYBIT-SYNC-WS] connect → {WS_TRADE_URL}", flush=True)
-                # websockets.sync ClientConnection (v12):
+                # websockets.sync ClientConnection:
                 # • open_timeout — на TCP+TLS+WS handshake
-                # • ping_interval/ping_timeout у sync-клиента появились
-                #   только в websockets 13.0. У нас pinned >=12,<13,
-                #   поэтому передавать их нельзя — будет TypeError.
-                #   Keepalive держится periodic warmup'ом (каждые 45с)
-                #   и TCP-level дроп ловится в recv/send → reconnect.
+                # • ping_interval/ping_timeout появились у sync-клиента
+                #   только в websockets 13.0. На 12.x их передавать нельзя —
+                #   TypeError. Поэтому пробрасываем их ТОЛЬКО если
+                #   установленная версия их поддерживает (см. _KEEPALIVE_KW).
+                #
+                # FIX-AUDIT: комментарий здесь раньше утверждал, что
+                # «websockets keepalive сам шлёт ping каждые 20с». Для
+                # sync-клиента 12.x это неверно — в websockets/sync/
+                # connection.py 12.0 нет ни keepalive-потока, ни
+                # ping_interval. Без ping'ов оборванное соединение не
+                # детектируется: reader молча висит в recv, _connected
+                # остаётся выставленным, а первый send() в half-open TCP
+                # проходит успешно (ядро буферизует) — ордер уходит
+                # в никуда и REST-fallback НЕ срабатывает, потому что
+                # place_order_fast вернул {"sent": True}.
                 ws = ws_connect(
                     WS_TRADE_URL,
                     open_timeout=10,
                     close_timeout=5,
                     max_size=2**20,  # 1MB, ack-фреймы крошечные
+                    **_KEEPALIVE_KW,
                 )
             except Exception as e:
                 print(f"[BYBIT-SYNC-WS] connect failed: {e!r} — retry через {delay:.0f}с", flush=True)
@@ -220,12 +304,41 @@ class BybitSyncWsTrade:
                 delay = _RECONNECT_DELAY_MIN
 
                 # ── Reader-loop ────────────────────────────────────
+                # FIX-AUDIT: считаем idle-таймауты. Если библиотека не умеет
+                # keepalive (websockets 12.x), сами шлём application-level
+                # ping и требуем ответ. Молчание сверх _MAX_SILENT_TIMEOUTS
+                # подряд означает мёртвое соединение — рвём и реконнектимся,
+                # вместо того чтобы держать _connected выставленным и терять
+                # ордера в half-open сокет.
+                silent_timeouts = 0
                 while not self._stop:
                     try:
                         raw = ws.recv(timeout=_READER_RECV_TIMEOUT)
                     except TimeoutError:
-                        # Нет фрейма за 30с — websockets keepalive сам
-                        # шлёт ping каждые 20с; нет фрейма = idle, OK.
+                        if not _MANUAL_PING_NEEDED:
+                            # Библиотека сама шлёт ping/pong — idle это норма.
+                            continue
+                        silent_timeouts += 1
+                        if silent_timeouts > _MAX_SILENT_TIMEOUTS:
+                            print(
+                                "[BYBIT-SYNC-WS] нет ответа на "
+                                f"{silent_timeouts} ping'ов подряд — "
+                                "считаем соединение мёртвым, reconnect",
+                                flush=True,
+                            )
+                            break
+                        # Application-level ping: Bybit V5 отвечает
+                        # {"op":"pong"}, что сбросит счётчик на след. итерации.
+                        try:
+                            with self._send_lock:
+                                ws.send(_json_dumps({"op": "ping"}))
+                        except Exception as e:  # noqa: BLE001
+                            print(
+                                f"[BYBIT-SYNC-WS] ping failed: {type(e).__name__}: {e}"
+                                " — reconnect",
+                                flush=True,
+                            )
+                            break
                         continue
                     except ConnectionClosed:
                         print("[BYBIT-SYNC-WS] connection closed by peer", flush=True)
@@ -233,6 +346,9 @@ class BybitSyncWsTrade:
                     except Exception as e:
                         print(f"[BYBIT-SYNC-WS] recv error: {e!r}", flush=True)
                         break
+
+                    # Любой полученный фрейм (в т.ч. pong) = соединение живое.
+                    silent_timeouts = 0
 
                     try:
                         msg = _json_loads(raw)
@@ -512,20 +628,63 @@ def place_order_sync(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | 
 # По тем же причинам, что и в async-варианте: PEP-659 inline caches,
 # CPU branch predictor и kernel TCP state остывают между листингами.
 _PERIODIC_WARMUP_INTERVAL = 45.0
+# Сколько прогревов подряд без ack терпим до принудительного reconnect'а.
+_WARMUP_FAIL_LIMIT = 2
 _periodic_warmup_thread: threading.Thread | None = None
 _periodic_warmup_lock = threading.Lock()
 
 
 def _periodic_warmup_loop() -> None:
+    """
+    Периодический прогрев hot-path + косвенный health-check соединения.
+
+    FIX-AUDIT: раньше результат warmup'а полностью игнорировался
+    (`except Exception: pass`, возврат не проверялся). Warmup — это
+    round-trip к Bybit: если он N раз подряд не получает ack, соединение
+    мертво, даже если сокет формально «открыт». Раньше в таком состоянии
+    _connected оставался выставленным, place_order_fast возвращал
+    {"sent": True}, и ордер терялся без REST-fallback.
+
+    Теперь N подряд неудачных прогревов принудительно рвут соединение —
+    manager-loop поднимет новое.
+    """
+    failures = 0
     while True:
         time.sleep(_PERIODIC_WARMUP_INTERVAL)
         inst = _global_instance
         if inst is None:
             continue
+        if not inst.is_ready():
+            # Не подключены — manager сам занимается reconnect'ом.
+            failures = 0
+            continue
         try:
-            inst.warmup(timeout=1.0)
-        except Exception:
-            pass
+            ok = inst.warmup(timeout=1.0)
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            print(f"[BYBIT-SYNC-WS] warmup упал: {e!r}", flush=True)
+
+        if ok:
+            failures = 0
+            continue
+
+        failures += 1
+        print(
+            f"[BYBIT-SYNC-WS] warmup без ack ({failures}/{_WARMUP_FAIL_LIMIT})",
+            flush=True,
+        )
+        if failures >= _WARMUP_FAIL_LIMIT:
+            print(
+                "[BYBIT-SYNC-WS] соединение не отвечает на прогрев — "
+                "принудительный reconnect (иначе ордера уходили бы "
+                "в мёртвый сокет без REST-fallback)",
+                flush=True,
+            )
+            failures = 0
+            try:
+                inst.force_reconnect()
+            except Exception as e:  # noqa: BLE001
+                print(f"[BYBIT-SYNC-WS] force_reconnect упал: {e!r}", flush=True)
 
 
 def start_periodic_warmup() -> None:
