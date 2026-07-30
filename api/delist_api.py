@@ -611,10 +611,24 @@ def calculate_margin_for_delist() -> float:
 _lot_step_cache: dict[str, float] = {}
 _lot_step_lock = threading.Lock()
 
+# FIX-AUDIT: биржевые лимиты инструмента, которые раньше вообще не читались.
+#   _max_leverage_cache — maxLeverage из leverageFilter. LEVERAGE=10 в коде
+#       использовался для расчёта qty, но у 35 linear-инструментов Bybit
+#       (проверено 2026-07-30) maxLeverage = 5. Ордер считался под плечо 10,
+#       а фактически требовал вдвое больше маржи -> Bybit отклонял его
+#       (retCode 110007 «insufficient balance»), и делистинг пропускался.
+#   _min_qty_cache — minOrderQty из lotSizeFilter. Если после округления
+#       вниз qty оказывается меньше минимума, ордер тоже отклоняется.
+# Оба поля приходят в ТОМ ЖЕ ответе /v5/market/instruments-info, который уже
+# запрашивает preload_lot_steps — дополнительных запросов не требуется.
+_max_leverage_cache: dict[str, float] = {}
+_min_qty_cache: dict[str, float] = {}
+
 
 def preload_lot_steps() -> None:
     """
-    Предзагружает шаги лота для всех linear-инструментов при старте.
+    Предзагружает шаги лота, минимальные размеры и максимальные плечи
+    для всех linear-инструментов при старте.
     Убирает задержку _get_qty_step в момент открытия ордера.
     """
     try:
@@ -623,13 +637,54 @@ def preload_lot_steps() -> None:
         with _lot_step_lock:
             for item in items:
                 symbol = item.get("symbol", "")
-                if symbol.endswith("USDT"):
-                    coin = symbol[:-4]
-                    step = float(item["lotSizeFilter"]["qtyStep"])
-                    _lot_step_cache[coin] = step
-        print(f"[PRELOAD] Загружено {len(_lot_step_cache)} шагов лота")
+                if not symbol.endswith("USDT"):
+                    continue
+                coin = symbol[:-4]
+                lot = item.get("lotSizeFilter") or {}
+                try:
+                    _lot_step_cache[coin] = float(lot["qtyStep"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # FIX-AUDIT: minOrderQty и maxLeverage — из того же ответа.
+                try:
+                    _min_qty_cache[coin] = float(lot.get("minOrderQty", 0) or 0)
+                except (TypeError, ValueError):
+                    _min_qty_cache[coin] = 0.0
+                try:
+                    lev = (item.get("leverageFilter") or {}).get("maxLeverage")
+                    if lev is not None:
+                        _max_leverage_cache[coin] = float(lev)
+                except (TypeError, ValueError):
+                    pass
+        capped = sum(1 for v in _max_leverage_cache.values() if v < LEVERAGE)
+        print(
+            f"[PRELOAD] Загружено {len(_lot_step_cache)} шагов лота, "
+            f"{len(_max_leverage_cache)} лимитов плеча "
+            f"({capped} инструментов с maxLeverage < {LEVERAGE})"
+        )
     except Exception as e:
         print(f"[PRELOAD ERROR] {e}")
+
+
+def effective_leverage(coin: str) -> float:
+    """
+    Плечо, которое биржа реально разрешает для этого инструмента.
+
+    FIX-AUDIT: раньше объём всегда считался под LEVERAGE=10. У инструментов
+    с maxLeverage=5 это давало ордер вдвое больше, чем позволяет доступная
+    маржа — Bybit отклонял его, и сигнал терялся. Берём min(LEVERAGE, max).
+    Если лимит неизвестен (нет в кеше) — консервативно возвращаем LEVERAGE,
+    поведение как раньше.
+    """
+    limit = _max_leverage_cache.get(coin)
+    if limit is None or limit <= 0:
+        return float(LEVERAGE)
+    return float(min(LEVERAGE, limit))
+
+
+def min_order_qty(coin: str) -> float:
+    """Минимальный размер ордера в токенах (0.0 если неизвестен)."""
+    return _min_qty_cache.get(coin, 0.0)
 
 
 class QtyStepUnavailable(Exception):
@@ -730,7 +785,11 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
 
     if bybit_price:
         symbol  = f"{ticker_name}USDT"
-        raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магическое число → константа
+        # FIX-AUDIT: плечо берём с учётом лимита инструмента, а не константу.
+        # У 35 linear-инструментов Bybit maxLeverage=5 — расчёт под 10x давал
+        # ордер, требующий вдвое больше маржи, и Bybit его отклонял.
+        lev     = effective_leverage(ticker_name)
+        raw_qty = (usdt_amount / bybit_price) * lev
 
         try:
             step = _get_qty_step(symbol)
@@ -741,6 +800,19 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
             bybit_price = None
         else:
             amount_tokens = _round_qty(raw_qty, step)
+
+            # FIX-AUDIT: qty ниже minOrderQty биржа отклонит (retCode 110007).
+            # Раньше такой ордер молча улетал и терялся; теперь сразу уходим
+            # на Gate.io fallback, где размер может пройти.
+            min_qty = min_order_qty(ticker_name)
+            if amount_tokens > 0 and min_qty > 0 and amount_tokens < min_qty:
+                print(
+                    f"[QTY BELOW MIN BYBIT] {symbol}: qty={amount_tokens} < "
+                    f"minOrderQty={min_qty} (margin={usdt_amount}, lev={lev:g}) "
+                    f"— пробуем Gate.io"
+                )
+                bybit_price = None
+                amount_tokens = 0
 
             if amount_tokens > 0:
                 qty_str = str(amount_tokens)
