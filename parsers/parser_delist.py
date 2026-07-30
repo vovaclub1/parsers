@@ -304,8 +304,26 @@ _fired_coins:  set[str] = set()
 _fired_expiry: dict[str, float] = {}
 _FIRED_TTL     = 60   # L1: секунд до снятия блокировки монеты
 
-# L2: постоянное хранилище отстрелянных монет (любой источник).
-_global_fired: set[str] = set()
+# L2: хранилище отстрелянных монет (любой источник).
+#
+# FIX-AUDIT: раньше это было множество без срока давности — монета, по которой
+# один раз открыли позицию, блокировалась НАВСЕГДА. Повторные делистинги одной
+# монеты — обычное дело, проверено по каталогу Binance:
+#   ARDR — 2026-03-10 (margin) и 2026-06-26 (spot), интервал 108 дней
+#   ALCX — 2026-03-13 (VIP loan) и 2026-06-26 (spot), интервал 105 дней
+#   HOT  — 2023-08-30 и 2026-06-29, интервал 1034 дня
+# Второй, часто более значимый сигнал молча пропускался.
+#
+# Теперь L2 хранит время открытия и истекает через _L2_TTL. Смысл L2
+# сохраняется (защита от дублей при рестарте контейнера и от повторной
+# обработки той же статьи разными источниками), но через месяц монета
+# снова доступна для торговли.
+_global_fired: dict[str, float] = {}
+
+# 30 дней. Дольше самого длинного «эха» одного события (статья + TG-мирроры
+# + повторные публикации Binance), но кратно меньше реального интервала между
+# независимыми делистингами одной монеты (100+ дней по данным выше).
+_L2_TTL = float(os.getenv("DELIST_L2_TTL_SEC", 30 * 24 * 3600))
 # FIX-AUDIT: STATE_DIR — отдельный смонтированный каталог, чтобы L2-дедуп
 # переживал пересоздание контейнера (см. config.config.STATE_DIR).
 _FIRED_FILE = Path(STATE_DIR) / "delist_fired.json"
@@ -566,9 +584,26 @@ def _load_fired_state() -> None:
             import json as _stdj
             data = _stdj.loads(raw.decode())
         gf = data.get("global", [])
+        now = time.time()
         with _fired_lock:
+            # FIX-AUDIT: обратная совместимость со старым форматом (list без
+            # времени). Такие записи считаем «только что созданными», чтобы
+            # апгрейд не разблокировал разом все монеты из истории.
             if isinstance(gf, list):
-                _global_fired.update(str(c) for c in gf if isinstance(c, str))
+                for c in gf:
+                    if isinstance(c, str):
+                        _global_fired[c] = now
+            elif isinstance(gf, dict):
+                for c, ts in gf.items():
+                    if not isinstance(c, str):
+                        continue
+                    try:
+                        ts_f = float(ts)
+                    except (TypeError, ValueError):
+                        continue
+                    # Пропускаем уже протухшие — незачем тащить их в память.
+                    if now - ts_f < _L2_TTL:
+                        _global_fired[c] = ts_f
         log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)}")
     except Exception as e:  # noqa: BLE001
         log_warn("DEDUP", f"L2 load failed: {e!r} — стартуем с пустого")
@@ -578,7 +613,8 @@ def _persist_fired_state() -> None:
     """Атомарный сейв L2 (write+rename). Вызывается фоновым writer'ом."""
     try:
         with _fired_lock:
-            snapshot = {"global": sorted(_global_fired)}
+            # FIX-AUDIT: сохраняем время открытия, чтобы TTL переживал рестарт.
+            snapshot = {"global": dict(_global_fired)}
         try:
             import orjson as _oj  # type: ignore[import-not-found]
             payload = _oj.dumps(snapshot, option=_oj.OPT_INDENT_2)
@@ -602,10 +638,17 @@ def _try_claim(coin: str) -> bool:
     threading.Thread.start() ≈ 3-5мс на coin (для 5 монет = 15-25мс в hot-path).
     Теперь один фоновый sweeper (_fired_sweeper) подметает по таймстампу.
     """
+    now_wall = time.time()
     with _fired_lock:
-        # L2: уже шортили эту монету (навсегда) → skip.
-        if coin in _global_fired:
-            return False
+        # L2: недавно шортили эту монету → skip. По истечении _L2_TTL монета
+        # снова доступна (повторные делистинги реальны, см. комментарий у
+        # _global_fired).
+        fired_at = _global_fired.get(coin)
+        if fired_at is not None:
+            if now_wall - fired_at < _L2_TTL:
+                return False
+            # Протухло — убираем запись, чтобы словарь не рос бесконечно.
+            _global_fired.pop(coin, None)
         # L1: монета сейчас обрабатывается (TTL) → skip.
         if coin in _fired_coins:
             return False
@@ -624,9 +667,9 @@ def _mark_opened(coin: str) -> None:
     """
     dirty = False
     with _fired_lock:
-        if coin not in _global_fired:
-            _global_fired.add(coin)
-            dirty = True
+        # Обновляем отметку времени всегда — повторное открытие сдвигает окно.
+        _global_fired[coin] = time.time()
+        dirty = True
     if dirty:
         _fired_dirty.set()
 
@@ -645,15 +688,26 @@ def _fired_persist_loop() -> None:
 
 
 def _fired_sweeper() -> None:
-    """FIX-PERF: единый поток для TTL-cleanup L1 _fired_coins. L2 — навсегда."""
+    """
+    FIX-PERF: единый поток для TTL-cleanup L1 _fired_coins.
+    FIX-AUDIT: заодно подчищает протухшие записи L2 (_global_fired) — раньше
+    L2 был «навсегда» и блокировал повторные делистинги одной монеты.
+    """
     while True:
         time.sleep(5)
         now = time.monotonic()
+        now_wall = time.time()
         with _fired_lock:
             expired = [c for c, ts in _fired_expiry.items() if ts <= now]
             for c in expired:
                 _fired_coins.discard(c)
                 _fired_expiry.pop(c, None)
+            # L2: снимаем блокировку по истечении _L2_TTL.
+            stale = [c for c, ts in _global_fired.items() if now_wall - ts >= _L2_TTL]
+            for c in stale:
+                _global_fired.pop(c, None)
+            if stale:
+                log_info("DEDUP", f"L2: снята блокировка с {len(stale)} монет по TTL")
 
 
 # ── Fetch ────────────────────────────────────────────────────────

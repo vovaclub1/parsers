@@ -74,11 +74,43 @@ def test_stale_index_entry_cannot_block_coin_forever():
     assert pl._try_claim("GHOST", "TG:1") is True
 
 
-def test_l2_blocks_previously_traded_coin():
-    """L2: монету, по которой уже открывали позицию, повторно не берём."""
+def test_l2_blocks_recently_traded_coin():
+    """L2: монету, по которой недавно открывали позицию, повторно не берём."""
     with pl._fired_lock:
-        pl._global_fired.add("OLDCOIN")
+        pl._global_fired["OLDCOIN"] = time.time()
     assert pl._try_claim("OLDCOIN", "TG:1") is False
+
+
+def test_l2_releases_coin_after_ttl():
+    """REGRESSION: L2 блокировал монету НАВСЕГДА.
+
+    По каталогу Binance повторные делистинги одной монеты реальны:
+      ARDR — 2026-03-10 и 2026-06-26 (108 дней)
+      ALCX — 2026-03-13 и 2026-06-26 (105 дней)
+    Второй сигнал молча пропускался.
+    """
+    with pl._fired_lock:
+        pl._global_fired["ARDR"] = time.time() - (pl._L2_TTL + 1)
+    assert pl._try_claim("ARDR", "TG:1") is True
+
+
+def test_l2_per_exchange_also_expires():
+    with pl._fired_lock:
+        pl._per_exchange_fired["UPBIT"]["PRL"] = time.time() - (pl._L2_TTL + 1)
+    assert pl._try_claim("PRL", "UPBIT") is True
+
+
+def test_l2_per_exchange_blocks_same_exchange_within_ttl():
+    with pl._fired_lock:
+        pl._per_exchange_fired["UPBIT"]["PRL"] = time.time()
+    assert pl._try_claim("PRL", "UPBIT") is False
+
+
+def test_l2_per_exchange_does_not_block_other_exchange():
+    """Листинг на Upbit не должен мешать поймать тот же тикер на Binance."""
+    with pl._fired_lock:
+        pl._per_exchange_fired["UPBIT"]["PRL"] = time.time()
+    assert pl._try_claim("PRL", "BINANCE") is True
 
 
 def test_claim_is_o1_and_not_linear_scan():

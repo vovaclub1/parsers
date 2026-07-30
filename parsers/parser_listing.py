@@ -235,13 +235,26 @@ _FIRED_TTL      = 60
 _first_claim_ts: dict[str, tuple[str, float]] = {}   # coin -> (source, t)
 _FIRST_CLAIM_TTL = 300  # храним 5 минут — на дольше дельта уже неинтересна
 
-# L2: постоянное хранилище опыта.
-_global_fired: set[str] = set()                       # ANNOUNCEMENT-monedas навсегда
-_per_exchange_fired: dict[str, set[str]] = {          # DIRECT POLL — (coin, exchange)
-    "UPBIT": set(),
-    "BITHUMB": set(),
-    "BINANCE": set(),
+# L2: хранилище опыта «эту монету уже торговали».
+#
+# FIX-AUDIT: раньше это были множества без срока давности — монета
+# блокировалась НАВСЕГДА. Но повторные события по одной монете реальны:
+# монета делистится с одной биржи и листится на другой, возвращается после
+# делистинга, либо листится сначала на Upbit, а через месяцы на Binance.
+# Второй сигнал молча пропускался.
+#
+# Теперь храним время открытия и истекаем через _L2_TTL. Защита от дублей
+# при рестарте и от повторной обработки того же анонса сохраняется.
+_global_fired: dict[str, float] = {}                  # ANNOUNCEMENT: coin -> ts
+_per_exchange_fired: dict[str, dict[str, float]] = {  # DIRECT POLL: coin -> ts
+    "UPBIT": {},
+    "BITHUMB": {},
+    "BINANCE": {},
 }
+
+# 30 дней — дольше «эха» одного события, но кратно меньше интервала между
+# независимыми листингами одной монеты.
+_L2_TTL = float(os.getenv("LISTING_L2_TTL_SEC", 30 * 24 * 3600))
 
 # Источники, по которым coin помечается ГЛОБАЛЬНО (anywhere fired).
 # Все TG-каналы (включая extra) — это анонсы. TOA/CoinListing — тоже анонсы.
@@ -322,14 +335,32 @@ def _load_fired_state() -> None:
             import json as _stdj
             data = _stdj.loads(raw.decode())
         gf = data.get("global", [])
+        now = time.time()
+
+        def _ingest(target: dict[str, float], payload) -> None:
+            """FIX-AUDIT: принимаем и старый формат (list без времени), и новый
+            (dict coin -> ts). Записи старого формата считаем свежими, чтобы
+            апгрейд не разблокировал разом всю историю."""
+            if isinstance(payload, list):
+                for c in payload:
+                    if isinstance(c, str):
+                        target[c] = now
+            elif isinstance(payload, dict):
+                for c, ts in payload.items():
+                    if not isinstance(c, str):
+                        continue
+                    try:
+                        ts_f = float(ts)
+                    except (TypeError, ValueError):
+                        continue
+                    if now - ts_f < _L2_TTL:
+                        target[c] = ts_f
+
         with _fired_lock:
-            if isinstance(gf, list):
-                _global_fired.update(str(c) for c in gf if isinstance(c, str))
+            _ingest(_global_fired, gf)
             for ex, coins in (data.get("per_exchange") or {}).items():
-                if ex in _per_exchange_fired and isinstance(coins, list):
-                    _per_exchange_fired[ex].update(
-                        str(c) for c in coins if isinstance(c, str)
-                    )
+                if ex in _per_exchange_fired:
+                    _ingest(_per_exchange_fired[ex], coins)
         per_ex_summary = ", ".join(f"{k}={len(v)}" for k, v in _per_exchange_fired.items())
         log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)} | {per_ex_summary}")
     except Exception as e:  # noqa: BLE001
@@ -343,9 +374,10 @@ def _persist_fired_state() -> None:
     """
     try:
         with _fired_lock:
+            # FIX-AUDIT: сохраняем время открытия — TTL должен переживать рестарт.
             snapshot = {
-                "global": sorted(_global_fired),
-                "per_exchange": {k: sorted(v) for k, v in _per_exchange_fired.items()},
+                "global": dict(_global_fired),
+                "per_exchange": {k: dict(v) for k, v in _per_exchange_fired.items()},
             }
         try:
             import orjson as _oj  # type: ignore[import-not-found]
@@ -362,12 +394,29 @@ def _persist_fired_state() -> None:
 
 
 def _is_already_fired(coin: str, source: str) -> bool:
-    """L2-проверка. Должна вызываться под _fired_lock."""
-    if coin in _global_fired:
-        return True
+    """
+    L2-проверка. Должна вызываться под _fired_lock.
+
+    FIX-AUDIT: блокировка действует только _L2_TTL секунд. Протухшие записи
+    удаляются здесь же (lazy expiry) — на случай если sweeper ещё не дошёл.
+    """
+    now = time.time()
+
+    fired_at = _global_fired.get(coin)
+    if fired_at is not None:
+        if now - fired_at < _L2_TTL:
+            return True
+        _global_fired.pop(coin, None)
+
     kind, exchange = _classify_source(source)
     if kind == "DIRECT" and exchange:
-        return coin in _per_exchange_fired.get(exchange, set())
+        bucket = _per_exchange_fired.get(exchange)
+        if bucket:
+            ex_ts = bucket.get(coin)
+            if ex_ts is not None:
+                if now - ex_ts < _L2_TTL:
+                    return True
+                bucket.pop(coin, None)
     return False
 
 
@@ -436,16 +485,16 @@ def _mark_opened(coin: str, source: str) -> None:
     """
     kind, exchange = _classify_source(source)
     dirty = False
+    now = time.time()
     with _fired_lock:
         if kind == "ANNOUNCE":
-            if coin not in _global_fired:
-                _global_fired.add(coin)
-                dirty = True
+            # Повторное открытие сдвигает окно блокировки.
+            _global_fired[coin] = now
+            dirty = True
         elif kind == "DIRECT" and exchange:
-            bucket = _per_exchange_fired.setdefault(exchange, set())
-            if coin not in bucket:
-                bucket.add(coin)
-                dirty = True
+            bucket = _per_exchange_fired.setdefault(exchange, {})
+            bucket[coin] = now
+            dirty = True
         # OTHER — не пишем в L2 (на всякий случай).
     if dirty:
         _fired_dirty.set()
@@ -465,10 +514,15 @@ def _fired_persist_loop() -> None:
 
 
 def _fired_sweeper() -> None:
-    """L1: очистка истёкших claim'ов. L2 — постоянно, не трогаем."""
+    """
+    L1: очистка истёкших claim'ов.
+    FIX-AUDIT: L2 больше не «навсегда» — протухшие по _L2_TTL записи тоже
+    удаляются, иначе повторный листинг той же монеты был бы пропущен.
+    """
     while True:
         time.sleep(5)
         now = time.monotonic()
+        now_wall = time.time()
         with _fired_lock:
             expired = [k for k, ts in _recent_signals.items() if ts <= now]
             for k in expired:
@@ -487,6 +541,19 @@ def _fired_sweeper() -> None:
             ]
             for c in expired_first:
                 _first_claim_ts.pop(c, None)
+
+            # FIX-AUDIT: L2 по TTL — снимаем «пожизненную» блокировку монеты.
+            stale = [c for c, ts in _global_fired.items() if now_wall - ts >= _L2_TTL]
+            for c in stale:
+                _global_fired.pop(c, None)
+            stale_ex = 0
+            for bucket in _per_exchange_fired.values():
+                for c in [c for c, ts in bucket.items() if now_wall - ts >= _L2_TTL]:
+                    bucket.pop(c, None)
+                    stale_ex += 1
+        if stale or stale_ex:
+            log_info("DEDUP", f"L2: снята блокировка — global={len(stale)}, "
+                              f"per_exchange={stale_ex}")
 
 
 # ── воркер (открытие лонга) ───────────────────────────────────────
