@@ -13,6 +13,8 @@ from api.delist_api import (
     post_order,              # FIX-10: публичный алиас вместо _post_order
     new_order_link_id,       # FIX-10: публичный алиас вместо _new_order_link_id
     _get_qty_step,
+    effective_leverage,
+    min_order_qty,
     _round_qty,
     get_price,
     known_coins,
@@ -95,7 +97,11 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
 
     if bybit_price:
         symbol  = f"{ticker_name}USDT"
-        raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магия → константа
+        # FIX-AUDIT: учитываем maxLeverage инструмента (у 35 перпов Bybit он
+        # равен 5, а не 10) — иначе ордер требует вдвое больше маржи и
+        # отклоняется с retCode 110007.
+        lev     = effective_leverage(ticker_name)
+        raw_qty = (usdt_amount / bybit_price) * lev
 
         try:
             step = _get_qty_step(symbol)
@@ -105,6 +111,17 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
             bybit_price = None
         else:
             amount_tokens = _round_qty(raw_qty, step)
+
+            # FIX-AUDIT: ниже minOrderQty биржа ордер не примет — сразу Gate.io.
+            min_qty = min_order_qty(ticker_name)
+            if amount_tokens > 0 and min_qty > 0 and amount_tokens < min_qty:
+                print(
+                    f"[QTY BELOW MIN BYBIT] {symbol}: qty={amount_tokens} < "
+                    f"minOrderQty={min_qty} (margin={usdt_amount}, lev={lev:g}) "
+                    f"— пробуем Gate.io"
+                )
+                bybit_price = None
+                amount_tokens = 0
 
             if amount_tokens <= 0:
                 print(f"[QTY ZERO BYBIT] {symbol}")
