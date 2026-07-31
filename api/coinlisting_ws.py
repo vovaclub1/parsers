@@ -30,8 +30,6 @@ except ImportError:
         return json.loads(b)
 
 from api.listing_api import (
-    market_open_long,
-    set_tp_sl_long,
     calculate_margin_for_listing,
     find_listing_pairs,
     price_updater,
@@ -492,35 +490,6 @@ async def _parse_tokens_streaming(url: str, started: float, is_bithumb: bool) ->
 # ── External signal sink ─────────────────────────────────────────
 # Если задан — _handle делегирует сигнал ему ВМЕСТО прямого _trade.
 # Сигнатура: (tickers: list[str], source: str, t_signal: float) -> None.
-# Используется parser_listing.run_coinlisting(..., signal_callback=...) для
-# того, чтобы CoinListing-сигналы попадали в общий L1+L2 дедуп процесса
-# (announcement → global fired). Cooldown _in_cooldown/_set_cooldown
-# остаётся локальным фильтром этого модуля.
-_signal_callback = None  # type: ignore[var-annotated]
-
-
-def set_signal_callback(cb) -> None:
-    """Регистрирует внешний обработчик сигналов. См. _signal_callback выше."""
-    global _signal_callback
-    _signal_callback = cb
-
-
-def _emit_signal(tickers: list[str], source: str, t_signal: float) -> None:
-    """Безопасный диспатч во внешний callback или в локальный _trade."""
-    if _signal_callback is not None:
-        try:
-            _signal_callback(tickers, source, t_signal)
-            return
-        except Exception as e:  # noqa: BLE001
-            log_err("CL", f"external callback failed ({e!r}) — fallback to local _trade")
-    for t in tickers:
-        threading.Thread(
-            target=_trade,
-            args=(t, source, "", t_signal),
-            daemon=True,
-        ).start()
-
-
 # ── External signal sink ─────────────────────────────────────────
 # Если задан — _handle делегирует сигнал ему ВМЕСТО прямого _trade.
 # Сигнатура: (tickers: list[str], source: str, t_signal: float) -> None.
@@ -572,34 +541,39 @@ def _trade(
 
     usdt_amount = calculate_margin_for_listing()
 
+    # FIX 2026-07-08 (INVERT): листинг → ШОРТ (fade the pump), зеркально
+    # worker'у parser_listing. Этот локальный путь работает только когда
+    # внешний callback не установлен/упал — но и он обязан шортить.
+    from api.delist_api import market_open_short, set_tp_sl as set_tp_sl_short
+
     try:
-        amount, entry_price = market_open_long(ticker, usdt_amount)
+        amount, entry_price = market_open_short(ticker, usdt_amount)
     except Exception as e:
-        log_err("TRADE", f"{ticker} market_open_long: {e}")
+        log_err("TRADE", f"{ticker} market_open_short: {e}")
         return
 
     open_ms = (time.perf_counter() - t_signal) * 1000
 
-    if not amount or not entry_price:
+    if amount == -1 or not amount or not entry_price:
         log_err("TRADE", f"{ticker} failed ({open_ms:.0f}ms)")
         return
 
     log_ok(
         "TRADE",
-        f"{ticker} OPENED | "
+        f"{ticker} SHORT OPENED | "
         f"entry={entry_price} "
         f"qty={amount} "
         f"time={open_ms:.0f}ms"
     )
 
     threading.Thread(
-        target=set_tp_sl_long,
+        target=set_tp_sl_short,
         args=(ticker, entry_price, amount),
         daemon=True,
     ).start()
 
     tg_log(
-        f"🚀 {ticker}\n"
+        f"🔴 SHORT {ticker}\n"
         f"Source: {source}\n"
         f"Time: {open_ms:.0f}ms"
     )
