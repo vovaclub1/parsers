@@ -10,6 +10,7 @@ import json
 import time
 import threading
 import re
+import html as _html_lib
 
 import aiohttp
 import websockets
@@ -40,7 +41,7 @@ from api.listing_api import (
     preload_lot_steps,
     gate_preload_lot_steps,
 )
-from config.config import COINLISTING_API_KEY
+from config.config import COINLISTING_API_KEY, COINLISTING_ENDPOINTS
 from tg.tg_logger import tg_log
 
 # ── ANSI ──────────────────────────────────────────────────────────
@@ -66,8 +67,14 @@ def log_err(tag, msg):  _log(tag, RED,    msg)
 if not COINLISTING_API_KEY:
     log_warn("CL", "COINLISTING_API_KEY не задан в .env — WS не подключится")
 
-URL_SEOUL = f"wss://seoul.coinlisting.pro/listings?key={COINLISTING_API_KEY}"
-URL_TOKYO = f"wss://tokyo.coinlisting.pro/listings?key={COINLISTING_API_KEY}"
+# FIX 2026-07-07 (free tier): подключаемся только к endpoint'ам из
+# COINLISTING_ENDPOINTS (деф. только seoul). На бесплатном тире второе
+# одновременное подключение выбивает первое кодом 1008 — пинг-понг
+# SEOUL↔TOKYO каждую секунду, оба слепые.
+_CL_URLS = {
+    "seoul": f"wss://seoul.coinlisting.pro/listings?key={COINLISTING_API_KEY}",
+    "tokyo": f"wss://tokyo.coinlisting.pro/listings?key={COINLISTING_API_KEY}",
+}
 
 TRADE_SOURCES = {"UPBIT", "BITHUMB"}
 
@@ -159,11 +166,31 @@ async def get_http_session() -> aiohttp.ClientSession:
 TOKEN_REGEX = re.compile(rb'\(([A-Z][A-Z0-9]{1,9})\)')
 
 # FIX: убрал дубли (раньше "KRW"/"BTC"/"USDT" повторялись)
+# FIX 2026-06-19: расширил BANNED после боевого случая с (F5) в Upbit-нотисе —
+# "새로고침 (F5) 후 확인" (нажмите F5 для refresh) триггерил TOKEN_REGEX и в
+# вырожденном сценарии (если RE-тикер ещё не пришёл в буфер) парсер бы открыл
+# лонг на F5USDT. Добавлены: F1-F12 (function keys), V1-V9 (versions),
+# распространённые крипто-аббревиатуры (ICO/ATH/DEX/CEX/AMM/KYC/AML/P2P),
+# форматы файлов (PDF/CSV/PNG/JPG/SVG), web/network-протоколы (HTTP/TCP/SSL),
+# major фиаты (EUR/JPY/GBP/CNY) и оставшиеся таймзоны (GMT/EST/PST).
 BANNED = {
     # Валюты и стейблы
     "KRW", "BTC", "ETH", "USD", "USDT", "USDC", "BUSD", "DAI",
+    "EUR", "JPY", "GBP", "CNY", "RUB", "INR", "AUD", "CAD", "CHF", "HKD",
     # Технические
-    "NFT", "KST", "UTC", "API", "VIP",
+    "NFT", "KST", "UTC", "API", "VIP", "GMT", "EST", "PST",
+    # Function keys (Korean notices: "F5로 새로고침" — refresh hotkey)
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    # Версии (V1/V2 часто в notice body — "V1 deprecated, use V2")
+    "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9",
+    # Крипто-сленг
+    "ICO", "IDO", "IEO", "ATH", "ATL", "ROI", "DEX", "CEX", "AMM",
+    "KYC", "AML", "P2P", "OTC", "DAO", "DEFI",
+    # Форматы / расширения
+    "PDF", "CSV", "PNG", "JPG", "JPEG", "GIF", "SVG", "ZIP", "RAR",
+    "HTML", "JSON", "XML", "CSS", "SQL",
+    # Протоколы / сети
+    "HTTP", "HTTPS", "FTP", "SSL", "TLS", "TCP", "UDP", "DNS", "URL",
     # Биржи и общие слова в заголовках
     "MARKET", "MARKETS", "LIST",
     "UPBIT", "BITHUMB", "BINANCE", "COINBASE",
@@ -209,6 +236,37 @@ _UPBIT_NOTICE_RE = re.compile(
 # корейские негативные ключевые слова.
 _BITHUMB_NOTICE_RE = re.compile(rb'<h2\s+class="NoticeDetailContent_detail__title[^"]*"[^>]*>([^<]+)</h2>')
 
+# FIX 2026-06-19: Next.js обфусцирует CSS-классы при каждом билде, поэтому
+# хардкод `NoticeDetailContent_detail__title__XXXX` периодически отваливается
+# (видели "no tokens found" на live-нотисах с реальными тикерами). Добавляем
+# многоуровневый fallback. og:title всегда инжектится в <head> для
+# соц-шеринга — самый ранний и стабильный signal (доступен в первых ~1-2 KB).
+_BITHUMB_OG_TITLE_RE = re.compile(
+    rb'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+# Любой <h1>/<h2> с классом, содержащим "title" (case-insensitive) —
+# устойчиво к обфускации имён, но менее надёжно чем og:title (на странице
+# могут быть посторонние title-блоки).
+_BITHUMB_ANY_TITLE_RE = re.compile(
+    rb'<h[12][^>]*class=["\'][^"\']*[Tt]itle[^"\']*["\'][^>]*>([^<]+)</h[12]>',
+)
+# Последний резерв — обычный <title>...</title>. У Bithumb-нотиса там
+# заголовок вида "오키드(OXT) 거래지원 종료 | 빗썸" — суффикс не мешает
+# token extraction, а delist-фильтр всё равно сработает.
+_BITHUMB_HTML_TITLE_RE = re.compile(
+    rb'<title[^>]*>([^<]+)</title>',
+    re.IGNORECASE,
+)
+
+# Порядок попыток — самый надёжный → самый шумный.
+_BITHUMB_TITLE_REGEXES = (
+    _BITHUMB_OG_TITLE_RE,
+    _BITHUMB_ANY_TITLE_RE,
+    _BITHUMB_NOTICE_RE,
+    _BITHUMB_HTML_TITLE_RE,
+)
+
 # Корейские стоп-слова в title, при которых сигнал — НЕ листинг:
 #   거래지원 종료 — поддержка торгов прекращена (делист)
 #   거래지원 중단 — приостановка торгов
@@ -230,6 +288,41 @@ _BITHUMB_NEG_KEYWORDS = (
     "점검",       # тех. работы
 )
 
+# FIX-FALSE-LISTING (Patch #5 risk): title-only-parse теперь идёт ПЕРЕД
+# article fetch. Раньше find_listing_pairs(title) срабатывал лишь как
+# last-resort после неуспешного article-parse, и delist-нотисы обычно
+# отфильтровывались самим парсером. Теперь — нужно явно блочить title'ы
+# с delist-маркерами, иначе откроем лонг на умирающую монету.
+# Korean уже в _BITHUMB_NEG_KEYWORDS, плюс английские/смешанные:
+_TITLE_DELIST_NEG_LOWER = (
+    "delist",         # покрывает "delisted", "delisting", "delists"
+    "will remove",
+    "removal of",
+    "removed from",
+    "trading will end",
+    "trading end",
+    "cease trading",
+    "discontinue",
+    "discontinued",
+    "monitoring tag",
+    "delistat",       # на всякий, опечатки
+)
+
+
+def _title_is_delist(title: str) -> bool:
+    """True если в title есть KR или EN-маркер delisting'а.
+    Используется чтобы early-title-parse не открыл лонг на delist-нотисе."""
+    if not title:
+        return False
+    for kw in _BITHUMB_NEG_KEYWORDS:
+        if kw in title:
+            return True
+    lower = title.lower()
+    for kw in _TITLE_DELIST_NEG_LOWER:
+        if kw in lower:
+            return True
+    return False
+
 
 def _is_bithumb_notice(url: str) -> bool:
     return "feed.bithumb.com/notice/" in url
@@ -242,27 +335,48 @@ def _rewrite_url_to_api(url: str) -> str:
     return url
 
 
-def _extract_bithumb_tokens(html: bytes) -> list[str]:
+def _find_bithumb_title(html_bytes: bytes) -> str | None:
     """
-    Парсинг Bithumb-нотиса:
-      1. Ищем <h2 class="NoticeDetailContent_detail__title__..."> ... </h2>
-      2. Если в title есть негативный корейский ключ — возвращаем []
-         (фоллбэк find_listing_pairs тоже ничего не найдёт в MASKED title,
-          ордер не откроется — это и нужно).
-      3. Иначе — экстрактим (TICKER) из title.
+    Многоуровневый extraction title из Bithumb-нотиса. Возвращает первый
+    непустой title из (og:title → любой h1/h2-title → legacy NoticeDetailContent
+    → <title>) или None если ничего не нашлось (буфер ещё мал).
     """
-    m = _BITHUMB_NOTICE_RE.search(html)
-    if not m:
+    for regex in _BITHUMB_TITLE_REGEXES:
+        m = regex.search(html_bytes)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            decoded = raw.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not decoded:
+            continue
+        # og:title и <title> могут содержать HTML-entities (&amp;, &#x2F; и т.д.)
+        try:
+            return _html_lib.unescape(decoded)
+        except Exception:
+            return decoded
+    return None
+
+
+def _extract_bithumb_tokens(html_bytes: bytes) -> list[str] | None:
+    """
+    Парсинг Bithumb-нотиса. Тристейт-возврат:
+      None      — title ещё не найден ни одним из regex'ов; стримеру нужно
+                  буферизировать дальше.
+      []        — title найден, но это delist/служебный нотис ИЛИ из title
+                  не извлеклось ни одного тикера; стримеру пора выйти —
+                  ордер открывать НЕЛЬЗЯ.
+      [tokens]  — нашли тикеры, можно открывать longs.
+    """
+    title = _find_bithumb_title(html_bytes)
+    if title is None:
+        return None
+    if _title_is_delist(title):
+        log_warn("FAST", f"Bithumb delist title — skip: {title}")
         return []
-    title_bytes = m.group(1)
-    try:
-        title = title_bytes.decode("utf-8", errors="replace").strip()
-    except Exception:
-        return []
-    for kw in _BITHUMB_NEG_KEYWORDS:
-        if kw in title:
-            log_warn("FAST", f"Bithumb negative keyword '{kw}' в title — skip: {title}")
-            return []
+    title_bytes = title.encode("utf-8", errors="replace")
     found: list[str] = []
     seen: set[str] = set()
     for tok in TOKEN_REGEX.findall(title_bytes):
@@ -323,19 +437,21 @@ async def _parse_tokens_streaming(url: str, started: float, is_bithumb: bool) ->
 
             buffer += chunk
 
-            # Bithumb-нотис: ищем <h2 class="NoticeDetailContent_detail__title__...">
-            # с фильтром негативных корейских ключей (종료, 중단, 유의, etc).
+            # Bithumb-нотис: многоуровневый title-extraction (og:title →
+            # any title-class h1/h2 → legacy NoticeDetailContent → <title>)
+            # с фильтром негативных корейских/английских ключей.
             if is_bithumb:
-                found = _extract_bithumb_tokens(buffer)
-                if found:
+                result = _extract_bithumb_tokens(buffer)
+                if result is None:
+                    # Title ещё не появился в буфере, читаем дальше.
+                    pass
+                else:
                     elapsed = (time.perf_counter() - started) * 1000
-                    log_ok("FAST", f"Bithumb title parsed in {elapsed:.1f}ms | {found}")
-                    return found
-                # Если нашли <h2> но токенов нет (негативный ключ) — сразу выходим
-                if _BITHUMB_NOTICE_RE.search(buffer):
-                    elapsed = (time.perf_counter() - started) * 1000
-                    log_warn("FAST", f"Bithumb title found but filtered ({elapsed:.1f}ms)")
-                    return []
+                    if result:
+                        log_ok("FAST", f"Bithumb title parsed in {elapsed:.1f}ms | {result}")
+                    else:
+                        log_warn("FAST", f"Bithumb title found but filtered ({elapsed:.1f}ms)")
+                    return result
             else:
                 # Upbit-API / другие: стандартный regex \(TICKER\)
                 matches = TOKEN_REGEX.findall(buffer)
@@ -363,6 +479,11 @@ async def _parse_tokens_streaming(url: str, started: float, is_bithumb: bool) ->
         elapsed = (time.perf_counter() - started) * 1000
         if found:
             log_ok("FAST", f"parsed in {elapsed:.1f}ms | {found}")
+        elif len(buffer) < 200 and (b"success" in buffer[:200] or b"error code" in buffer[:200]):
+            # FIX 2026-06-05: api-manager ответил success:false/404/CF-throttle —
+            # нотис ещё не проиндексирован или API заблокирован. Это не ошибка
+            # парсинга. Fallback на text-parser/TG всё равно ловит сигнал.
+            log_info("FAST", f"notice not indexed yet ({elapsed:.1f}ms) — fallback to text-parser")
         else:
             log_warn("FAST", f"no tokens found ({elapsed:.1f}ms)")
         return found
@@ -523,25 +644,49 @@ async def _handle(msg: dict) -> None:
         _emit_signal(real, f"COINLISTING-{source}", t_signal)
         return
 
+    # ── EARLY TITLE PARSE (Patch #5) ────────────
+    # FIX-LATENCY: раньше title-парсер шёл ПОСЛЕ article fetch (0-500мс
+    # блокировка). На сообщениях, где coins замаскированы (█), но title
+    # содержит $TICKER или known_coin — это даёт мгновенный сигнал.
+    # Цена: ~1мкс на регекс. Risk false-positive: find_listing_pairs
+    # требует либо явный "$TICKER listed on X" формат, либо матч на
+    # known_coins Bybit — не сработает на голом "Bithumb Listing Notice".
+    #
+    # FIX-FALSE-LISTING: skip early-title-parse если в title есть delist-
+    # маркер. Без этого, например title "거래지원 종료 (XYZ)" → match
+    # на $XYZ → лонг на умирающую монету.
+    if title and not _title_is_delist(title):
+        title_tickers = find_listing_pairs(title)
+        if title_tickers:
+            log_ok("CL", f"TITLE-EARLY {title_tickers} (article fetch пропущен)")
+            _emit_signal(title_tickers, f"COINLISTING-{source}", t_signal)
+            # Дальше article-parse не нужен — title уже дал ответ, дубли
+            # отсеются в L1/L2 на стороне parser_listing.
+            return
+
     # ── MASKED → ARTICLE PARSE ──────────────────
     if not url:
-        log_warn("CL", "MASKED но url пустой — пробуем fallback")
-    else:
-        log_ok("CL", f"MASKED → article parse: {url}")
+        log_warn("CL", "MASKED но url пустой — fallback ничего не дал")
+        return
 
-    parsed = await _parse_tokens_from_article_fast(url) if url else []
+    log_ok("CL", f"MASKED → article parse: {url}")
+    parsed = await _parse_tokens_from_article_fast(url)
 
     if parsed:
         log_ok("CL", f"ARTICLE TOKENS {parsed}")
         _emit_signal(parsed, f"COINLISTING-{source}", t_signal)
         return
 
-    # ── FALLBACK ────────────────────────────────
-    tickers = find_listing_pairs(title)
-
-    if tickers:
-        log_warn("CL", f"FALLBACK {tickers}")
-        _emit_signal(tickers, f"COINLISTING-{source}", t_signal)
+    # ── LAST-RESORT: повтор title-парсера с возможно обновлённым known_coins
+    # Дёшево, бесполезно почти всегда (мы уже пробовали выше), но иногда
+    # gate_known_coins дозагрузился между этими двумя точками и теперь
+    # match сработал. Оставляем как cheap safety net.
+    # FIX-FALSE-LISTING: тот же delist-guard, что в early-path.
+    if title and not _title_is_delist(title):
+        tickers = find_listing_pairs(title)
+        if tickers:
+            log_warn("CL", f"FALLBACK-LATE {tickers}")
+            _emit_signal(tickers, f"COINLISTING-{source}", t_signal)
 
 
 # ── Websocket ────────────────────────────────────────────────────
@@ -561,6 +706,11 @@ async def _listen(url: str, label: str) -> None:
     delay = _WS_BACKOFF_MIN
     while True:
 
+        # FIX 2026-07-07: сброс backoff'а ТОЛЬКО если коннект прожил ≥60с.
+        # Раньше сбрасывали сразу после connect — сервер принимал соединение
+        # и тут же выкидывал 1008 (free-tier policy), delay никогда не рос →
+        # реконнект-шторм каждую секунду сутками.
+        connected_at = 0.0
         try:
             async with websockets.connect(
                 url,
@@ -570,7 +720,7 @@ async def _listen(url: str, label: str) -> None:
             ) as ws:
 
                 log_ok("WS", f"{label} connected")
-                delay = _WS_BACKOFF_MIN  # сбрасываем backoff после успешного коннекта
+                connected_at = time.monotonic()
 
                 async for raw in ws:
 
@@ -588,9 +738,13 @@ async def _listen(url: str, label: str) -> None:
                     task.add_done_callback(_retire_task)
 
         except ConnectionClosedError as e:
+            if connected_at and (time.monotonic() - connected_at) >= 60.0:
+                delay = _WS_BACKOFF_MIN
             log_warn("WS", f"{label} disconnected {e.code} — reconnect через {delay:.0f}с")
 
         except Exception as e:
+            if connected_at and (time.monotonic() - connected_at) >= 60.0:
+                delay = _WS_BACKOFF_MIN
             log_err("WS", f"{label} error: {e} — reconnect через {delay:.0f}с")
 
         await asyncio.sleep(delay)
@@ -606,8 +760,15 @@ async def _listen(url: str, label: str) -> None:
 # aiohttp.ClientSession (важно: connection pool общий с боевым
 # парсером, только так warm-up имеет смысл).
 _PREWARM_HOSTS = (
+    # Эти хосты использует CL article-parser через aiohttp ClientSession.
     "https://api-manager.upbit.com/",
     "https://feed.bithumb.com/",
+    # FIX-LATENCY-REVERTED: api.bithumb.com и api.upbit.com убраны —
+    # notice-поллеры в parser_listing.py используют `requests.Session`
+    # из _LISTING_PROXY_POOL, это ОТДЕЛЬНЫЙ TLS-пул от aiohttp. Прогрев
+    # тут keep-alive aiohttp-сессии им не помог бы. Поллеры держат свой
+    # keep-alive через poll cadence 40-60мс — handshake платится только
+    # один раз на старте.
 )
 _PREWARM_INTERVAL = 60.0
 
@@ -643,10 +804,17 @@ async def _prewarm_loop() -> None:
 
 # ── Run ──────────────────────────────────────────────────────────
 async def _run() -> None:
-
+    # FIX 2026-07-07 (free tier): подключаемся только к сконфигурированным
+    # endpoint'ам (COINLISTING_ENDPOINTS, деф. seoul) — см. _CL_URLS.
+    listeners = [
+        _listen(_CL_URLS[ep], ep.upper())
+        for ep in COINLISTING_ENDPOINTS
+        if ep in _CL_URLS
+    ]
+    if not listeners:
+        log_warn("WS", f"COINLISTING_ENDPOINTS={COINLISTING_ENDPOINTS} — ни одного валидного endpoint'а")
     await asyncio.gather(
-        _listen(URL_SEOUL, "SEOUL"),
-        _listen(URL_TOKYO, "TOKYO"),
+        *listeners,
         _prewarm_loop(),
     )
 

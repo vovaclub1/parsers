@@ -1,0 +1,7 @@
+aiohttp>=3.9,<4
+websockets>=12,<14
+# FIX: curl_cffi — обход Cloudflare через имитацию TLS handshake Chrome
+# (JA3/JA4 fingerprint). Нужно для Upbit на Korean datacenter IP, где CF
+# режет aiohttp/curl. Bundled-binary через manylinux wheel, дополнительных
+# system-пакетов в Docker не нужно.
+curl_cffi>=0.7,<0.11

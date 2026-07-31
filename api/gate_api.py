@@ -12,6 +12,9 @@ import hmac
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, ROUND_HALF_UP
+
 import requests
 
 from config.config import GATEIO_API_KEY, GATEIO_SECRET_KEY
@@ -43,13 +46,50 @@ gate_price_cache: dict[str, float] = {}   # {"BTC": 65000.0, ...}
 gate_known_coins: set[str]         = set()
 _cache_lock = threading.Lock()
 
+
+def gate_known_snapshot() -> frozenset:
+    """Потокобезопасный снимок монет, торгуемых на Gate-фьючерсах (USDT-перпы).
+    Нужен delist-парсеру: Gate-only делисты (например XNO) распознаются и
+    шортятся на Gate, хотя их нет на Bybit."""
+    with _cache_lock:
+        return frozenset(gate_known_coins)
+
+
+# FIX (review high): age-gate против money-losing сайзинга по замороженной
+# цене при сбое Gate. gate_get_price → 0 если кэш протух → caller не торгует
+# по старой цене (market_open_* трактует 0 как "нет цены").
+_gate_cache_updated_at = 0.0
+_GATE_STALE_SEC = 10.0   # обновление каждые 3с → 3 пропуска = устарело
+
 # ── HTTP сессия ───────────────────────────────────────────────────
 _session = requests.Session()
 _session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
 
+# ── Gate WS Trade ──────────────────────────────────────────────────
+# FIX 2026-06-06: перенос ордеров с REST на WebSocket — убирает один
+# HMAC+HTTP+TLS roundtrip (~200-700мс → ~50-100мс). Модель как Bybit sync WS.
+try:
+    from api.gate_ws import init as _gate_ws_init, warmup_gate_ws, \
+        place_order_ws as _gate_ws_order, get_client as _gate_ws_client
+    _gate_ws_init(GATEIO_API_KEY, GATEIO_SECRET_KEY)
+    _gate_ws_available = True
+except Exception as _gwse:  # noqa: BLE001
+    print(f"[GATE-WS] модуль не подгружен: {_gwse!r} — будет только REST")
+    # заглушки чтобы не засорять _gate_open условиями
+    def warmup_gate_ws(timeout: float = 10.0) -> bool:  # type: ignore[no-redef]
+        return False
+    def _gate_ws_order(args: dict, timeout: float = 3.0) -> dict | None:  # type: ignore[no-redef]
+        return None
+
 # FIX: кэш установленных плеч, чтобы не дёргать API перед каждым ордером.
 _leverage_set_for: set[str] = set()
 _leverage_lock = threading.Lock()
+
+# M9: фоновый пул для установки плеча вне hot-path market_open_long.
+_leverage_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gate-lev")
+# FIX (review M16): корректный shutdown пула при выходе процесса.
+import atexit as _atexit
+_atexit.register(lambda: _leverage_executor.shutdown(wait=False))
 
 
 # ── авторизация ───────────────────────────────────────────────────
@@ -103,14 +143,19 @@ def gate_price_updater() -> None:
                 gate_price_cache.update(new_cache)
                 gate_known_coins.clear()
                 gate_known_coins.update(new_coins)
+                global _gate_cache_updated_at
+                _gate_cache_updated_at = time.monotonic()
 
         except Exception as e:
-            print(f"{_tag('GATE ERR', RED)} price_updater: {e}")
+            print(f"{_tag('GATE ERR', RED)} price_updater: {type(e).__name__}: {e}")
 
         time.sleep(3)
 
 
 def gate_get_price(ticker: str) -> float:
+    # FIX (review high): age-gate — 0 если кэш протух (сбой Gate).
+    if (time.monotonic() - _gate_cache_updated_at) > _GATE_STALE_SEC:
+        return 0
     with _cache_lock:
         return gate_price_cache.get(ticker, 0)
 
@@ -190,7 +235,12 @@ def _gate_round_price(ticker: str, price: float) -> str:
     step = _price_steps_gate.get(ticker, 0.0001)
     if step <= 0:
         step = 0.0001
-    rounded  = round(round(price / step) * step, 10)
+    # M7: было round(round(price/step)*step, 10) — двойное округление с
+    # banker's rounding (round-half-to-even) на первом round() давало ±1 тик
+    # (напр. 100.005 при step=0.01 → 100.00 вместо 100.01). Decimal с
+    # ROUND_HALF_UP считает шаг точно, без float-погрешности.
+    _d_step  = Decimal(str(step))
+    rounded  = float((Decimal(str(price)) / _d_step).quantize(Decimal(1), rounding=ROUND_HALF_UP) * _d_step)
     step_str = f"{step:.10f}".rstrip("0")
     if "." in step_str:
         decimals = len(step_str.split(".")[1])
@@ -236,17 +286,89 @@ def _gate_set_leverage(contract: str, leverage: int = _LEVERAGE, cross: bool = T
         if resp.status_code == 200:
             with _leverage_lock:
                 _leverage_set_for.add(cache_key)
-            mode = "cross" if cross else "isolated"
-            print(f"{_tag('GATE LEV', CYAN)} {contract} → {leverage}x {mode} ✓")
+            # FIX-LOG: success-print убран — на старте gate_leverage_presetter
+            # делает 700+ вызовов, забивает stdout. Кэш виден в итоговом
+            # "GATE PRESET sweep#N ✓ ... новых в кэше=...".
             return True
         else:
-            print(
-                f"{_tag('GATE LEV ERR', RED)} {contract}: "
-                f"HTTP {resp.status_code} | {resp.text[:120]}"
-            )
+            # Тихо игнорим LEVERAGE_EXCEEDED — для некоторых контрактов
+            # Gate ограничивает плечо. Этих контрактов мало, ошибки не помогают.
+            if "LEVERAGE_EXCEEDED" not in resp.text:
+                print(
+                    f"{_tag('GATE LEV ERR', RED)} {contract}: "
+                    f"HTTP {resp.status_code} | {resp.text[:120]}"
+                )
             return False
     except Exception as e:
         print(f"{_tag('GATE LEV ERR', RED)} {contract}: {e}")
+        return False
+
+
+def _gate_set_leverage_async(contract: str, leverage: int = _LEVERAGE, cross: bool = True) -> None:
+    """
+    M9: ставит плечо в ФОНЕ — не блокирует hot-path. На cache-hit ничего не
+    делает (плечо уже установлено). На cold-тикере submit'ит установку в пул
+    и сразу возвращается; ордер уходит, не дожидаясь ~150мс HTTP POST.
+    Корректность размера: contracts считаются от КОНСТАНТЫ _LEVERAGE, а НЕ от
+    состояния биржи. Если фоновая установка не успеет и Gate отвергнет ордер
+    по марже — self-heal в _gate_open доставит плечо синхронно и повторит.
+    """
+    cache_key = f"{contract}:{leverage}:{int(cross)}"
+    with _leverage_lock:
+        if cache_key in _leverage_set_for:
+            return
+    try:
+        _leverage_executor.submit(_gate_set_leverage, contract, leverage, cross)
+    except Exception:
+        # Пул переполнен/закрыт — ставим синхронно как fallback (хуже по
+        # латентности, но корректность важнее).
+        _gate_set_leverage(contract, leverage, cross)
+
+
+def _is_leverage_margin_error(exc: Exception) -> bool:
+    """True, если ошибка Gate похожа на «плечо не установлено / не хватает маржи»."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    try:
+        label = str((resp.json() or {}).get("label", ""))
+    except Exception:
+        label = resp.text or ""
+    label = label.upper()
+    return any(k in label for k in ("LEVERAGE", "MARGIN", "INSUFFICIENT", "RISK_LIMIT"))
+
+
+def _is_trigger_passed_error(exc) -> bool:
+    """
+    True, если Gate отверг постановку стоп-триггера, потому что цена УЖЕ за ним
+    (AUTO_TRIGGER_PRICE_LESS_LAST для лонга / GREATER для шорта). Значит позиция
+    уже пробила стоп → её надо закрыть по рынку немедленно.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    try:
+        label = str((resp.json() or {}).get("label", ""))
+    except Exception:  # noqa: BLE001
+        label = getattr(resp, "text", "") or ""
+    return "AUTO_TRIGGER_PRICE" in label.upper()
+
+
+def _gate_market_close(ticker: str, contracts: int, is_long: bool) -> bool:
+    """Немедленное закрытие позиции по рынку (reduce-only IOC). True = ушло.
+    Лонг → size<0 (продаём), шорт → size>0 (выкупаем)."""
+    contract = f"{ticker}_USDT"
+    size = -int(abs(contracts)) if is_long else int(abs(contracts))
+    try:
+        _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
+            "contract": contract, "size": size, "price": "0",
+            "tif": "ioc", "reduce_only": True,
+        })
+        print(f"{_tag('GATE SL→MARKET', RED)} {BOLD}{ticker}{RESET} | "
+              f"цена уже за SL → закрыто по рынку ({abs(contracts)} контр.)")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"{_tag('GATE CLOSE ERR', RED)} {ticker}: {e}")
         return False
 
 
@@ -271,7 +393,11 @@ def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, f
 
     contract = f"{ticker}_USDT"
 
-    _gate_set_leverage(contract, _LEVERAGE, cross=True)
+    # M9: плечо ставим в ФОНЕ — не блокируем hot-path на ~150мс. Требование:
+    # на аккаунте дефолтный cross-leverage ≥ _LEVERAGE (тогда первый ордер по
+    # свежему тикеру не отвергнут по марже). Если всё же отвергнут — self-heal
+    # на _post_signed ниже доставит плечо синхронно и повторит ровно один раз.
+    _gate_set_leverage_async(contract, _LEVERAGE, cross=True)
 
     contracts = _gate_calc_contracts(ticker, usdt_amount, _LEVERAGE)
     min_sz    = _gate_min_order(ticker)
@@ -279,23 +405,61 @@ def _gate_open(ticker: str, usdt_amount: float, is_long: bool) -> tuple[float, f
     quanto    = _quanto_gate.get(ticker, 1.0)
     coins     = contracts * quanto
 
-    print(
-        f"{_tag('GATE CALC', CYAN)} {ticker} | "
-        f"margin={usdt_amount}$ × {_LEVERAGE}x = {contracts} контрактов "
-        f"(≈{coins:.4f} монет @ {price})"
-    )
+    # FIX-LOG: GATE CALC print убран — то же contracts/coins/price видно в
+    # GATE LONG ниже. Перед каждым ордером дублировал инфу.
 
     order_size = contracts if is_long else -contracts
-    result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
+    _order_body = {
         "contract":    contract,
         "size":        order_size,
         "price":       "0",
         "tif":         "ioc",
         "reduce_only": False,
         "auto_size":   "",
-    })
+    }
+    # FIX 2026-06-06: WS Trade быстрее REST (~50-100мс вместо 200-700мс).
+    # Если WS не готов — автоматический fallback на HTTP (_post_signed).
+    result = _gate_ws_order(_order_body)
+    if result is None:
+        try:
+            result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
+        except requests.HTTPError as e:
+            # M9 self-heal: leverage/margin reject → sync set + retry ONCE.
+            if not _is_leverage_margin_error(e):
+                raise
+            print(f"{_tag('GATE RETRY-LEV', YELLOW)} {BOLD}{contract}{RESET} | margin/leverage reject → sync set + retry")
+            _gate_set_leverage(contract, _LEVERAGE, cross=True)
+            result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", _order_body)
 
-    fill_price = float(result.get("fill_price") or price)
+    # M1: IOC market-ордер мог быть ПРИНЯТ (HTTP 200), но не исполнен —
+    # на свежем листинге с тонкой ликвидностью. Раньше `or price` подставлял
+    # кэш-цену → ложный success → worker ставил TP/SL на НЕсуществующую
+    # позицию. Авторитетный признак исполнения = |size|-|left| (Gate, IOC):
+    # сколько контрактов реально набралось (НЕ полагаемся на fill_price — он
+    # может отсутствовать у реально исполненного ордера, и тогда ложный (0,0)
+    # → retry → ДВОЙНАЯ позиция на Gate, где нет orderLinkId-идемпотентности).
+    # Нет филла → (0,0), worker сделает retry (unfilled-ордер позиции не
+    # создаёт, повтор безопасен).
+    # (0,0) возвращаем ТОЛЬКО при ПОЛОЖИТЕЛЬНОМ признаке неисполнения — иначе
+    # ложный (0,0) → retry → ДВОЙНАЯ позиция на Gate (нет orderLinkId). Если
+    # size/left отсутствуют или не парсятся → считаем исполненным (без retry).
+    _size_raw, _left_raw = result.get("size"), result.get("left")
+    filled = None
+    if _size_raw is not None and _left_raw is not None:
+        try:
+            filled = abs(int(_size_raw)) - abs(int(_left_raw))
+        except (TypeError, ValueError):
+            filled = None
+    fill_price = float(result.get("fill_price") or 0)
+    if filled is not None and filled <= 0:
+        print(
+            f"{_tag('GATE NO FILL', RED)} {BOLD}{contract}{RESET} | "
+            f"IOC не исполнен | size={_size_raw} left={_left_raw} "
+            f"status={result.get('status')} finish_as={result.get('finish_as')}"
+        )
+        return 0, 0
+    if fill_price <= 0:
+        fill_price = price  # исполнилось, но цена не пришла — берём кэш-цену
     direction  = "LONG" if is_long else "SHORT"
     color      = GREEN if is_long else RED
     print(
@@ -353,11 +517,7 @@ def gate_open_short_by_contracts(
     quanto    = _quanto_gate.get(ticker, 1.0)
     coins     = contracts * quanto
 
-    print(
-        f"{_tag('GATE CALC', CYAN)} {ticker} | "
-        f"шорт {contracts} контрактов "
-        f"(≈{coins:.4f} монет @ {price})"
-    )
+    # FIX-LOG: GATE CALC шорт-print убран — дублирует GATE SHORT ниже.
 
     result = _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
         "contract":    contract,
@@ -368,7 +528,24 @@ def gate_open_short_by_contracts(
         "auto_size":   "",
     })
 
-    fill_price = float(result.get("fill_price") or price)
+    # M1: см. _gate_open — (0,0) только при ПОЛОЖИТЕЛЬНОМ признаке неисполнения.
+    _size_raw, _left_raw = result.get("size"), result.get("left")
+    filled = None
+    if _size_raw is not None and _left_raw is not None:
+        try:
+            filled = abs(int(_size_raw)) - abs(int(_left_raw))
+        except (TypeError, ValueError):
+            filled = None
+    fill_price = float(result.get("fill_price") or 0)
+    if filled is not None and filled <= 0:
+        print(
+            f"{_tag('GATE NO FILL', RED)} {BOLD}{contract}{RESET} | "
+            f"IOC не исполнен | size={_size_raw} left={_left_raw} "
+            f"status={result.get('status')}"
+        )
+        return 0, 0
+    if fill_price <= 0:
+        fill_price = price
     fill_coins = contracts * quanto
     print(
         f"{_tag('GATE SHORT', RED)} {BOLD}{contract}{RESET} | "
@@ -410,7 +587,10 @@ def _run_trailing_stop(ticker: str, entry_price: float, contracts: int, trail_pc
     contract  = f"{ticker}_USDT"
     max_price = entry_price
     started   = time.monotonic()
-    last_check = 0.0
+    last_check = time.monotonic()   # FIX: НЕ 0.0 — иначе первая итерация (t=1с)
+                                    # сразу триггерит position-check до того как
+                                    # Gate API увидит свежую позицию (race).
+    zero_reads = 0                  # FIX: 2 подряд нуля прежде чем выйти.
 
     print(
         f"{_tag('GATE TRAIL', MAGENTA)} {BOLD}{ticker}{RESET} | "
@@ -425,12 +605,19 @@ def _run_trailing_stop(ticker: str, entry_price: float, contracts: int, trail_pc
             print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | таймаут {_TRAILING_MAX_LIFETIME}с, выход")
             return
 
-        # FIX: каждую минуту проверяем что позиция ещё жива (биржа могла закрыть по SL)
-        if time.monotonic() - last_check > 60:
+        # FIX 2026-06-06: grace 15с (position-API Gate отстаёт 2-5с после IOC) +
+        # 2 подряд нулевых чтения. Без этого первая же проверка читала 0 (позиция
+        # ещё не осела в API) → трейлинг умирал сразу после открытия.
+        if (time.monotonic() - started > 15
+                and time.monotonic() - last_check > 60):
             last_check = time.monotonic()
             if _gate_position_size(contract) == 0:
-                print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | позиция уже закрыта, выход")
-                return
+                zero_reads += 1
+                if zero_reads >= 2:
+                    print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | позиция закрыта (2 чтения), выход")
+                    return
+            else:
+                zero_reads = 0
 
         price = gate_get_price(ticker)
         if not price:
@@ -438,11 +625,8 @@ def _run_trailing_stop(ticker: str, entry_price: float, contracts: int, trail_pc
 
         if price > max_price:
             max_price = price
-            print(
-                f"{_tag('GATE TRAIL', MAGENTA)} {ticker} | "
-                f"новый макс={max_price:.6f} | "
-                f"стоп будет на {max_price * (1 - trail_pct):.6f}"
-            )
+            # FIX-LOG: 'new max=' print убран — забивал логи на каждом тике
+            # роста цены. Старт trailing и выход уже логируются.
 
         stop_price = max_price * (1 - trail_pct)
 
@@ -478,25 +662,97 @@ def gate_start_trailing(ticker: str, entry_price: float, contracts: int, trail_p
     ).start()
 
 
+def _run_trailing_stop_short(ticker: str, entry_price: float, contracts: int,
+                             trail_pct: float = 0.005) -> None:
+    """
+    Фоновый trailing stop для ШОРТ позиции (зеркало _run_trailing_stop).
+    Отслеживает МИНИМУМ цены (профит шорта при падении); закрывает позицию
+    покупкой если цена откатила вверх на trail_pct от достигнутого минимума.
+    """
+    contract  = f"{ticker}_USDT"
+    min_price = entry_price
+    started   = time.monotonic()
+    last_check = time.monotonic()   # FIX: см. _run_trailing_stop — не 0.0.
+    zero_reads = 0
+
+    print(
+        f"{_tag('GATE TRAIL', MAGENTA)} {BOLD}{ticker}{RESET} | "
+        f"старт SHORT trailing {trail_pct*100:.1f}% | "
+        f"contracts={contracts} | entry={entry_price:.6f}"
+    )
+
+    while True:
+        time.sleep(1)
+        if time.monotonic() - started > _TRAILING_MAX_LIFETIME:
+            print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | таймаут {_TRAILING_MAX_LIFETIME}с, выход")
+            return
+        # FIX 2026-06-06: grace 15с + 2 подряд нуля (Gate position-API лаг).
+        if (time.monotonic() - started > 15
+                and time.monotonic() - last_check > 60):
+            last_check = time.monotonic()
+            if _gate_position_size(contract) == 0:
+                zero_reads += 1
+                if zero_reads >= 2:
+                    print(f"{_tag('GATE TRAIL', YELLOW)} {ticker} | позиция закрыта (2 чтения), выход")
+                    return
+            else:
+                zero_reads = 0
+        price = gate_get_price(ticker)
+        if not price:
+            continue
+        if price < min_price:
+            min_price = price
+        stop_price = min_price * (1 + trail_pct)
+        if price >= stop_price:
+            print(
+                f"{_tag('GATE TRAIL HIT', RED)} {BOLD}{ticker}{RESET} | "
+                f"цена={price:.6f} ≥ стоп={stop_price:.6f} | мин был={min_price:.6f}"
+            )
+            try:
+                # Закрытие шорта = покупка (положительный size).
+                _post_signed(f"/api/v4/futures/{_SETTLE}/orders", {
+                    "contract":    contract,
+                    "size":        int(abs(contracts)),
+                    "price":       "0",
+                    "tif":         "ioc",
+                    "reduce_only": True,
+                })
+                print(
+                    f"{_tag('GATE TRAIL CLOSED', GREEN)} {BOLD}{ticker}{RESET} | "
+                    f"{contracts} контрактов закрыто по ~{price:.6f}"
+                )
+            except Exception as e:
+                print(f"{_tag('GATE TRAIL ERR', RED)} {ticker}: {e}")
+            return
+
+
+def gate_start_trailing_short(ticker: str, entry_price: float, contracts: int,
+                              trail_pct: float = 0.005) -> None:
+    """Запускает SHORT trailing stop в daemon-потоке."""
+    threading.Thread(
+        target=_run_trailing_stop_short,
+        args=(ticker, entry_price, int(contracts), trail_pct),
+        daemon=True,
+        name=f"trail-short-{ticker}",
+    ).start()
+
+
 # ── TP/SL для лонга на Gate.io ────────────────────────────────────
 
-def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
+def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float,
+                        sl_pct: float = 0.01, trail_pct: float = 0.01) -> str:
     """
-    Выставляет:
-      - SL  -8%   на 100% позиции (через price_order)
-      - TP1 +5.5% на 30%  позиции (через price_order)
-      - Trailing 6% на оставшиеся 70% (через поллинг-поток)
+    SL -sl_pct + trailing trail_pct на всю позицию (синхрон с Bybit listing_api).
+    Дефолт 1%/1% (обычный листинг); Robinhood зовёт с 0.5%/0.75%.
+      - SL  на 100% позиции (price_order reduce-only)
+      - Trailing на 100% позиции (через поллинг-поток _run_trailing_stop)
     """
     contract = f"{ticker}_USDT"
+    sl = round(entry_price * (1.0 - sl_pct), 8)
+    sl_contracts = int(amount)
 
-    sl  = round(entry_price * 0.92, 8)   # -8%
-    tp1 = round(entry_price * 1.055, 8)  # +5.5%
-
-    sl_contracts  = int(amount)
-    tp1_contracts = max(1, int(amount * 0.30))
-    tail_contracts = max(0, sl_contracts - tp1_contracts)
-
-    def _place_price_order(trigger: float, order_price: float, size: int, label: str) -> None:
+    def _place_price_order(trigger: float, order_price: float, size: int, label: str) -> str:
+        """Возвращает 'ok' / 'fail' / 'closed' (закрыто по рынку — цена за стопом)."""
         try:
             price_str   = _gate_round_price(ticker, order_price)
             trigger_str = _gate_round_price(ticker, trigger)
@@ -522,7 +778,18 @@ def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
                 f"{_tag('GATE ORDER', color)} {ticker} | "
                 f"{label} → trigger={trigger_str} | size={size} контрактов"
             )
+            return "ok"
         except Exception as e:
+            # FIX 2026-06-09: цена УЖЕ за SL (медленный листинг съел время) →
+            # триггер reject'нут. Стоп уже должен был сработать → закрываем по
+            # рынку немедленно, иначе защиты -1% нет (раньше молча падали на
+            # трейлинг → закрытие на гэпе по -4%).
+            if order_price < entry_price and _is_trigger_passed_error(e):
+                print(f"{_tag('GATE SL PASSED', RED)} {ticker}: цена уже ниже SL "
+                      f"-1% → market-close")
+                # Закрыли по рынку → 'closed' (трейлинг не нужен). Если закрытие
+                # упало — НЕ глушим: возвращаем 'fail', чтобы трейлинг стал бэкстопом.
+                return "closed" if _gate_market_close(ticker, size, is_long=True) else "fail"
             if hasattr(e, "response") and getattr(e, "response", None) is not None:
                 resp = e.response
                 print(
@@ -531,17 +798,20 @@ def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
                 )
             else:
                 print(f"{_tag('GATE TP/SL ERR', RED)} {ticker} [{label}]: {e}")
+            return "fail"
 
-    _place_price_order(sl, sl, sl_contracts, "SL -8%")
-    _place_price_order(tp1, tp1, tp1_contracts, "TP1 +5.5%")
+    _sl_lbl = f"SL -{sl_pct * 100:.2f}%"
+    if _place_price_order(sl, sl, sl_contracts, _sl_lbl) == "closed":
+        return "Gate: цена уже за SL — закрыто по рынку"
 
-    if tail_contracts > 0:
-        gate_start_trailing(ticker, entry_price, tail_contracts, trail_pct=0.06)
+    # Trailing на всю позицию (поллинг-поток).
+    if sl_contracts > 0:
+        gate_start_trailing(ticker, entry_price, sl_contracts, trail_pct=trail_pct)
 
     print(
         f"{_tag('GATE TP/SL SET', CYAN)} {BOLD}{ticker}{RESET} | "
-        f"SL={sl}(-8%/100%) | TP1={tp1}(+5.5%/30%) | "
-        f"Trailing=6%(70%/{tail_contracts}контр)"
+        f"SL={sl}(-{sl_pct * 100:.2f}%/100%) | "
+        f"Trailing={trail_pct * 100:.2f}%(100%/{sl_contracts}контр)"
     )
     return "Gate TP/SL выставлен"
 
@@ -550,33 +820,23 @@ def gate_set_tp_sl_long(ticker: str, entry_price: float, amount: float) -> str:
 
 def gate_set_tp_sl_short(ticker: str, entry_price: float, amount: float) -> str:
     """
-    Выставляет для шорт-позиции на Gate.io:
-      - SL  +5%   на 100% позиции
-      - TP1 -8%   на 20%  позиции
-      - TP2 -15%  на 30%  позиции
-      - TP3 -45%  на 50%  позиции
-    Для шорта: TP ниже цены входа, SL выше.
+    FIX 2026-06-04: новая стратегия делиста — SL +1% + trailing 0.5% на всю
+    позицию (синхрон с Bybit delist_api). Фиксированные TP убраны.
+      - SL +1% на 100% позиции (price_order reduce-only, закрытие = покупка)
+      - Trailing 0.5% на 100% (поллинг-поток _run_trailing_stop_short)
+    Для шорта: SL выше входа, профит когда цена падает.
     """
     contract = f"{ticker}_USDT"
+    sl = round(entry_price * 1.01, 8)   # +1% — стоп выше входа
+    sl_contracts = int(amount)
 
-    sl  = round(entry_price * 1.05, 8)   # +5%  — стоп выше входа
-    tp1 = round(entry_price * 0.92, 8)   # -8%
-    tp2 = round(entry_price * 0.85, 8)   # -15%
-    tp3 = round(entry_price * 0.55, 8)   # -45%
-
-    tp1_contracts = max(1, int(amount * 0.20))
-    tp2_contracts = max(1, int(amount * 0.30))
-    tp3_contracts = max(1, int(amount * 0.50))
-    sl_contracts  = int(amount)
-
-    def _place(trigger: float, order_price: float, size: int, label: str) -> None:
+    def _place(trigger: float, order_price: float, size: int, label: str) -> str:
+        """Возвращает 'ok' / 'fail' / 'closed' (закрыто по рынку — цена за стопом)."""
         try:
             price_str   = _gate_round_price(ticker, order_price)
             trigger_str = _gate_round_price(ticker, trigger)
-            # Для шорта: закрытие = покупка (положительный size).
-            # rule 1 = цена >= триггер (SL для шорта),
-            # rule 2 = цена <= триггер (TP для шорта).
-            rule = 1 if order_price >= entry_price else 2
+            # Для шорта закрытие = покупка (положительный size).
+            # rule 1 = цена >= триггер (SL для шорта).
             _post_signed(f"/api/v4/futures/{_SETTLE}/price_orders", {
                 "initial": {
                     "contract":    contract,
@@ -589,34 +849,115 @@ def gate_set_tp_sl_short(ticker: str, entry_price: float, amount: float) -> str:
                     "strategy_type": 0,
                     "price_type":    0,
                     "price":         trigger_str,
-                    "rule":          rule,
+                    "rule":          1,
                 },
             })
-            color = RED if order_price >= entry_price else GREEN
             print(
-                f"{_tag('GATE ORDER', color)} {ticker} | "
+                f"{_tag('GATE ORDER', RED)} {ticker} | "
                 f"{label} → trigger={trigger_str} | size={size} контрактов"
             )
+            return "ok"
         except Exception as e:
+            # FIX 2026-06-09: цена УЖЕ выше SL шорта → триггер reject'нут →
+            # закрываем (выкупаем) по рынку немедленно, иначе защиты +1% нет.
+            if order_price > entry_price and _is_trigger_passed_error(e):
+                print(f"{_tag('GATE SL PASSED', RED)} {ticker}: цена уже выше SL "
+                      f"+1% → market-close")
+                return "closed" if _gate_market_close(ticker, size, is_long=False) else "fail"
             print(f"{_tag('GATE TP/SL ERR', RED)} {ticker} [{label}]: {e}")
+            return "fail"
 
-    _place(sl,  sl,  sl_contracts,  "SL  +5%")
-    _place(tp1, tp1, tp1_contracts, "TP1 -8%")
-    _place(tp2, tp2, tp2_contracts, "TP2 -15%")
-    _place(tp3, tp3, tp3_contracts, "TP3 -45%")
+    if _place(sl, sl, sl_contracts, "SL +1%") == "closed":
+        return "Gate: цена уже за SL — закрыто по рынку"
+
+    if sl_contracts > 0:
+        gate_start_trailing_short(ticker, entry_price, sl_contracts, trail_pct=0.005)
 
     print(
         f"{_tag('GATE TP/SL SHORT', CYAN)} {BOLD}{ticker}{RESET} | "
-        f"SL={sl}(+5%) | TP1={tp1}(-8%/20%) | "
-        f"TP2={tp2}(-15%/30%) | TP3={tp3}(-45%/50%)"
+        f"SL={sl}(+1%/100%) | Trailing=0.5%(100%/{sl_contracts}контр)"
     )
     return "Gate TP/SL SHORT выставлен"
 
 
 def warmup_gate_connection() -> None:
-    """Прогревает HTTP соединение с Gate.io заранее."""
+    """Прогревает HTTP + WS соединения с Gate.io заранее."""
     try:
         _get(f"/api/v4/futures/{_SETTLE}/tickers", {"limit": 1})
-        print(f"{_tag('GATE WARMUP', CYAN)} соединение прогрето")
+        print(f"{_tag('GATE WARMUP', CYAN)} REST соединение прогрето")
     except Exception as e:
         print(f"{_tag('GATE WARMUP ERR', RED)} {e}")
+    # FIX 2026-06-06: прогрев WS соединения — убирает холодный TCP+TLS
+    # (~300-500мс) с первого ордера.
+    try:
+        warmup_gate_ws(timeout=10.0)
+    except Exception as e:
+        print(f"[GATE WS WARMUP ERR] {e}")
+
+
+# ── Pre-set leverage sweep ────────────────────────────────────────
+# FIX-LATENCY: на cold ticker'е _gate_set_leverage делает HTTP POST
+# (100-200мс), который сидит в hot-path market_open_long → gate_open_long.
+# Кэш _leverage_set_for помогает только со 2-го листинга по той же
+# монете — а у нас каждый листинг это свежий тикер. Решение: фоновый
+# sweep, который проходит по gate_known_coins и пред-устанавливает
+# leverage для каждой. К моменту fresh-листинга кэш уже тёплый,
+# market_open_long пропускает 150мс.
+def gate_leverage_presetter(
+    throttle_ms: int = 50,
+    sweep_interval_sec: int = 3600,
+    init_wait_sec: float = 30.0,
+) -> None:
+    """
+    Фоновый sweep — для каждой монеты из gate_known_coins вызываем
+    _gate_set_leverage(coin_USDT, _LEVERAGE, cross=True).
+
+    Throttle 50мс/coin × ~300 контрактов ≈ 15с на полный sweep.
+    Sweep interval 1ч — Gate.io редко добавляет новые контракты.
+    На уже-кэшированных _gate_set_leverage отдаёт за ~1мкс (dict lookup),
+    поэтому повторные sweep'ы практически бесплатные по сети.
+
+    Ждём на старте, пока gate_price_updater наполнит gate_known_coins
+    (первый цикл = 3с). Если за init_wait_sec пусто — отменяем.
+    """
+    waited = 0.0
+    while not gate_known_coins and waited < init_wait_sec:
+        time.sleep(1.0)
+        waited += 1.0
+    if not gate_known_coins:
+        print(
+            f"{_tag('GATE PRESET', YELLOW)} gate_known_coins пуст после "
+            f"{waited:.0f}с — sweep отменён"
+        )
+        return
+
+    throttle = throttle_ms / 1000.0
+    sweep_no = 0
+    while True:
+        sweep_no += 1
+        snapshot = sorted(gate_known_coins)  # детерминированный порядок для логов
+        t0 = time.monotonic()
+        with _leverage_lock:
+            before = len(_leverage_set_for)
+        errors = 0
+        for i, coin in enumerate(snapshot, 1):
+            contract = f"{coin}_USDT"
+            try:
+                _gate_set_leverage(contract, _LEVERAGE, cross=True)
+            except Exception:  # noqa: BLE001
+                errors += 1
+            # throttle и для cached, и для cold — не вредно: фоновая нагрузка.
+            time.sleep(throttle)
+            # FIX-LOG: промежуточный print каждые 50 убран — забивал stdout.
+            # Прогресс смотреть в итоговом sweep#N ✓ сообщении внизу.
+        elapsed = time.monotonic() - t0
+        with _leverage_lock:
+            after = len(_leverage_set_for)
+        new_count = after - before
+        print(
+            f"{_tag('GATE PRESET', GREEN)} sweep#{sweep_no} ✓ "
+            f"{len(snapshot)} контрактов за {elapsed:.1f}с | "
+            f"новых в кэше={new_count} err={errors} | "
+            f"следующий через {sweep_interval_sec}с"
+        )
+        time.sleep(sweep_interval_sec)
