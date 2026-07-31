@@ -218,6 +218,20 @@ class BybitWsTrade:
                         # неудачная auth получала минимальный delay → hot-loop.
                         # Теперь явно поднимаем backoff здесь.
                         print(f"[BYBIT-WS] auth failed: {auth_resp} — reconnect через {delay:.0f}с", flush=True)
+                        # FIX 2026-07-08: истёкший/невалидный ключ — громкий
+                        # TG-алерт (раз в час), иначе тонет в stdout и вся
+                        # Bybit-торговля молча умирает (NEO-инцидент).
+                        try:
+                            from tg.tg_logger import tg_alert_throttled
+                            tg_alert_throttled(
+                                "bybit-auth-fail",
+                                f"🚨 <b>BYBIT AUTH FAIL</b>\n"
+                                f"retCode={ret_code} "
+                                f"msg={auth_resp.get('retMsg', '?')}\n"
+                                f"Проверь/обнови API-ключ — ордера НЕ открываются!",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                         self._ws = None
                         await asyncio.sleep(delay)
                         delay = min(delay * 2, _RECONNECT_DELAY_MAX)
@@ -666,6 +680,25 @@ def place_order_ws_fast(args: dict, _warmup_mode: bool = False) -> dict | None:
         inst.warmup(timeout=0.5)
         return {"sent": True, "reqId": "warmup-mode"}
     return inst.place_order_fast(args)
+
+
+def place_batch_orders_ws_ack(args_list: list[dict],
+                              timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
+    """
+    FIX 2026-06-19 (R2): batch ack-waiting. N ордеров → 1 WS-фрейм через
+    op:order.create-batch. Маршрутизация ТОЛЬКО через sync (async-клиент
+    батч не поддерживает; если sync не подключён — caller fallback к
+    per-order REST).
+
+    Возврат:
+      dict — ack от Bybit. result.list / retExtInfo.list содержат per-order
+             retCode/retMsg. Caller сам парсит.
+      None — sync не подключён / таймаут → caller fallback per-order.
+    """
+    sync = _sync_preferred
+    if sync is None or not sync.is_ready():
+        return None
+    return sync.place_batch_orders(args_list, timeout=timeout)
 
 
 def place_order_ws_ack(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:

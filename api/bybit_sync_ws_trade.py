@@ -201,6 +201,18 @@ class BybitSyncWsTrade:
                 auth_resp = _json_loads(auth_resp_raw)
                 if auth_resp.get("retCode") != 0:
                     print(f"[BYBIT-SYNC-WS] auth failed: {auth_resp} — reconnect через {delay:.0f}с", flush=True)
+                    # FIX 2026-07-08: TG-алерт (раз в час) на мёртвый ключ.
+                    try:
+                        from tg.tg_logger import tg_alert_throttled
+                        tg_alert_throttled(
+                            "bybit-auth-fail",
+                            f"🚨 <b>BYBIT AUTH FAIL</b>\n"
+                            f"retCode={auth_resp.get('retCode')} "
+                            f"msg={auth_resp.get('retMsg', '?')}\n"
+                            f"Проверь/обнови API-ключ — ордера НЕ открываются!",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     try:
                         ws.close()
                     except Exception:
@@ -356,6 +368,66 @@ class BybitSyncWsTrade:
             # FIX: return внутри _ws_lock блока, чтобы ws не закрылся между send и return
             return {"sent": True, "reqId": req_id}
 
+    def place_batch_orders(self, args_list: list[dict],
+                           timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
+        """
+        Batch ack-waiting вариант. Шлёт N ордеров в ОДНОМ WS-фрейме через
+        op:order.create-batch. Bybit V5 linear допускает до 10 ордеров.
+
+        Зачем: при мульти-листинге (2-5 монет одновременно) каждый отдельный
+        place_order проходит через _send_lock последовательно, добавляя
+        ~50-200μs ws.send на каждую. Batch — один send_lock acquire,
+        одна сетевая RTT, ack на всё разом. Экономия 100-800μs на burst.
+
+        Возврат: ack-dict от Bybit (с retExtInfo.list per-order), или None
+        при таймауте / transport-ошибке. На per-order reject caller сам
+        смотрит retExtInfo.list[i].code.
+        """
+        if not args_list:
+            return None
+        if not self._connected.is_set():
+            return None
+        ws = self._ws
+        if ws is None:
+            return None
+
+        req_id = str(uuid.uuid4())
+        ts_ms = str(int(time.time() * 1000))
+        payload = {
+            "reqId": req_id,
+            "op":    "order.create-batch",
+            "header": {
+                "X-BAPI-TIMESTAMP":   ts_ms,
+                "X-BAPI-RECV-WINDOW": "5000",
+                "Referer":            "Parsers",
+            },
+            "args": args_list,
+        }
+        payload_str = _json_dumps(payload)
+
+        ev = threading.Event()
+        with self._pending_lock:
+            self._pending[req_id] = ev
+
+        try:
+            with self._send_lock:
+                ws.send(payload_str)
+        except Exception as e:
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+                self._pending_results.pop(req_id, None)
+            print(f"[BYBIT-SYNC-WS] place_batch send failed: {type(e).__name__}: {e}", flush=True)
+            return None
+
+        if not ev.wait(timeout):
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+                self._pending_results.pop(req_id, None)
+            return None
+
+        with self._pending_lock:
+            return self._pending_results.pop(req_id, None)
+
     def place_order(self, args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
         """
         Ack-waiting вариант. Регистрирует pending ПЕРЕД send (чтобы
@@ -508,6 +580,15 @@ def place_order_sync(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | 
     if inst is None:
         return None
     return inst.place_order(args, timeout=timeout)
+
+
+def place_batch_orders_sync(args_list: list[dict],
+                            timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
+    """Sync batch ack-waiting — N ордеров в одном WS-фрейме."""
+    inst = _global_instance
+    if inst is None:
+        return None
+    return inst.place_batch_orders(args_list, timeout=timeout)
 
 
 # ── периодический прогрев ────────────────────────────────────────

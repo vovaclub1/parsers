@@ -121,14 +121,20 @@ from api.delist_api import (
     calculate_margin_for_delist,
     price_updater,
     get_price,
-    set_tp_sl,
-    market_open_short,
     warmup_bybit_connection,
     start_bybit_heartbeat,
     preload_lot_steps,
     gate_price_updater,
     gate_preload_lot_steps,
     warmup_gate_connection,
+)
+# FIX 2026-07-07 (INVERT): по решению — на ДЕЛИСТАХ открываем ЛОНГ
+# (контр-тренд на отскок после дампа), на листингах — шорт. Лонг-механика
+# (Bybit+Gate fallback, bundled SL, трейлинг LISTING_*) переиспользуется
+# из listing_api.
+from api.listing_api import (
+    market_open_long,
+    set_tp_sl_long,
 )
 from tg.tg_logger import tg_log
 
@@ -227,16 +233,12 @@ TG_DELIST_NEG = [
     "alpha removal",
     "from alpha",
     "delisting postponed",  # отменили
-    # FIX: "Notice of Removal of Margin Trading Pairs" ≠ делистинг токена.
-    # Снимаются только margin-пары; на spot/perp монета остаётся, шорт
-    # открывать нельзя (получаем ложный сигнал на случайный тикер из
-    # текста, см. инцидент с FOLLOWING/AT 2026-05-25).
-    "margin trading pairs",
-    "margin trading pair",
-    "removal of margin",
-    "margin pairs",
-    "isolated margin",
-    "cross margin",
+    # FIX 2026-06-19: margin-делисты ТЕПЕРЬ отрабатываем (шортим перп базовой монеты).
+    # Раньше блокировались строками "margin trading pairs"/"cross margin"/... как ложные.
+    # Но монеты реально торгуются перпами (CVC/RPL/RVN/XAI), а защита от ложных тикеров
+    # (AT/FOLLOWING + квоуты BTC/ETH/BNB) теперь в EXCLUDED_TOKENS + фильтре по торгуемым
+    # (Bybit∪Gate). Поэтому margin-строки УБРАНЫ из NEG. Spot-пар-removal по-прежнему
+    # не проходит (нет positive-keyword "will delist"/"remove from spot").
     # Аналогичные «не-делисты»: leveraged token shutdowns, copy-trading
     # ограничения и т.п. — это не уход монеты с биржи.
     "leveraged tokens",
@@ -315,8 +317,13 @@ _fired_coins:  set[str] = set()
 _fired_expiry: dict[str, float] = {}
 _FIRED_TTL     = 60   # L1: секунд до снятия блокировки монеты
 
-# L2: постоянное хранилище отстрелянных монет (любой источник).
-_global_fired: set[str] = set()
+# L2: хранилище отстрелянных монет (любой источник).
+# FIX 2026-07-07 (MORPHO-инцидент, зеркально с listing): вечный global-блок
+# гасит и НОВЫЕ события по той же монете (делист на другой бирже месяц
+# спустя). Теперь dict{coin: fired_ts} с TTL (деф. 72ч,
+# env DELIST_GLOBAL_FIRED_TTL_H) — блок живёт на волну одной новости.
+_GLOBAL_FIRED_TTL = float(os.getenv("DELIST_GLOBAL_FIRED_TTL_H", "72")) * 3600.0
+_global_fired: dict[str, float] = {}    # coin → fired_ts (time.time())
 _FIRED_FILE = Path(STATE_DIR) / "delist_fired.json"
 
 # FIX-PERF: dirty-flag для фонового L2-writer'а — вместо thread.start() на
@@ -576,9 +583,20 @@ def _load_fired_state() -> None:
             return
         gf = data.get("global", [])
         with _fired_lock:
-            if isinstance(gf, list):
-                _global_fired.update(str(c) for c in gf if isinstance(c, str))
-        log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)}")
+            # FIX 2026-07-07: новый формат dict {coin: fired_ts}; легаси-список
+            # получает mtime файла (консервативно — истечёт максимум через TTL).
+            if isinstance(gf, dict):
+                for c, ts in gf.items():
+                    try:
+                        _global_fired[str(c)] = float(ts)
+                    except (TypeError, ValueError):
+                        continue
+            elif isinstance(gf, list):
+                legacy_ts = _FIRED_FILE.stat().st_mtime
+                for c in gf:
+                    if isinstance(c, str):
+                        _global_fired[c] = legacy_ts
+        log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)} (TTL {_GLOBAL_FIRED_TTL/3600:.0f}ч)")
     except Exception as e:  # noqa: BLE001
         log_warn("DEDUP", f"L2 load failed: {e!r} — стартуем с пустого")
 
@@ -587,7 +605,8 @@ def _persist_fired_state() -> None:
     """Атомарный сейв L2 (write+rename). Вызывается фоновым writer'ом."""
     try:
         with _fired_lock:
-            snapshot = {"global": sorted(_global_fired)}
+            # FIX 2026-07-07: global — dict {coin: fired_ts} (TTL-семантика).
+            snapshot = {"global": dict(sorted(_global_fired.items()))}
         # FIX: используем уже импортированный _json_dumps вместо дубликата
         payload = _json_dumps(snapshot, indent=True)
         _FIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -764,18 +783,7 @@ def _hstat(method: str, *args) -> None:
             pass
 
 
-def _health_report_loop() -> None:
-    """Каждые 6 часов шлёт health-отчёт делиста в TG и stdout (тик через 1ч)."""
-    time.sleep(3600)
-    while True:
-        try:
-            if _health is not None:
-                report = _health.build_report()
-                print(report.replace("<b>", "").replace("</b>", ""), flush=True)
-                tg_log("🔴 <b>DELIST</b>\n" + report)
-        except Exception as e:  # noqa: BLE001
-            log_warn("HEALTH", f"report failed: {e!r}")
-        time.sleep(6 * 3600)
+# FIX 2026-06-18: _health_report_loop удалён — TG-отчёт каждые 6ч отключён.
 
 # Первый источник, заявивший монету (для метрики отставания). coin -> (src, t).
 _first_claim_ts: dict[str, tuple[str, float]] = {}
@@ -840,9 +848,15 @@ def _try_claim(coin: str, source: str = "") -> bool:
     для метрики отставания (_measure_lag).
     """
     with _fired_lock:
-        # L2: уже шортили эту монету (навсегда) → skip.
-        if coin in _global_fired:
-            return False
+        # L2: уже торговали эту монету в окне TTL → skip. Просроченные записи
+        # лениво чистим (FIX 2026-07-07: вечный блок гасил новые события
+        # по той же монете — MORPHO-инцидент на listing-стороне).
+        ts = _global_fired.get(coin)
+        if ts is not None:
+            if (time.time() - ts) < _GLOBAL_FIRED_TTL:
+                return False
+            _global_fired.pop(coin, None)
+            _fired_dirty.set()
         # L1: монета сейчас обрабатывается (TTL) → skip.
         if coin in _fired_coins:
             return False
@@ -858,13 +872,13 @@ def _mark_opened(coin: str) -> None:
     Worker зовёт после успешного open. Обновляет L2 (in-memory) и поднимает
     dirty-flag — фоновый writer (_fired_persist_loop) сохранит на диск.
 
-    FIX-PERF: НЕ спавним поток здесь — это hot-path worker'а. Только set.add
+    FIX-PERF: НЕ спавним поток здесь — это hot-path worker'а. Только dict-set
     (~1мкс) + Event.set (~1мкс).
     """
     dirty = False
     with _fired_lock:
         if coin not in _global_fired:
-            _global_fired.add(coin)
+            _global_fired[coin] = time.time()
             dirty = True
     if dirty:
         _fired_dirty.set()
@@ -945,20 +959,27 @@ def is_delist_article(title: str) -> bool:
 
 def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", retries: int = 3) -> None:
     """
-    Воркер — открывает шорт, логирует время, ставит TP/SL в фоне.
+    Воркер — FIX 2026-07-07 (INVERT): на делисте открываем ЛОНГ (отскок после
+    дампа), логирует время, ставит TP/SL в фоне через listing-механику.
     """
     last_fail = "failed"
     for attempt in range(1, retries + 1):
         try:
             # FIX-PERF: "Старт"-print только на retry'ях — на attempt 1
-            # форматированный print → stdout = ~1-3мс перед market_open_short
+            # форматированный print → stdout = ~1-3мс перед market_open_long
             # в hot-path. Открытие позиции важнее, чем factual лог.
             if attempt > 1:
                 log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
-            amount, entry_price = market_open_short(coin, margin)
+            amount, entry_price = market_open_long(coin, margin)
+            # sentinel (-1, 0) = биржевой REJECT (30228 + пустой Gate и т.д.).
+            # Ретрай не починит — fail-fast.
+            if amount == -1:
+                log_warn("WORKER", f"{coin}: биржи отвергли ордер — fail-fast")
+                last_fail = "rejected"
+                break
             if not amount:
                 # FIX: проверяем что это не последняя попытка, иначе зависнем
-                # в бесконечном цикле если market_open_short всегда возвращает 0.
+                # в бесконечном цикле если market_open_long всегда возвращает 0.
                 last_fail = "no_price"
                 if attempt < retries:
                     log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
@@ -969,9 +990,8 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
                     break
 
             # FIX-PERF: TP/SL submit ДО метрики (~5-20μs, не сдвинет open_ms).
-            # Один print вместо двух — экономия ~4мс на intermediate stdout flush.
-            # См. parser_listing.py для деталей.
-            _tp_sl_executor.submit(set_tp_sl, coin, entry_price, amount)
+            # ЛОНГ-механика: set_tp_sl_long (роутер bybit/gate из listing_api).
+            _tp_sl_executor.submit(set_tp_sl_long, coin, entry_price, amount)
 
             open_ms = (time.perf_counter() - t_start) * 1000
             log_ok("OPEN", (
@@ -980,15 +1000,16 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             ))
             # Health: латентность сигнал→ордер по источнику.
             _hstat("latency", f"{source}→order", open_ms)
-            # Биржа исполнения шорта (bybit/gate) для venue/PnL.
+            # Биржа исполнения лонга (bybit/gate) для venue/PnL —
+            # ЛОНГ пишется в listing_api._last_exchange.
             try:
-                from api.delist_api import _delist_exchange as _dx
+                from api.listing_api import _last_exchange as _dx
                 venue = _dx.get(coin, "bybit")
             except Exception:  # noqa: BLE001
                 venue = "?"
             # FIX-PERF: tg_log fire-and-forget (см. tg/tg_logger.py).
             tg_log(
-                f"🔴 <b>DELIST SHORT</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
+                f"🟢 <b>DELIST LONG</b> {coin}\nEntry: {entry_price}\nAmount: {amount:.4f}\nВремя: {open_ms:.0f}мс")
 
             # FIX-PERF: bookkeeping L2 ПОСЛЕ метрики и tg_log — не влияет
             # на «время от сигнала до ордера». _mark_opened только set.add +
@@ -998,8 +1019,8 @@ def worker(coin: str, margin: float, t_start: float, source: str = "BINANCE", re
             _sig_open(coin, source, venue, "opened",
                       open_ms=open_ms, entry=entry_price, amount=amount)
             _register_pnl(coin, source, venue)
-            # Бэктест: пишем пост-входную траекторию цены (шорт).
-            _record_path(coin, "short", source, venue, entry_price)
+            # Бэктест: пишем пост-входную траекторию цены (ЛОНГ — инверт).
+            _record_path(coin, "long", source, venue, entry_price)
             return
         except Exception as e:
             err_str = str(e)
@@ -1092,7 +1113,7 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None) 
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("DELIST", f"[{source}] Новый делистинг!")
     log_info("DELIST", f"Монеты : {new_pairs}")
-    log_info("TRADE",  f"Маржа={margin} USDT | открываем {len(new_pairs)} шорт(ов)...")
+    log_info("TRADE",  f"Маржа={margin} USDT | открываем {len(new_pairs)} лонг(ов) [INVERT]...")
     print(f"{BOLD}{'═' * 60}{RESET}\n")
 
 
@@ -1778,6 +1799,19 @@ if __name__ == "__main__":
                 log_warn("PARSER", "Bybit ASYNC WS не подключился за 3с — fallback на REST до коннекта")
         except Exception as e:
             log_err("PARSER", f"Bybit ASYNC WS init упал: {e!r} — будет REST")
+
+        # FIX 2026-06-19 (R3): private WS (order+position). Без wallet.
+        from config.config import BYBIT_WS_PRIVATE_ENABLED
+        if BYBIT_WS_PRIVATE_ENABLED:
+            try:
+                from api import bybit_ws_private as _priv_mod
+                priv_inst = _priv_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                if priv_inst.is_ready(wait_sec=5.0):
+                    log_ok("PARSER", "Bybit PRIVATE WS (order+position) готов ✓")
+                else:
+                    log_warn("PARSER", "Bybit PRIVATE WS не подключился за 5с — fallback на REST poll")
+            except Exception as e:
+                log_warn("PARSER", f"Bybit PRIVATE WS init упал: {e!r} — fallback на REST poll")
     else:
         log_info("PARSER", "Bybit WS Trade отключён (BYBIT_WS_TRADE_ENABLED=0 или нет ключей) — используем REST")
 
@@ -1799,12 +1833,14 @@ if __name__ == "__main__":
     log_ok("PARSER", "_signal_executor + _tp_sl_executor pre-warmed (40+40)")
 
     try:
-        from api.delist_api import warmup_chain as _del_warmup_chain
+        # FIX 2026-07-07 (INVERT): делист открывает ЛОНГ → греем long-путь
+        # (listing_api.warmup_chain), а не шортовый.
+        from api.listing_api import warmup_chain as _long_warmup_chain
         sample_signal = "Binance Will Delist BTC"
         for _ in range(30):
             find_pairs(sample_signal)
-        ok = _del_warmup_chain(n=30)
-        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_short path×{ok}/30 ✓")
+        ok = _long_warmup_chain(n=30)
+        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_long path×{ok}/30 ✓")
     except Exception as e:  # noqa: BLE001
         log_warn("PARSER", f"Chain warmup упал: {e!r} — первый делистинг будет медленнее")
 
@@ -1860,16 +1896,15 @@ if __name__ == "__main__":
         ).start()
         log_ok("STATS", "closed-PnL поллер Gate активен (PnL в статистику)")
 
-    # Health-stats: персистентность + TG-отчёт «слабые места» каждые 6ч.
+    # Health-stats: только персистентность метрик. FIX 2026-06-18: TG-отчёт
+    # «слабые места» каждые 6ч отключён по запросу — спамил без пользы.
+    # Сбор _hstat и persist_loop остались (метрики копятся на диск).
     if _health is not None:
         threading.Thread(
             target=_health.persist_loop, kwargs={"batch_sec": 30.0},
             daemon=True, name="health-persist",
         ).start()
-        threading.Thread(
-            target=_health_report_loop, daemon=True, name="health-report",
-        ).start()
-        log_ok("HEALTH", "диагностика делиста активна (TG-отчёт каждые 6ч)")
+        log_ok("HEALTH", "сбор диагностики делиста активен (TG-отчёт отключён)")
 
     # Price-recorder: захват «головы» входа (первые 10 мин) для бэктеста выходов.
     if _recorder is not None:

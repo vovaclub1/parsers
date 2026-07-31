@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import html
+import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -34,6 +37,16 @@ except (TypeError, ValueError):
 _ALLOWED_TAGS = ("<b>", "</b>", "<i>", "</i>", "<code>", "</code>", "<pre>", "</pre>")
 _TAG_PLACEHOLDERS = [(t, f"\x00{i}\x00") for i, t in enumerate(_ALLOWED_TAGS)]
 
+# FIX 2026-06-24: <a href="...">...</a> поддержка для тапаемых имён стратегий
+# в карточке 6ч-итогов (см. tg/strategy_eval.py:_strat_label). Раньше тег <a>
+# не был в whitelist'е — html.escape экранировал его в &lt;a href=...&gt;,
+# Telegram показывал ссылку как plain text. Тот же текст, отрендеренный через
+# edit_message в log_bot.py (по тапу), идёт БЕЗ эскейпинга и ссылки работают —
+# отсюда и расхождение, замеченное юзером.
+# Регулярка ловит <a href="..." ...>текст</a>. href обязателен (ленивая ".*?"
+# для текста — не схлопывает соседние <a>...</a> в одну match'у).
+_ANCHOR_RE = re.compile(r'<a\s+href="[^"]*"[^>]*>.*?</a>', re.DOTALL | re.IGNORECASE)
+
 
 def _escape_for_html(msg: str) -> str:
     """
@@ -42,18 +55,40 @@ def _escape_for_html(msg: str) -> str:
     или несбалансированным '<' Telegram возвращал 400 (спасал только
     retry без parse_mode в _tg_log_blocking).
 
-    Теперь: прячем разрешённые теги (<b>/<i>/<code>/<pre>) в плейсхолдеры,
-    html.escape всё остальное (& < >), возвращаем теги назад. Так
-    форматирование сохраняется, а спецсимволы в данных безопасны.
+    Теперь: прячем разрешённые теги (<b>/<i>/<code>/<pre>) И весь <a href=...>...</a>
+    в плейсхолдеры, html.escape всё остальное (& < >), возвращаем теги назад.
+    Так форматирование и ссылки сохраняются, а спецсимволы в данных безопасны.
     """
     if "<" not in msg and "&" not in msg:
         return msg
     tmp = msg
+
+    # 1) Прячем <a href="...">...</a> целиком (с атрибутом href нельзя простой
+    #    string-replace — используем regex). Каждое вхождение → уникальный
+    #    плейсхолдер. Список anchors хранит оригиналы для обратной подстановки.
+    anchors: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        anchors.append(m.group(0))
+        return f"\x00A{len(anchors) - 1}\x00"
+
+    tmp = _ANCHOR_RE.sub(_stash, tmp)
+
+    # 2) Простые whitelist-теги.
     for tag, ph in _TAG_PLACEHOLDERS:
         tmp = tmp.replace(tag, ph)
+
+    # 3) Эскейпим всё остальное.
     tmp = html.escape(tmp, quote=False)   # экранирует & < > (не трогает ")
+
+    # 4) Возвращаем простые теги.
     for tag, ph in _TAG_PLACEHOLDERS:
         tmp = tmp.replace(ph, tag)
+
+    # 5) Возвращаем <a> назад на свои места.
+    for i, anchor in enumerate(anchors):
+        tmp = tmp.replace(f"\x00A{i}\x00", anchor)
+
     return tmp
 
 
@@ -84,6 +119,23 @@ def _tg_log_blocking(msg: str, reply_markup=None) -> None:
             print(f"[TG LOG ERR] HTTP {resp.status_code} | {resp.text[:160]}")
     except Exception as e:
         print(f"[TG LOG ERR] {e}")
+
+
+# FIX 2026-07-08: throttled-алерты для критичных повторяющихся событий
+# (истёкший API-ключ и т.п.). Без тротла reconnect-циклы (30с × 3 WS-модуля)
+# заспамили бы TG сотнями сообщений в час.
+_alert_last: dict[str, float] = {}
+_alert_lock = threading.Lock()
+
+
+def tg_alert_throttled(key: str, msg: str, interval: float = 3600.0) -> None:
+    """tg_log с подавлением: одно и то же key-событие — не чаще раза в interval сек."""
+    now = time.monotonic()
+    with _alert_lock:
+        if now - _alert_last.get(key, 0.0) < interval:
+            return
+        _alert_last[key] = now
+    tg_log(msg)
 
 
 def tg_log(msg: str, reply_markup=None) -> None:

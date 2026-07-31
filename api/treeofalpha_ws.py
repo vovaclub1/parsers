@@ -240,7 +240,20 @@ async def _listener(
                         continue
 
                     short = title[:120].replace("\n", " ")
-                    print(f"[TOA-WS] [{kind.upper()}] ({source}) {short}", flush=True)
+                    # FIX 2026-06-12: реальная задержка «биржа опубликовала → мы
+                    # получили». TOA шлёт epoch публикации в msg['time'] (ms). Это
+                    # показывает, насколько поздно нас доходит сигнал (корень
+                    # «вошли на пике»). 0 если поля нет/часы расходятся.
+                    lag_str = ""
+                    try:
+                        pub_ms = int(msg.get("time") or 0)
+                        if pub_ms > 0:
+                            lag_ms = time.time() * 1000.0 - pub_ms
+                            if -2000 < lag_ms < 600000:   # отсекаем мусор/рассинхрон часов
+                                lag_str = f" | задержка {lag_ms:.0f}мс"
+                    except (TypeError, ValueError):
+                        pass
+                    print(f"[TOA-WS] [{kind.upper()}] ({source}) {short}{lag_str}", flush=True)
 
                     # Передаём в callback через пул — НЕ блокируем WS loop
                     # сетевыми запросами и не платим за спавн потока (S1).

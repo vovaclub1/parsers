@@ -17,7 +17,29 @@ from config.config import (
     DELIST_TRAILING_PCT,
     DELIST_ACTIVE_PCT,
     DELIST_SL_PCT,
+    DELIST_TRAIL_MODE,
+    DELIST_ATR_INTERVAL,
+    DELIST_ATR_PERIOD,
+    DELIST_ATR_MIN_CANDLES,
+    DELIST_ATR_TRAIL_MULT,
+    DELIST_ATR_ACT_MULT,
+    DELIST_ATR_SL_MULT,
+    DELIST_ATR_TRAIL_MIN_PCT,
+    DELIST_ATR_TRAIL_MAX_PCT,
+    DELIST_ATR_ACT_MIN_PCT,
+    DELIST_ATR_ACT_MAX_PCT,
+    DELIST_ATR_SL_MIN_PCT,
+    DELIST_ATR_SL_MAX_PCT,
+    DELIST_SIM_ATR_K,
+    DELIST_SIM_ATR_SL,
+    DELIST_SIM_ATR_PERIOD,
+    DELIST_SIM_ATR_INTERVAL,
+    DELIST_SIM_ATR_MIN_CANDLES,
+    DELIST_SIM_ATR_LO,
+    DELIST_SIM_ATR_HI,
+    DELIST_SIM_ATR_FALLBACK,
 )
+from api.atr import compute_atr, clamp_distance, live_sample_atr_frac
 import requests
 
 # FIX-batch-1: orjson для парсинга ответов Bybit (3-5x быстрее).
@@ -115,6 +137,12 @@ except Exception as _ws_import_exc:  # noqa: BLE001 — graceful
         """Stub если bybit_ws_trade не подгрузился — никогда не raise-нется."""
         pass
 
+# FIX 2026-06-19 (R3): private WS для real-time чтения position вместо REST poll.
+try:
+    from api import bybit_ws_private as _ws_private  # noqa: F401
+except Exception:  # noqa: BLE001
+    _ws_private = None  # type: ignore[assignment]
+
 # ── Конфиг Bybit ─────────────────────────────────────────────────
 BYBIT_BASE_URL = "https://api.bybit.com"
 ORDER_CREATE_URL = BYBIT_BASE_URL + "/v5/order/create"   # FIX-batch-8: pre-built URL
@@ -145,6 +173,11 @@ _bybit_session.headers.update({
 # ── Слова-исключения ──────────────────────────────────────────────
 EXCLUDED_TOKENS = {
     "USDT", "BUSD", "USDC", "TUSD", "DAI",
+    # FIX 2026-06-19: КВОУТ-валюты пар. На «removal of trading pairs» нотисах
+    # (margin/spot) пара вида CVC/USDC, ADX/BTC, DOT/BNB — правая часть это квоут,
+    # её НИКОГДА не делистят и шортить нельзя (иначе зашортим BTC/ETH по посту про
+    # удаление пары ADX/BTC). Базовая монета (левая часть) — да, квоут — нет.
+    "BTC", "ETH", "BNB", "FDUSD", "EUR", "TRY", "BRL", "GBP", "AUD", "ARS",
     "BINANCE", "SPOT", "MARGIN", "FUTURES", "EARN",
     "WILL", "AND", "ON", "FOR", "THE", "ALL",
     "USD", "UTC", "API", "VIP", "KYC", "AML",
@@ -217,6 +250,8 @@ EXCLUDED_TOKENS = {
 
 # ── Кэш цен ──────────────────────────────────────────────────────
 price_cache: dict[str, float] = {}
+price_cache_prev: dict[str, float] = {}   # снапшот предыдущего цикла (~2с назад)
+_price_prev_at = 0.0
 cache_lock  = threading.Lock()
 known_coins: set[str] = set()
 
@@ -283,7 +318,8 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
                 stop_loss: str | None = None,
                 take_profit: str | None = None,
                 tp_size: str | None = None,
-                reduce_only: bool = False) -> dict:
+                reduce_only: bool = False,
+                slippage_tol_pct: float = 0.0) -> dict:
     """
     Размещает Market ордер через Bybit V5 REST максимально быстро.
     :param symbol: "BTCUSDT" (linear).
@@ -329,6 +365,10 @@ def _post_order(symbol: str, side: str, qty: str, position_idx: int,
         # отвергнет ордер. Без tpSize оставляем дефолтный Full-режим TP.
         if tp_size is not None:
             _inner += f',"tpslMode":"Partial","tpSize":"{tp_size}"'
+    # FIX 2026-06-19: slippage cap на стороне Bybit (REST fallback для листинга).
+    # Принимаем число от listing_api._SLIPPAGE_TOL_PCT, в payload — строка.
+    if slippage_tol_pct and slippage_tol_pct > 0:
+        _inner += f',"slippageToleranceType":"Percent","slippageTolerance":"{slippage_tol_pct}"'
     body_str = "{" + _inner + "}"
 
     # FIX: ретраи на Timeout/ConnectionError ОПАСНЫ для market-ордеров без
@@ -508,6 +548,14 @@ def _post_http2(endpoint: str, params: dict, retries: int = 2) -> dict:
 _TPSL_SETTLE_RETRIES = int(os.getenv("TPSL_SETTLE_RETRIES", "8"))
 _TPSL_SETTLE_SLEEP = float(os.getenv("TPSL_SETTLE_SLEEP_MS", "300")) / 1000.0
 
+# FIX 2026-06-17: верификация TP/SL делиста по РЕАЛЬНОЙ позиции (как на листинге).
+# Ждём осёдку позиции, ставим трейлинг к реальной avgPrice, проверяем что он СЕЛ,
+# ретраим пока позиция жива. Если уже закрылась стопом — спокойный лог, не FAIL.
+_DELIST_POS_WAIT_RETRIES     = int(os.getenv("DELIST_POS_WAIT_RETRIES", "10"))
+_DELIST_POS_WAIT_SLEEP       = float(os.getenv("DELIST_POS_WAIT_SLEEP_MS", "300")) / 1000.0
+_DELIST_TRAIL_VERIFY_RETRIES = int(os.getenv("DELIST_TRAIL_VERIFY_RETRIES", "4"))
+_DELIST_TRAIL_VERIFY_SLEEP   = float(os.getenv("DELIST_TRAIL_VERIFY_SLEEP_MS", "300")) / 1000.0
+
 
 def _is_zero_position_err(low: str) -> bool:
     """Подлинная гонка осёдки: позиция ещё не появилась на Bybit (retCode 10001
@@ -625,6 +673,59 @@ def _get(endpoint: str, params: dict | None = None) -> dict:
     return _json_loads(resp.content)  # FIX-batch-1: orjson
 
 
+def _signed_get(endpoint: str, params: dict, timeout: float = 3.0) -> dict:
+    """Подписанный GET к приватным эндпоинтам Bybit V5 (позиция и т.п.).
+    Подпись = HMAC(ts + apiKey + recvWindow + queryString)."""
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    ts = str(int(time.time() * 1000))
+    sign = _sign(ts, qs)
+    headers = {
+        "X-BAPI-API-KEY":     BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP":   ts,
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "X-BAPI-SIGN":        sign,
+    }
+    resp = _bybit_session.get(BYBIT_BASE_URL + endpoint + "?" + qs,
+                              headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return _json_loads(resp.content)
+
+
+def get_position(symbol: str, position_idx: int = 1):
+    """РЕАЛЬНОЕ состояние позиции с биржи: (size, avg_price, trailing_on).
+
+    (0.0, 0.0, False) если позиции нет (не открылась / уже закрыта стопом).
+    avg_price — фактическая средняя цена входа (для якоря SL/трейлинга вместо
+    устаревшей кеш-цены сигнала). trailing_on — стоит ли уже trailingStop.
+    """
+    try:
+        data = _signed_get("/v5/position/list",
+                           {"category": "linear", "symbol": symbol})
+    except Exception as e:  # noqa: BLE001 — сеть/подпись: считаем «неизвестно»
+        print(f"[POSITION] {symbol} query err: {e!r}", flush=True)
+        return 0.0, 0.0, False
+    if str(data.get("retCode")) != "0":
+        return 0.0, 0.0, False
+    for p in (data.get("result") or {}).get("list") or []:
+        try:
+            if int(p.get("positionIdx", -1)) != position_idx:
+                continue
+            sz = float(p.get("size") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sz > 0:
+            try:
+                avg = float(p.get("avgPrice") or 0)
+            except (TypeError, ValueError):
+                avg = 0.0
+            try:
+                trailing_on = float(p.get("trailingStop") or 0) > 0
+            except (TypeError, ValueError):
+                trailing_on = False
+            return sz, avg, trailing_on
+    return 0.0, 0.0, False
+
+
 # ── Price updater (тикеры через REST, без ccxt) ───────────────────
 
 def price_updater() -> None:
@@ -680,12 +781,19 @@ def price_updater() -> None:
                         new_known.add(symbol[:-4])
 
             with cache_lock:
+                # FIX 2026-06-12: снапшот ПРЕДЫДУЩего цикла (~2с назад) — референс
+                # для фильтра позднего входа (понять, успела ли цена уже улететь
+                # до того как мы получили сигнал листинга).
+                global _price_cache_updated_at, _price_prev_at
+                if price_cache:
+                    price_cache_prev.clear()
+                    price_cache_prev.update(price_cache)
+                    _price_prev_at = _price_cache_updated_at
                 price_cache.clear()
                 price_cache.update(new_cache)
                 known_coins.clear()
                 known_coins.update(new_known)
                 # FIX (review high): отмечаем успешное обновление.
-                global _price_cache_updated_at
                 _price_cache_updated_at = time.monotonic()
 
         except Exception as e:
@@ -715,6 +823,39 @@ def get_price(coin: str) -> Optional[float]:
     # произойти между этим чтением и возвратом. Берём под lock.
     with cache_lock:
         return price_cache.get(f"{coin}/USDT:USDT")
+
+
+def price_ago(coin: str) -> Optional[float]:
+    """Цена монеты из ПРЕДЫДУЩего цикла (~2с назад), или None если её там не было.
+    Референс для фильтра позднего входа: сравнить текущую цену с этой."""
+    with cache_lock:
+        return price_cache_prev.get(f"{coin}/USDT:USDT")
+
+
+def fetch_live_price(coin: str, timeout: float = 0.7) -> Optional[float]:
+    """СВЕЖАЯ цена одного символа прямым REST-запросом (НЕ из 2с-кеша).
+
+    Нужна для ретрая-на-откат при фильтре позднего входа: кеш обновляется раз в 2с,
+    поэтому перечитывание get_price() через десятки мс вернуло бы то же значение.
+    Этот запрос (~30-80мс) даёт актуальный lastPrice. None при ошибке/таймауте.
+    """
+    symbol = f"{coin}USDT"
+    try:
+        resp = _bybit_session.get(
+            BYBIT_BASE_URL + "/v5/market/tickers",
+            params={"category": "linear", "symbol": symbol},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = _json_loads(resp.content)
+        lst = ((data.get("result") or {}).get("list")) or []
+        if lst:
+            lp = lst[0].get("lastPrice")
+            if lp:
+                return float(lp)
+    except Exception:  # noqa: BLE001 — сеть/parse: вернём None, caller решит
+        return None
+    return None
 
 
 def calculate_margin_for_delist() -> float:
@@ -857,6 +998,11 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
     """
     bybit_price = get_price(ticker_name)
 
+    # FIX 2026-06-24: флаг видим И в Bybit-блоке (где он выставляется на reject
+    # типа 30228 "No new positions during delisting"), И в Gate-fallback внизу
+    # (где он определяет — фейл-фастить или ретраиться).
+    bybit_rejected = False
+
     # FIX: проверка на 0 или отрицательную цену (защита от деления на ноль)
     if bybit_price and bybit_price > 0:
         symbol  = f"{ticker_name}USDT"
@@ -881,6 +1027,13 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 # orderLinkId Bybit отвергнет (retCode 30050 → success).
                 order_link_id = _new_order_link_id()
 
+                # FIX 2026-06-17: bundled SL прямо в order.create (как на листинге).
+                # Раньше делистовый шорт открывался ГОЛЫМ — защита приходила только
+                # отдельным /v5/position/trading-stop, и при его провале (34040/
+                # zero-position/trailing-invalid) позиция оставалась без стопа
+                # (инцидент HIGH: закрывали руками). SL для шорта ВЫШЕ входа.
+                sl_price = str(round(bybit_price * (1 + DELIST_SL_PCT), 8))
+
                 # FIX 2026-06-05: ack-waiting + ретраи на price-cap (зеркало listing).
                 ws_args = {
                     "category":    "linear",
@@ -890,15 +1043,34 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                     "qty":         qty_str,
                     "positionIdx": 2,
                     "orderLinkId": order_link_id,
+                    "stopLoss":    sl_price,
+                    "slTriggerBy": "LastPrice",
                 }
                 success = False
+                # FIX 2026-06-24: на reject (30228 "No new positions during delisting",
+                # symbol-not-found и т.д.) — НЕ return 0,0 сразу, а break → Gate fallback
+                # ниже. Раньше Gate-блок был недостижим: воркер видел (0,0) → "нет цены"
+                # → 3×0.1с retry → "сдаёмся", даже когда Gate имел эту монету.
+                # Кейс из прода: IPUSDT 17:01:18 — Bybit 30228, Gate имел IP.
+                # bybit_rejected объявлен на func-scope выше.
                 for attempt in range(1, _ORDER_RETRIES + 1):
                     ack = _ws_place_order_ack(ws_args)
                     if ack is None:
-                        # WS недоступен/таймаут → REST fallback один раз.
-                        _post_order(symbol, "Sell", qty_str, 2,
-                                    order_link_id=order_link_id)
-                        success = True
+                        # WS недоступен/таймаут → REST fallback один раз (тоже с SL).
+                        # FIX 2026-07-08 (NEO-инцидент): REST-исключение (33004
+                        # expired key и т.п.) раньше пролетало МИМО Gate-fallback
+                        # и убивало весь market_open_short — воркер видел
+                        # «попытка упала», Gate даже не пробовался.
+                        try:
+                            _post_order(symbol, "Sell", qty_str, 2,
+                                        order_link_id=order_link_id, stop_loss=sl_price)
+                            success = True
+                        except Exception as e_rest:  # noqa: BLE001
+                            print(
+                                f"[BYBIT-REST] REJECTED {symbol}: {e_rest} "
+                                f"— пробуем Gate", flush=True,
+                            )
+                            bybit_rejected = True
                         break
                     rc = ack.get("retCode", -1)
                     if rc == 0:
@@ -907,33 +1079,44 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                     if rc not in _PRICE_CAP_RETCODES:
                         print(
                             f"[BYBIT-WS] REJECTED {symbol} retCode={rc} "
-                            f"retMsg={ack.get('retMsg','?')!r} — fail fast",
+                            f"retMsg={ack.get('retMsg','?')!r} — пробуем Gate",
                             flush=True,
                         )
-                        return 0, 0
+                        bybit_rejected = True
+                        break
                     if attempt < _ORDER_RETRIES:
                         time.sleep(_ORDER_RETRY_SLEEP)
 
-                if not success:
+                if not success and not bybit_rejected:
                     print(
                         f"[BYBIT-WS] {symbol}: все {_ORDER_RETRIES} ретраев "
-                        f"на price-cap — не зашли", flush=True,
+                        f"на price-cap — пробуем Gate", flush=True,
                     )
-                    return 0, 0
 
-                with _delist_exchange_lock:
-                    _delist_exchange[ticker_name] = "bybit"
-                # FIX-PERF: удалён print "[BYBIT SHORT/{placed_via}]" — он стоял
-                # ПЕРЕД return и добавлял ~1мс к open_ms (PYTHONUNBUFFERED=1).
-                # На WS-failure bybit_ws_trade сам пишет "[BYBIT-WS-FAST] ...".
-                return amount_tokens, bybit_price
+                if success:
+                    with _delist_exchange_lock:
+                        _delist_exchange[ticker_name] = "bybit"
+                    # FIX-PERF: удалён print "[BYBIT SHORT/{placed_via}]" — он стоял
+                    # ПЕРЕД return и добавлял ~1мс к open_ms (PYTHONUNBUFFERED=1).
+                    # На WS-failure bybit_ws_trade сам пишет "[BYBIT-WS-FAST] ...".
+                    return amount_tokens, bybit_price
+                # Не вышло на Bybit — проваливаемся в Gate fallback (ниже).
 
     # ── Gate.io fallback ─────────────────────────────────────────
     gate_price = gate_get_price(ticker_name)
     if not gate_price:
+        # FIX 2026-06-24: на Bybit-reject (30228 etc) + пустой Gate → fail-fast
+        # sentinel (-1,0). Без этого воркер на (0,0) делает 3×0.1с retry'я
+        # бессмысленно (причина перманентная).
+        if bybit_rejected:
+            print(f"[NO PRICE ANYWHERE] {ticker_name} — Bybit reject + Gate пустой "
+                  f"— fail-fast", flush=True)
+            return -1, 0
         print(f"[NO PRICE ANYWHERE] {ticker_name}")
         return 0, 0
 
+    print(f"[GATE-FALLBACK] {ticker_name}: открываем шорт на Gate "
+          f"(price={gate_price})", flush=True)
     amount, fill_price = gate_open_short(ticker_name, usdt_amount)
     if amount:
         with _delist_exchange_lock:
@@ -988,6 +1171,90 @@ def warmup_chain(n: int = 30) -> int:
     return ok
 
 
+def _sim_atr_live_trail_params_short(ticker: str, base_px: float) -> tuple[float, float, float, str]:
+    """
+    ЖИВОЙ порт tg/exit_strategies.py:exit_atr_trailing для SHORT-позиции.
+
+    Блокирует ~DELIST_SIM_ATR_PERIOD секунд (default 30) sampling'ом
+    price_cache через get_price — тот же источник что recorder в _atr_frac.
+
+    После warmup'а: trail_frac = clamp(k×atr_frac, lo, hi), act = trail,
+    SL = _SIM_ATR_SL. Для SHORT: активация НИЖЕ base, SL ВЫШЕ base.
+    """
+    sample_res = live_sample_atr_frac(
+        get_price,
+        coin=ticker,
+        entry=base_px,
+        samples=DELIST_SIM_ATR_PERIOD,
+        period=1.0,
+        min_valid=DELIST_SIM_ATR_MIN_CANDLES,
+    )
+    if sample_res is not None:
+        atr_frac, n_used, peak, trough = sample_res
+        raw = DELIST_SIM_ATR_K * atr_frac
+        trail_frac = min(DELIST_SIM_ATR_HI, max(DELIST_SIM_ATR_LO, raw))
+        atr_tag = (f"atr_frac={atr_frac:.5f} (n={n_used}, "
+                   f"peak={peak:.6g}, trough={trough:.6g})")
+    else:
+        trail_frac = DELIST_SIM_ATR_FALLBACK
+        atr_tag = f"sample=n/a → fallback={DELIST_SIM_ATR_FALLBACK*100:.1f}%"
+
+    trail_dist  = round(base_px * trail_frac, 8)
+    active_pric = round(base_px * (1.0 - trail_frac), 8)   # SHORT act ниже
+    sl_price    = round(base_px * (1.0 + DELIST_SIM_ATR_SL), 8)  # SHORT SL выше
+    tag = (f"sim_atr LIVE {atr_tag} "
+           f"({DELIST_SIM_ATR_PERIOD}×1s post-fill) "
+           f"trail={trail_frac*100:.2f}% act={trail_frac*100:.2f}% "
+           f"SL={DELIST_SIM_ATR_SL*100:.1f}%")
+    return trail_dist, active_pric, sl_price, tag
+
+
+def _compute_trail_params_short(symbol: str, base_px: float) -> tuple[float, float, float, str]:
+    """
+    Возвращает (trailing_distance, active_price, sl_price, log_tag) для ШОРТ.
+
+    Режимы (DELIST_TRAIL_MODE):
+      - "sim_atr": порт симуляторного exit_atr_trailing (тот "atr_trail" из
+                   6ч-карточек, +56% на IOTX). atr_frac=mean(|Δclose|)/entry,
+                   trail=k×atr clamped[lo,hi], act=trail, SL=1%.
+      - "atr":     Wilder True Range с clamp'ом в %.
+      - "pct":     фикс % (legacy).
+
+    Для шорта: активация НИЖЕ base_px, SL ВЫШЕ base_px.
+    """
+    # NB: mode "sim_atr" НЕ здесь — sim_atr требует post-fill live sampling
+    # (см. _sim_atr_live_trail_params_short, вызывается напрямую из
+    # _set_tp_sl_bybit_short).
+
+    if DELIST_TRAIL_MODE == "atr" and base_px > 0:
+        atr = compute_atr(
+            symbol,
+            interval=DELIST_ATR_INTERVAL,
+            period=DELIST_ATR_PERIOD,
+            min_candles=DELIST_ATR_MIN_CANDLES,
+        )
+        if atr is not None and atr > 0:
+            td = clamp_distance(atr * DELIST_ATR_TRAIL_MULT, base_px,
+                                DELIST_ATR_TRAIL_MIN_PCT, DELIST_ATR_TRAIL_MAX_PCT)
+            ad = clamp_distance(atr * DELIST_ATR_ACT_MULT,   base_px,
+                                DELIST_ATR_ACT_MIN_PCT,   DELIST_ATR_ACT_MAX_PCT)
+            sd = clamp_distance(atr * DELIST_ATR_SL_MULT,    base_px,
+                                DELIST_ATR_SL_MIN_PCT,    DELIST_ATR_SL_MAX_PCT)
+            trail_dist  = round(td, 8)
+            active_pric = round(base_px - ad, 8)
+            sl_price    = round(base_px + sd, 8)
+            tag = (f"ATR={atr:.6g} ({DELIST_ATR_PERIOD}×{DELIST_ATR_INTERVAL}m) "
+                   f"trail={td/base_px*100:.2f}% SL={sd/base_px*100:.2f}%")
+            return trail_dist, active_pric, sl_price, tag
+
+    # Fallback / pct-mode — legacy формулы.
+    trail_dist  = round(base_px * DELIST_TRAILING_PCT, 8)
+    active_pric = round(base_px * (1 - DELIST_ACTIVE_PCT), 8)
+    sl_price    = round(base_px * (1 + DELIST_SL_PCT),     8)
+    tag = f"pct trail={DELIST_TRAILING_PCT*100:.1f}% SL={DELIST_SL_PCT*100:.1f}%"
+    return trail_dist, active_pric, sl_price, tag
+
+
 def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) -> str:
     """
     Выставляет нативный trailing stop + аварийный SL для шорта на Bybit.
@@ -1006,69 +1273,125 @@ def _set_tp_sl_bybit_short(ticker_name: str, entry_price: float, amount: float) 
         print(f"[TP/SL SKIP] {e}")
         return "skip"
 
-    # Параметры стратегии (env-tunable). Цена short'а: SL ВЫШЕ входа, активация НИЖЕ.
-    sl_price = round(entry_price * (1 + DELIST_SL_PCT), 8)           # аварийный стоп (+SL%)
-    trailing_distance = round(entry_price * DELIST_TRAILING_PCT, 8)  # дистанция трейлинга в USDT
-    active_price = round(entry_price * (1 - DELIST_ACTIVE_PCT), 8)   # активация после -ACTIVE%
-
     sl_size = str(_round_qty(amount, step))  # Вся позиция
-
-    # FIX: если amount < step, _round_qty вернёт 0.0 → Bybit отклонит запрос
     if sl_size == "0.0" or float(sl_size) <= 0:
         print(f"[TP/SL SKIP] {ticker_name}: slSize={sl_size} (amount={amount}, step={step}) — слишком мало")
         return "skip"
 
-    # FIX 2026-06-11: делистнутая монета часто УЖЕ падает ниже точки активации, пока
-    # позиция оседает. Для Sell Bybit требует activePrice < last_price, иначе отвергает
-    # ВЕСЬ вызов (10001) — и SL гибнет вместе с трейлингом (инцидент HIGH: позиция без
-    # защиты). Если уже прошли активацию — не шлём activePrice (трейлинг от текущей цены).
-    last = get_price(ticker_name)
-    past_activation = last is not None and last <= active_price
+    # 1) Ждём появления позиции и берём РЕАЛЬНУЮ avgPrice. Bundled SL из order.create
+    #    уже защищает шорт, пока цепляем трейлинг. Нет позиции за окно → закрылась
+    #    стопом / не исполнилась (НЕ голая, трейлить нечего).
+    # FIX 2026-06-19 (R3): сначала private-WS push (10-30мс); REST poll — fallback.
+    avg = 0.0
+    size = 0.0
+    pos_deadline = time.monotonic() + _DELIST_POS_WAIT_RETRIES * _DELIST_POS_WAIT_SLEEP
+    ws_priv_ready = _ws_private is not None and _ws_private.is_ready()
+    if ws_priv_ready:
+        ws_timeout = max(0.0, pos_deadline - time.monotonic())
+        ws_res = _ws_private.wait_for_position(symbol, 2, timeout=ws_timeout)
+        if ws_res is not None:
+            size, avg, _trailing = ws_res
+    if size <= 0:
+        # REST poll с общим бюджетом pos_deadline (БЕЗ удвоения окна).
+        # Гарантируем 1 last-check (мог прийти ack между WS-таймаутом и сейчас).
+        while True:
+            size, avg, _trailing = get_position(symbol, 2)
+            if size > 0:
+                break
+            remaining = pos_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(_DELIST_POS_WAIT_SLEEP, remaining))
+    if size <= 0:
+        print(f"[TP/SL] {ticker_name}: позиции нет — закрыта стопом или не исполнилась "
+              f"(bundled SL отработал; трейлить нечего)", flush=True)
+        return "no-position"
+
+    # 2) Якорим к РЕАЛЬНОЙ цене входа. Для short: SL ВЫШЕ входа, активация НИЖЕ.
+    base_px = avg if avg > 0 else entry_price
+
+    # FIX 2026-07-07: sim_atr — блокирующий 30-сек warmup + live sample атра.
+    # Позиция защищена bundled SL из order.create (см. market_open_short).
+    if DELIST_TRAIL_MODE == "sim_atr":
+        print(f"[TP/SL SIM_ATR] {ticker_name}: warmup {DELIST_SIM_ATR_PERIOD}с "
+              f"(bundled SL держит)...", flush=True)
+        trailing_distance, active_price, sl_price, trail_tag = \
+            _sim_atr_live_trail_params_short(ticker_name, base_px)
+        # Позиция могла закрыться bundled SL за warmup.
+        size, _, _ = get_position(symbol, 2)
+        if size <= 0:
+            print(f"[TP/SL] {ticker_name}: позиция закрылась за sim_atr warmup "
+                  f"(bundled SL сработал) — трейлить нечего", flush=True)
+            return "closed"
+    else:
+        trailing_distance, active_price, sl_price, trail_tag = _compute_trail_params_short(symbol, base_px)
 
     base = {
-        "category":    "linear",
-        "symbol":      symbol,
-        "positionIdx": 2,  # short-hedge
-        "stopLoss":    str(sl_price),
-        "slTriggerBy": "LastPrice",
-        "slSize":      sl_size,
+        "category":    "linear", "symbol": symbol, "positionIdx": 2,
+        "stopLoss":    str(sl_price), "slTriggerBy": "LastPrice", "slSize": sl_size,
     }
-    trail = {"trailingStop": str(trailing_distance)}  # tpslMode не указываем → Full mode
-    if not past_activation:
-        trail["activePrice"] = str(active_price)
 
-    try:
-        _trading_stop_settle({**base, **trail}, tag=ticker_name)
-    except Exception as e_comb:  # noqa: BLE001
-        # Защита от «голой» позиции: ставим SL и трейлинг ПО ОТДЕЛЬНОСТИ — отказ одной
-        # защиты не должен оставлять позицию без другой.
-        print(f"[TP/SL] {ticker_name} комбинированный вызов упал: {e_comb} → "
-              f"ставлю SL и трейлинг по отдельности", flush=True)
-        done = []
+    # 3) Ставим трейлинг с ВЕРИФИКАЦИЕЙ (перечитываем позицию — реально ли сел трейлинг),
+    #    ретраим пока позиция жива. past_activation пересчитываем каждый раз: делистнутая
+    #    монета падает, и activePrice могла стать невалидной (Sell требует activePrice<last).
+    for attempt in range(1, _DELIST_TRAIL_VERIFY_RETRIES + 1):
+        last = get_price(ticker_name)
+        past_activation = last is not None and last <= active_price
+        trail = {"trailingStop": str(trailing_distance)}
+        if not past_activation:
+            trail["activePrice"] = str(active_price)
         try:
-            _trading_stop_settle(dict(base), tag=f"{ticker_name}-SL")
-            done.append("SL")
-        except Exception as e_sl:  # noqa: BLE001
-            print(f"[TP/SL] {ticker_name} SL-only упал: {e_sl}", flush=True)
-        try:
-            _trading_stop_settle({"category": "linear", "symbol": symbol,
-                                  "positionIdx": 2,
-                                  "trailingStop": str(trailing_distance)},
-                                 tag=f"{ticker_name}-TS")
-            done.append("trailing")
-        except Exception as e_ts:  # noqa: BLE001
-            print(f"[TP/SL] {ticker_name} trailing-only упал: {e_ts}", flush=True)
-        if not done:
-            raise  # пусть set_tp_sl залогирует громкий [TP/SL FAIL]
-        print(f"[TP/SL PARTIAL] {ticker_name}: выставлено {'+'.join(done)}", flush=True)
+            _trading_stop_settle({**base, **trail}, tag=ticker_name)
+        except Exception as e_comb:  # noqa: BLE001
+            # SL переякорить не вышло — хотя бы трейлинг (bundled SL из order.create остаётся)
+            try:
+                _trading_stop_settle({"category": "linear", "symbol": symbol,
+                                      "positionIdx": 2,
+                                      "trailingStop": str(trailing_distance)},
+                                     tag=f"{ticker_name}-TS")
+            except Exception as e_ts:  # noqa: BLE001
+                print(f"[TP/SL] {ticker_name} попытка {attempt}: "
+                      f"комбо={e_comb}; trailing-only={e_ts}", flush=True)
 
-    act_txt = "немедленно (цена прошла активацию)" if past_activation else f"@{active_price:.6f}"
-    print(
-        f"[TP/SL SET SHORT] {ticker_name} | entry={entry_price:.6f} | "
-        f"SL={sl_price:.6f}(+{DELIST_SL_PCT*100:.1f}%) | "
-        f"Trailing={DELIST_TRAILING_PCT*100:.1f}% (active {act_txt})", flush=True
-    )
-    return "Выставил trailing stop"
+        # FIX 2026-06-19 (R3): WS-cache first (~push 10-50мс) → REST fallback.
+        # trailing_on — bool: либо WS показал trailing>0, либо REST вернул True.
+        size_w = 0.0
+        trail_w = 0.0
+        if ws_priv_ready:
+            snap = _ws_private.get_position_cached(symbol, 2)
+            if snap is not None:
+                size_w, _, trail_w = snap
+        if size_w > 0 and trail_w > 0:
+            size, trailing_on = size_w, True
+        else:
+            size, _, trailing_on = get_position(symbol, 2)
+        if size <= 0:
+            print(f"[TP/SL] {ticker_name}: позиция закрылась пока ставили трейлинг "
+                  f"(стоп/трейлинг отработал) — ок", flush=True)
+            return "closed"
+        if trailing_on:
+            act_txt = "немедленно (цена прошла активацию)" if past_activation else f"@{active_price:.6f}"
+            print(f"[TP/SL SET SHORT] {ticker_name} | entry={base_px:.6f}(реал) | "
+                  f"SL={sl_price:.6f} | Trailing={trailing_distance} "
+                  f"(active {act_txt}) | {trail_tag} — ПОДТВЕРЖДЁН на бирже",
+                  flush=True)
+            return "ok"
+        if attempt < _DELIST_TRAIL_VERIFY_RETRIES:
+            if ws_priv_ready:
+                # wait_for_position_trailing уже спит timeout=sleep'а; либо
+                # пришёл push (continue), либо истёк — оба варианта = задержка
+                # покрыта, второй sleep не нужен.
+                _ws_private.wait_for_position_trailing(
+                    symbol, 2, timeout=_DELIST_TRAIL_VERIFY_SLEEP,
+                )
+            else:
+                time.sleep(_DELIST_TRAIL_VERIFY_SLEEP)
+
+    # Позиция жива, трейлинг не подтвердился. Bundled SL защищает — громкий warn.
+    print(f"[TP/SL WARN] {ticker_name}: трейлинг НЕ подтверждён за "
+          f"{_DELIST_TRAIL_VERIFY_RETRIES} попыток, позиция ЖИВА и защищена bundled SL. "
+          f"ПРОВЕРЬ ТРЕЙЛИНГ!", flush=True)
+    return "sl-only"
 
 
 def set_tp_sl(ticker_name: str, entry_price: float, amount: float) -> str:

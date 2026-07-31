@@ -85,15 +85,12 @@ from config.config import (
     BYBIT_SYNC_WS_ENABLED,                      # FIX-PERF: sync WS hot-path
     BYBIT_API_KEY, BYBIT_SECRET_KEY,
     LISTING_PROXIES,                            # FIX-LATENCY (Patch #2): proxy pool
-    SEOUL_RELAY_URL,                            # FIX-LATENCY (Patch #1): edge relay (auth внутри URL ?key=...)
 )
 import itertools  # FIX-LATENCY (Patch #2): round-robin для proxy pool
 
 from api.listing_api import (
     find_listing_pairs,
     calculate_margin_for_listing,
-    market_open_long,
-    set_tp_sl_long,
     price_updater,
     gate_price_updater,
     warmup_bybit_connection,
@@ -101,6 +98,13 @@ from api.listing_api import (
     preload_lot_steps,
     gate_preload_lot_steps,
     warmup_gate_connection,
+)
+# FIX 2026-07-07 (INVERT): по решению — на ЛИСТИНГАХ открываем ШОРТ
+# (fade the pump), на делистах — лонг. Шорт-механика (Bybit+Gate fallback,
+# bundled SL выше входа, трейлинг DELIST_*) переиспользуется из delist_api.
+from api.delist_api import (
+    market_open_short,
+    set_tp_sl as set_tp_sl_short,
 )
 # FIX-LATENCY: pre-set leverage sweep — убирает 150мс HTTP POST из
 # market_open_long на cold-Gate-листинге.
@@ -212,6 +216,30 @@ BINANCE_POLL_INTERVAL = 2.5
 POLL_ERROR_BACKOFF  = 3.0
 
 WATCHDOG_TIMEOUT    = 60   # секунд
+
+# FIX 2026-07-07: тротлинг повторяющихся ошибок поллеров. Мёртвый прокси
+# давал "poll error: ProxyError..." каждые 2-3с СУТКАМИ — лог нечитаем.
+# Одинаковая (tag, сигнатура) ошибка теперь логируется раз в 5 минут
+# со счётчиком подавленных повторов.
+_POLL_ERR_LOG_INTERVAL = 300.0
+_poll_err_last: dict[tuple[str, str], tuple[float, int]] = {}   # (tag, sig) → (last_log_ts, suppressed)
+_poll_err_lock = threading.Lock()
+
+
+def _log_poll_error_throttled(tag: str, e: Exception) -> None:
+    """log_err с подавлением повторов: одна и та же ошибка — раз в 5 мин."""
+    # Сигнатура без изменчивых частей (портов/адресов достаточно — они
+    # в тексте, но одинаковы для одного и того же мёртвого прокси).
+    sig = f"{type(e).__name__}:{str(e)[:120]}"
+    now = time.monotonic()
+    with _poll_err_lock:
+        last_ts, suppressed = _poll_err_last.get((tag, sig), (0.0, 0))
+        if now - last_ts < _POLL_ERR_LOG_INTERVAL:
+            _poll_err_last[(tag, sig)] = (last_ts, suppressed + 1)
+            return
+        _poll_err_last[(tag, sig)] = (now, 0)
+    extra = f" (+{suppressed} подавлено за 5мин)" if suppressed else ""
+    log_err(tag, f"poll error: {type(e).__name__}: {e}{extra}")
 
 
 # ── Proxy pool для notice-поллеров (Patch #2) ─────────────────────
@@ -499,7 +527,15 @@ _first_claim_ts: dict[str, tuple[str, float]] = {}   # coin -> (source, t)
 _FIRST_CLAIM_TTL = 300  # храним 5 минут — на дольше дельта уже неинтересна
 
 # L2: постоянное хранилище опыта.
-_global_fired: set[str] = set()                       # биржа не распознана / легаси
+# FIX 2026-07-07 (MORPHO-инцидент): _global_fired перманентный блок пропустил
+# реальный Upbit-листинг MORPHO — монета отстрелялась 14 июня по TOA-WS (биржа
+# не распозналась → global), и месяц спустя настоящий листинг был отброшен.
+# global-блок нужен только чтобы погасить ВОЛНУ одной новости (разные источники
+# дублируют часами) → теперь dict{coin: fired_ts} с TTL (деф. 72ч,
+# env LISTING_GLOBAL_FIRED_TTL_H). per_exchange остаётся перманентным —
+# та же биржа не листит ту же монету дважды.
+_GLOBAL_FIRED_TTL = float(os.getenv("LISTING_GLOBAL_FIRED_TTL_H", "72")) * 3600.0
+_global_fired: dict[str, float] = {}                  # coin → fired_ts (time.time())
 _per_exchange_fired: dict[str, set[str]] = {          # биржа распознана — (coin, exchange)
     "UPBIT": set(),
     "BITHUMB": set(),
@@ -838,15 +874,28 @@ def _load_fired_state() -> None:
             return
         gf = data.get("global", [])
         with _fired_lock:
-            if isinstance(gf, list):
-                _global_fired.update(str(c) for c in gf if isinstance(c, str))
+            # FIX 2026-07-07: новый формат — dict {coin: fired_ts}; легаси —
+            # list[str] без времени → ставим mtime файла (= последний open,
+            # консервативно: блок ещё максимум TTL от последнего открытия,
+            # потом само истечёт).
+            if isinstance(gf, dict):
+                for c, ts in gf.items():
+                    try:
+                        _global_fired[str(c)] = float(ts)
+                    except (TypeError, ValueError):
+                        continue
+            elif isinstance(gf, list):
+                legacy_ts = _FIRED_FILE.stat().st_mtime
+                for c in gf:
+                    if isinstance(c, str):
+                        _global_fired[c] = legacy_ts
             for ex, coins in (data.get("per_exchange") or {}).items():
                 if ex in _per_exchange_fired and isinstance(coins, list):
                     _per_exchange_fired[ex].update(
                         str(c) for c in coins if isinstance(c, str)
                     )
         per_ex_summary = ", ".join(f"{k}={len(v)}" for k, v in _per_exchange_fired.items())
-        log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)} | {per_ex_summary}")
+        log_ok("DEDUP", f"L2 загружен: global={len(_global_fired)} (TTL {_GLOBAL_FIRED_TTL/3600:.0f}ч) | {per_ex_summary}")
     except Exception as e:  # noqa: BLE001
         log_warn("DEDUP", f"L2 load failed: {e!r} — стартуем с пустого")
 
@@ -858,8 +907,9 @@ def _persist_fired_state() -> None:
     """
     try:
         with _fired_lock:
+            # FIX 2026-07-07: global теперь dict {coin: fired_ts} (TTL-семантика).
             snapshot = {
-                "global": sorted(_global_fired),
+                "global": dict(sorted(_global_fired.items())),
                 "per_exchange": {k: sorted(v) for k, v in _per_exchange_fired.items()},
             }
         # FIX: используем уже импортированный _json_dumps вместо дубликата
@@ -877,13 +927,18 @@ def _is_already_fired(coin: str, source: str, exchange: str = "") -> bool:
     L2-проверка. Должна вызываться под _fired_lock.
 
     Блокируем если:
-      • coin в _global_fired — легаси-записи + fallback для источников без
-        привязки к бирже (TG/TOA без распознанной биржи); ИЛИ
+      • coin в _global_fired И запись моложе TTL (гасим волну одной новости;
+        просроченные записи лениво вычищаем — MORPHO-инцидент 2026-07-07:
+        вечный global-блок пропустил реальный Upbit-листинг); ИЛИ
       • coin уже стреляли на ТОЙ ЖЕ бирже (_per_exchange_fired[ex]).
     Другая биржа той же монеты — НЕ блок (новый рынок = новый памп).
     """
-    if coin in _global_fired:
-        return True
+    ts = _global_fired.get(coin)
+    if ts is not None:
+        if (time.time() - ts) < _GLOBAL_FIRED_TTL:
+            return True
+        _global_fired.pop(coin, None)   # просрочена — чистим, персист догонит
+        _fired_dirty.set()
     ex = _resolve_exchange(source, exchange)
     if ex is not None:
         return coin in _per_exchange_fired.get(ex, set())
@@ -960,8 +1015,9 @@ def _mark_opened(coin: str, source: str, exchange: str = "") -> None:
                 bucket.add(coin)
                 dirty = True
         else:
+            # FIX 2026-07-07: dict с fired_ts (TTL-семантика, см. _is_already_fired).
             if coin not in _global_fired:
-                _global_fired.add(coin)
+                _global_fired[coin] = time.time()
                 dirty = True
     if dirty:
         _fired_dirty.set()
@@ -1124,21 +1180,7 @@ def _source_stats_summary_loop() -> None:
         time.sleep(6 * 3600)
 
 
-def _health_report_loop() -> None:
-    """
-    Каждые 6 часов шлёт health-отчёт «слабые места» в TG и stdout.
-    Первый тик через 1 час после старта (даём накопить данные).
-    """
-    time.sleep(3600)
-    while True:
-        try:
-            if _health is not None:
-                report = _health.build_report()
-                print(report.replace("<b>", "").replace("</b>", ""), flush=True)
-                tg_log(report)
-        except Exception as e:  # noqa: BLE001
-            log_warn("HEALTH", f"report failed: {e!r}")
-        time.sleep(6 * 3600)
+# FIX 2026-06-18: _health_report_loop удалён — TG-отчёт каждые 6ч отключён.
 
 
 def _fired_sweeper() -> None:
@@ -1164,43 +1206,44 @@ def _fired_sweeper() -> None:
 # ── воркер (открытие лонга) ───────────────────────────────────────
 
 def worker(coin: str, margin: float, t_start: float,
-           source: str, retries: int = 3, exchange: str = "") -> None:
+           source: str, retries: int = 3, exchange: str = "",
+           prefilled: tuple[float, float] | None = None) -> None:
     # Signal-stats: причина последнего провала (для emit в конце).
-    # no_price → market_open_long вернул 0; rejected → биржа 400/404.
+    # no_price → market_open_short вернул 0; rejected → биржа 400/404.
+    # prefilled — результат уже открытого ордера (например, через batch);
+    # пропускает market_open_short и идёт сразу к TP/SL postprocess.
     last_fail = "failed"
     for attempt in range(1, retries + 1):
         try:
             # FIX-PERF: пропускаем "Старт"-print на attempt 1. Это
-            # форматированный print → stdout = ~1-3мс перед market_open_long
+            # форматированный print → stdout = ~1-3мс перед market_open_short
             # в hot-path. Открытие позиции важнее, чем factual лог "сейчас открываем".
             # На retry'ях лог остаётся — там диагностика нужна.
             if attempt > 1:
                 log_info("WORKER", f"[{source}] Retry {attempt}/{retries} → {coin} | margin={margin} USDT")
-            amount, entry_price = market_open_long(coin, margin)
+            if prefilled is not None and attempt == 1:
+                amount, entry_price = prefilled
+            else:
+                # FIX 2026-07-07 (INVERT): листинг → ШОРТ (fade the pump).
+                amount, entry_price = market_open_short(coin, margin)
+            # sentinel (-1, 0) = биржевой REJECT (нет маржи /
+            # symbol-not-found / slippage cap превышен). Ретрай не починит —
+            # fail-fast, экономит 0.2-0.3с на отказе.
+            if amount == -1:
+                log_warn("WORKER", f"{coin}: биржа отвергла ордер — fail-fast")
+                last_fail = "rejected"
+                break
             if not amount:
                 log_warn("WORKER", f"{coin}: нет цены, повтор через 0.1с...")
                 last_fail = "no_price"
                 time.sleep(0.1)
                 continue
 
-            # FIX 2026-06-09: выбор стратегии выхода.
-            #   • Robinhood-листинг (Bybit ИЛИ Gate) → тугой выход: трейлинг
-            #     0.75% + страховочный SL 0.5% на всю позицию.
-            #   • всё остальное → обычный trailing 1% / SL 1%.
-            # venue читаем из _last_exchange (выставлен в market_open_long).
-            try:
-                from api.listing_api import _last_exchange as _lx_pre
-                _venue_pre = _lx_pre.get(coin, "bybit").lower()
-            except Exception:  # noqa: BLE001
-                _venue_pre = "bybit"
-            if "ROBINHOOD" in source:
-                from api.listing_api import set_robinhood_exit
-                _tp_sl_executor.submit(set_robinhood_exit, coin, entry_price,
-                                       amount, _venue_pre)
-            else:
-                # trading-stop endpoint: trailing 1% в Full-режиме (submit
-                # ~5-20μs не сдвинет open_ms).
-                _tp_sl_executor.submit(set_tp_sl_long, coin, entry_price, amount)
+            # FIX 2026-07-07 (INVERT): выход для ШОРТА — set_tp_sl_short
+            # (роутер bybit/gate из delist_api, DELIST_TRAIL_MODE управляет
+            # трейлингом). Robinhood-специфика (тугой лонг-выход) не
+            # применима к шорту — все идут единым путём.
+            _tp_sl_executor.submit(set_tp_sl_short, coin, entry_price, amount)
 
             open_ms = (time.perf_counter() - t_start) * 1000
             # FIX-PERF: один print вместо двух — раньше OPEN-print + intermediate
@@ -1217,14 +1260,16 @@ def worker(coin: str, margin: float, t_start: float,
             # возвращается за ~10мкс, реальный HTTP уходит в фоне.
             # Информативный лог: источник, биржа исполнения, notional, маржа,
             # попытка — по нему сразу видно ОТКУДА сигнал и КАК исполнился.
+            # FIX 2026-07-07 (INVERT): venue шорта пишется в
+            # delist_api._delist_exchange (выставлен в market_open_short).
             try:
-                from api.listing_api import _last_exchange as _lx
+                from api.delist_api import _delist_exchange as _lx
                 venue = _lx.get(coin, "bybit").upper()
             except Exception:  # noqa: BLE001
                 venue = "?"
             notional = entry_price * amount if (entry_price and amount) else 0.0
             tg_log(
-                f"🟢 <b>LISTING LONG</b> <code>{coin}</code>\n"
+                f"🔴 <b>LISTING SHORT</b> <code>{coin}</code>\n"
                 f"📡 Источник: <b>{source}</b>\n"
                 f"🏦 Биржа: <b>{venue}</b>\n"
                 f"💵 Entry: <code>{entry_price}</code>\n"
@@ -1246,8 +1291,8 @@ def worker(coin: str, margin: float, t_start: float,
                       listing_exchange=lex)
             # Регистрируем позицию для отслеживания закрытого PnL (только Bybit).
             _register_pnl(coin, source, venue)
-            # Бэктест: пишем пост-входную траекторию цены (лонг).
-            _record_path(coin, "long", source, venue, entry_price)
+            # Бэктест: пишем пост-входную траекторию цены (ШОРТ — инверт).
+            _record_path(coin, "short", source, venue, entry_price)
             return
         except Exception as e:
             err_str = str(e)
@@ -1410,6 +1455,10 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None,
     if len(new_pairs) == 1:
         worker(new_pairs[0], margin, t_start, source, exchange=exchange)
     else:
+        # FIX 2026-07-07 (INVERT): batch-открытие (market_open_long_batch)
+        # открывало ЛОНГИ — для шорта batch-пути нет. Multi-coin →
+        # параллельные single-short workers через executor. Потеря ~100-800μs
+        # на burst vs batch — приемлемо, multi-coin листинги редки.
         for coin in new_pairs:
             _signal_executor.submit(worker, coin, margin, t_start, source,
                                     exchange=exchange)
@@ -1417,7 +1466,7 @@ def process_signal(pairs: list[str], source: str, t_start: float | None = None,
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     log_ok("LISTING", f"[{source}] Новый листинг!")
     log_info("LISTING", f"Монеты : {new_pairs}")
-    log_info("TRADE",   f"Маржа={margin} USDT | открываем {len(new_pairs)} лонг(ов)...")
+    log_info("TRADE",   f"Маржа={margin} USDT | открываем {len(new_pairs)} шорт(ов) [INVERT]...")
     print(f"{BOLD}{'═' * 60}{RESET}\n")
 
 
@@ -1520,10 +1569,15 @@ def run_telegram_listener() -> None:
         log_ok("TG", "Telethon подключён | сессия: listing_session")
 
         # FIX-batch-3: пробуем get_entity для каждого канала.
+        # FIX 2026-07-07: печатаем и числовой ID (-100...) — чтобы мапить
+        # source-теги из source_stats.json (TG:-100...) на юзернеймы
+        # и выпиливать бесполезные каналы по статистике.
         for ch in channels:
             try:
                 entity = await client.get_entity(ch)
-                log_ok("TG", f"  + {getattr(entity, 'title', ch)!r} (@{getattr(entity, 'username', '?')}) ✓")
+                eid = getattr(entity, "id", "?")
+                log_ok("TG", f"  + {getattr(entity, 'title', ch)!r} "
+                             f"(@{getattr(entity, 'username', '?')} | id=-100{eid}) ✓")
             except Exception as e:
                 log_warn("TG", f"  ! {ch}: {e}")
 
@@ -1700,6 +1754,24 @@ def run_bithumb_poller() -> None:
 # (~4.5KB vs 1.1KB). Защита от пропуска при бурсте, когда биржа
 # публикует несколько анонсов одновременно.
 BITHUMB_NOTICES_URL = "https://api.bithumb.com/v1/notices?count=20"
+# FIX 2026-06-18: 166 ReadTimeout'ов (timeout=2с) на проде — Bithumb из датацентрового
+# IP часто отвечает >2с. Поднимаем timeout и делаем ретрай на ДРУГОМ IP (round-robin
+# сессия) перед тем как сдаться: одиночный таймаут конкретного IP больше не теряет нотис.
+BITHUMB_NOTICE_TIMEOUT = float(os.getenv("BITHUMB_NOTICE_TIMEOUT", "4.0"))
+
+
+def _bithumb_get_notices(timeout: float = BITHUMB_NOTICE_TIMEOUT):
+    """GET /v1/notices с ретраем на другой round-robin сессии (другой IP).
+    Возвращает распарсенный JSON (list) или поднимает последнее исключение."""
+    last_exc = None
+    for _ in range(2):   # 2 попытки: разные IP из пула — лечит транзиентный таймаут IP
+        try:
+            resp = _next_listing_session().get(BITHUMB_NOTICES_URL, timeout=timeout)
+            resp.raise_for_status()
+            return _json_loads(resp.content)
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+    raise last_exc
 
 # Категории-стопы (поле "categories" в JSON). Bithumb сам помечает анонс.
 _BITHUMB_NOTICE_NEG_CATEGORIES = {
@@ -1775,10 +1847,8 @@ def run_bithumb_announcement_poller() -> None:
     while seen_ids is None:
         init_attempt += 1
         try:
-            resp = _next_listing_session().get(BITHUMB_NOTICES_URL, timeout=4)
-            resp.raise_for_status()
             tmp: set[str] = set()
-            for item in _json_loads(resp.content):
+            for item in _bithumb_get_notices():
                 url = (item or {}).get("pc_url", "")
                 m = _BITHUMB_NOTICE_ID_RE.search(url)
                 if m:
@@ -1795,13 +1865,12 @@ def run_bithumb_announcement_poller() -> None:
         try:
             time.sleep(BITHUMB_NOTICE_POLL_INTERVAL)
             t_send = time.perf_counter()
-            # FIX-LATENCY: новая сессия (round-robin) на КАЖДЫЙ запрос —
-            # размазывает нагрузку по IP'ам, минимизирует 429 от Bithumb.
-            resp = _next_listing_session().get(BITHUMB_NOTICES_URL, timeout=2)
-            resp.raise_for_status()
+            # FIX-LATENCY: round-robin сессия на КАЖДЫЙ запрос (размазывает нагрузку
+            # по IP). FIX 2026-06-18: + ретрай на другом IP и timeout 4с (было 2с —
+            # 166 таймаутов теряли нотисы).
+            items = _bithumb_get_notices()
             t_recv = time.perf_counter()
 
-            items = _json_loads(resp.content)
             if not isinstance(items, list):
                 continue
 
@@ -1839,7 +1908,7 @@ def run_bithumb_announcement_poller() -> None:
                 process_signal(tickers, "BITHUMB-NOTICE", t_start=t_send)
 
         except Exception as e:
-            log_err("BITHUMB-NOTICE", f"poll error: {type(e).__name__}: {e}")
+            _log_poll_error_throttled("BITHUMB-NOTICE", e)
             _hstat("error", "BITHUMB-NOTICE")
             time.sleep(POLL_ERROR_BACKOFF)
 
@@ -2236,7 +2305,7 @@ def run_upbit_announcement_poller() -> None:
                 time.sleep(cur_interval)
 
         except Exception as e:
-            log_err("UPBIT-NOTICE", f"poll error: {type(e).__name__}: {e}")
+            _log_poll_error_throttled("UPBIT-NOTICE", e)
             _hstat("error", "UPBIT-NOTICE")
             time.sleep(POLL_ERROR_BACKOFF)
 
@@ -2503,7 +2572,7 @@ def run_binance_announcement_poller() -> None:
 
         except Exception as e:
             # FIX (review M0): тип ошибки → отличить parse от network в логе.
-            log_err("BINANCE-NOTICE", f"poll error: {type(e).__name__}: {e}")
+            _log_poll_error_throttled("BINANCE-NOTICE", e)
             _hstat("error", "BINANCE-NOTICE")
             time.sleep(POLL_ERROR_BACKOFF)
 
@@ -2890,6 +2959,20 @@ if __name__ == "__main__":
                 log_warn("PARSER", "Bybit ASYNC WS не подключился за 8с — fallback на REST")
         except Exception as e:
             log_err("PARSER", f"Bybit ASYNC WS init упал: {e!r} — будет REST")
+
+        # FIX 2026-06-19 (R3): private WS (order+position). Без wallet.
+        # Используется в _set_tp_sl_bybit для замены REST poll'инга позиции.
+        from config.config import BYBIT_WS_PRIVATE_ENABLED
+        if BYBIT_WS_PRIVATE_ENABLED:
+            try:
+                from api import bybit_ws_private as _priv_mod
+                priv_inst = _priv_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                if priv_inst.is_ready(wait_sec=5.0):
+                    log_ok("PARSER", "Bybit PRIVATE WS (order+position) готов ✓")
+                else:
+                    log_warn("PARSER", "Bybit PRIVATE WS не подключился за 5с — fallback на REST poll")
+            except Exception as e:
+                log_warn("PARSER", f"Bybit PRIVATE WS init упал: {e!r} — fallback на REST poll")
     else:
         log_info("PARSER", "Bybit WS Trade отключён — используем REST")
 
@@ -2925,12 +3008,14 @@ if __name__ == "__main__":
     #      json.dumps, ws.send (диверсия в cancel-fake — никаких ордеров).
     # ~600мс на бутстрапе → первый реальный листинг 5-9мс вместо 27мс cold.
     try:
-        from api.listing_api import warmup_chain as _lst_warmup_chain
+        # FIX 2026-07-07 (INVERT): листинг открывает ШОРТ → греем short-путь
+        # (delist_api.warmup_chain), а не лонговый.
+        from api.delist_api import warmup_chain as _short_warmup_chain
         sample_signal = "[BITHUMB] $BTC listed on Bithumb"
         for _ in range(30):
             find_listing_pairs(sample_signal)
-        ok = _lst_warmup_chain(n=30)
-        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_long path×{ok}/30 ✓")
+        ok = _short_warmup_chain(n=30)
+        log_ok("PARSER", f"Chain warmup: regex×30 + market_open_short path×{ok}/30 ✓")
     except Exception as e:  # noqa: BLE001
         log_warn("PARSER", f"Chain warmup упал: {e!r} — первый листинг будет медленнее")
 
@@ -2967,7 +3052,8 @@ if __name__ == "__main__":
     # datacenter proxy-пуле (pool=4) Cloudflare на api-manager.upbit.com банит
     # все IP наглухо — за прогон 4712 CF-1015 троттлов, 0 успешных ответов,
     # 0 пойманных листингов. Backoff/breaker это не лечат (проблема в самих
-    # флагнутых IP, не в частоте). Upbit-покрытие держат Seoul-relay + TG + TOA.
+    # флагнутых IP, не в частоте). FIX 2026-07-07: Seoul-relay удалён —
+    # Upbit-покрытие держат TG + TOA (+ CoinListing при валидном ключе).
     # Включить обратно: UPBIT_DIRECT_POLLER_ENABLED=1 (нужны корейские
     # residential прокси, иначе снова throttle-storm).
     if UPBIT_DIRECT_POLLER_ENABLED:
@@ -2978,7 +3064,7 @@ if __name__ == "__main__":
         ).start()
     else:
         log_warn("UPBIT-NOTICE", "direct-поллер ОТКЛЮЧЁН (UPBIT_DIRECT_POLLER_ENABLED=0) "
-                                 "— Upbit идёт через Seoul-relay + TG + TOA")
+                                 "— Upbit идёт через TG + TOA + CoinListing")
     threading.Thread(
         target=run_binance_announcement_poller,
         daemon=True,
@@ -3008,16 +3094,15 @@ if __name__ == "__main__":
     ).start()
     log_ok("STATS", "source-first телеметрия активна (persist 5мин, summary 6ч)")
 
-    # Health-stats: персистентность + периодический TG-отчёт «слабые места».
+    # Health-stats: только персистентность метрик. FIX 2026-06-18: TG-отчёт
+    # «слабые места» каждые 6ч отключён по запросу. Сбор _hstat и persist_loop
+    # остались (метрики копятся на диск).
     if _health is not None:
         threading.Thread(
             target=_health.persist_loop, kwargs={"batch_sec": 30.0},
             daemon=True, name="health-persist",
         ).start()
-        threading.Thread(
-            target=_health_report_loop, daemon=True, name="health-report",
-        ).start()
-        log_ok("HEALTH", "диагностика слабых мест активна (TG-отчёт каждые 6ч)")
+        log_ok("HEALTH", "сбор диагностики листинга активен (TG-отчёт отключён)")
 
     # Price-recorder: захват «головы» входа (первые 10 мин) для бэктеста выходов.
     if _recorder is not None:
@@ -3065,32 +3150,10 @@ if __name__ == "__main__":
         except Exception as e:
             log_err("PARSER", f"Не удалось запустить TOA WS: {e}")
 
-    # FIX-LATENCY (Patch #1): Seoul edge-нода. Если SEOUL_RELAY_URL задан —
-    # подключаемся к Seoul WS и получаем сигналы за ~85-120мс KR→SG (vs
-    # ~240мс прямым поллингом из SG). См. seoul_relay/README.md для
-    # деплоя серверной части.
-    if SEOUL_RELAY_URL:
-        try:
-            from api.seoul_relay_receiver import run_seoul_relay_listener
-            def _on_seoul_listing(tickers: list[str], source: str, t_start: float) -> None:
-                # source приходит как SEOUL-RELAY-BITHUMB / SEOUL-RELAY-UPBIT —
-                # биржа в теге, _resolve_exchange извлечёт → per-exchange L2.
-                process_signal(tickers, source, t_start=t_start)
-            threading.Thread(
-                target=run_seoul_relay_listener,
-                kwargs={
-                    "url": SEOUL_RELAY_URL,
-                    "listing_callback": _on_seoul_listing,
-                    "on_disconnect": lambda: _hstat("disconnect", "SEOUL-RELAY"),
-                },
-                daemon=True,
-                name="seoul-relay-rx",
-            ).start()
-            log_ok("PARSER", f"Seoul relay listener подключён → {SEOUL_RELAY_URL.split('?', 1)[0]}")
-        except Exception as e:
-            log_err("PARSER", f"Не удалось запустить Seoul relay: {e!r}")
-    else:
-        log_info("PARSER", "SEOUL_RELAY_URL пуст — Seoul relay отключён (см. seoul_relay/README.md)")
+    # FIX 2026-07-07: Seoul relay (edge-нода) УДАЛЁН по решению — сервис был
+    # мёртв (вечный reconnect), выигрывал всего 5 сигналов за всю статистику,
+    # TOA-WS + CoinListing + TG перекрывают. Код: api/seoul_relay_receiver.py
+    # удалён, серверная часть seoul_relay/ остановлена на VPS.
 
     log_ok("PARSER", "Запускаем Telegram listener (нужна авторизация при первом запуске)...")
     tg_log("🚀 <b>LISTING парсер запущен</b>\nUpbit + Bithumb + Telegram + Watchdog")
