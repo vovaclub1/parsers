@@ -80,6 +80,44 @@ CREATE TABLE IF NOT EXISTS position_events (
 );
 CREATE INDEX IF NOT EXISTS idx_position_events_key_ts
     ON position_events(venue, symbol, position_idx, ts_ns);
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    client_order_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    signal_id TEXT NOT NULL DEFAULT '',
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    bid REAL NOT NULL,
+    ask REAL NOT NULL,
+    bid_qty REAL NOT NULL DEFAULT 0,
+    ask_qty REAL NOT NULL DEFAULT 0,
+    mid REAL NOT NULL,
+    spread_bps REAL NOT NULL,
+    depth_bids_json TEXT NOT NULL DEFAULT '[]',
+    depth_asks_json TEXT NOT NULL DEFAULT '[]',
+    ts_ns INTEGER NOT NULL,
+    PRIMARY KEY(client_order_id, stage)
+);
+
+CREATE TABLE IF NOT EXISTS market_snapshot_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_order_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    signal_id TEXT NOT NULL DEFAULT '',
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    bid REAL NOT NULL,
+    ask REAL NOT NULL,
+    bid_qty REAL NOT NULL DEFAULT 0,
+    ask_qty REAL NOT NULL DEFAULT 0,
+    mid REAL NOT NULL,
+    spread_bps REAL NOT NULL,
+    depth_bids_json TEXT NOT NULL DEFAULT '[]',
+    depth_asks_json TEXT NOT NULL DEFAULT '[]',
+    ts_ns INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_snapshot_events_link_stage
+    ON market_snapshot_events(client_order_id, stage, ts_ns);
 """
 
 
@@ -220,6 +258,62 @@ class ExecutionStore:
                        trailing_stop,ts_ns,raw_json) VALUES(?,?,?,?,?,?,?,?,?)""",
                 values + (_json(raw),),
             )
+
+    def record_market_snapshot(
+        self, *, signal_id: str, client_order_id: str, venue: str,
+        symbol: str, stage: str, bid: float, ask: float,
+        bid_qty: float = 0, ask_qty: float = 0,
+        depth_bids=None, depth_asks=None, ts_ns: int | None = None,
+    ) -> None:
+        from research.tca import bbo_metrics
+        metrics = bbo_metrics(bid, ask)
+        ts = int(ts_ns if ts_ns is not None else time.time_ns())
+        values = (
+            client_order_id, stage, signal_id or "", venue, symbol,
+            float(bid), float(ask), float(bid_qty or 0), float(ask_qty or 0),
+            metrics["mid"], metrics["spread_bps"],
+            _json(depth_bids or []), _json(depth_asks or []), ts,
+        )
+        with self._lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO market_snapshots(
+                       client_order_id,stage,signal_id,venue,symbol,bid,ask,
+                       bid_qty,ask_qty,mid,spread_bps,depth_bids_json,
+                       depth_asks_json,ts_ns) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(client_order_id,stage) DO UPDATE SET
+                       signal_id=excluded.signal_id,venue=excluded.venue,
+                       symbol=excluded.symbol,bid=excluded.bid,ask=excluded.ask,
+                       bid_qty=excluded.bid_qty,ask_qty=excluded.ask_qty,
+                       mid=excluded.mid,spread_bps=excluded.spread_bps,
+                       depth_bids_json=excluded.depth_bids_json,
+                       depth_asks_json=excluded.depth_asks_json,
+                       ts_ns=excluded.ts_ns""",
+                values,
+            )
+            self.connection.execute(
+                """INSERT INTO market_snapshot_events(
+                       client_order_id,stage,signal_id,venue,symbol,bid,ask,
+                       bid_qty,ask_qty,mid,spread_bps,depth_bids_json,
+                       depth_asks_json,ts_ns) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                values,
+            )
+
+    def get_market_snapshot(self, client_order_id: str, stage: str) -> dict | None:
+        with self._lock:
+            row = self.connection.execute(
+                """SELECT * FROM market_snapshots
+                   WHERE client_order_id=? AND stage=?""",
+                (client_order_id, stage),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def count_market_snapshot_events(self, client_order_id: str, stage: str) -> int:
+        with self._lock:
+            return int(self.connection.execute(
+                """SELECT COUNT(*) FROM market_snapshot_events
+                   WHERE client_order_id=? AND stage=?""",
+                (client_order_id, stage),
+            ).fetchone()[0])
 
     def get_order(self, client_order_id: str) -> dict | None:
         with self._lock:
