@@ -31,7 +31,7 @@ import uuid
 from typing import Any
 
 import websockets
-from websockets.exceptions import ConnectionClosedError
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 try:
     import orjson as _orjson  # type: ignore[import-not-found]
@@ -113,6 +113,10 @@ class BybitWsTrade:
         self._connected = threading.Event()
         self._pending:  dict[str, asyncio.Future] = {}
         self._pending_lock = threading.Lock()
+        # FIX: threading.Lock для защиты self._ws от race condition между
+        # reader thread (который может сбросить в None) и caller threads
+        # (которые читают для place_order_fast). Без него возможны дубликаты.
+        self._ws_lock = threading.Lock()
         # FIX: asyncio.Lock защищает от concurrent ws.send из разных корутин.
         # Без него современные `websockets` бросают ConcurrencyError, а старые
         # перемешивают кадры. Создаётся лениво в loop-потоке (asyncio.Lock
@@ -214,6 +218,20 @@ class BybitWsTrade:
                         # неудачная auth получала минимальный delay → hot-loop.
                         # Теперь явно поднимаем backoff здесь.
                         print(f"[BYBIT-WS] auth failed: {auth_resp} — reconnect через {delay:.0f}с", flush=True)
+                        # FIX 2026-07-08: истёкший/невалидный ключ — громкий
+                        # TG-алерт (раз в час), иначе тонет в stdout и вся
+                        # Bybit-торговля молча умирает (NEO-инцидент).
+                        try:
+                            from tg.tg_logger import tg_alert_throttled
+                            tg_alert_throttled(
+                                "bybit-auth-fail",
+                                f"🚨 <b>BYBIT AUTH FAIL</b>\n"
+                                f"retCode={ret_code} "
+                                f"msg={auth_resp.get('retMsg', '?')}\n"
+                                f"Проверь/обнови API-ключ — ордера НЕ открываются!",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                         self._ws = None
                         await asyncio.sleep(delay)
                         delay = min(delay * 2, _RECONNECT_DELAY_MAX)
@@ -226,7 +244,10 @@ class BybitWsTrade:
                     async for raw in ws:
                         try:
                             msg = _json_loads(raw)
-                        except Exception:
+                        except Exception as e:  # noqa: BLE001
+                            # FIX (review): не глотаем молча — malformed frame
+                            # может сигналить о смене протокола/обрезке.
+                            print(f"[BYBIT-WS] bad frame skipped: {type(e).__name__} | {raw[:120]!r}", flush=True)
                             continue
                         await self._dispatch(msg)
 
@@ -469,10 +490,15 @@ class BybitWsTrade:
           None       — WS не подключён ИЛИ transport-ошибка при send → REST fallback.
           dict       — frame ушёл на провод; ack ждём в фоне.
         """
-        if not self._connected.is_set():
-            return None
-        if self._loop is None or self._ws is None:
-            return None
+        # FIX: race condition — читаем self._ws под lock перед использованием
+        with self._ws_lock:
+            if not self._connected.is_set():
+                return None
+            if self._loop is None or self._ws is None:
+                return None
+            # Фиксируем локальные копии под lock
+            loop = self._loop
+            ws = self._ws
 
         req_id = str(uuid.uuid4())
         ts_ms  = str(int(time.time() * 1000))
@@ -493,16 +519,18 @@ class BybitWsTrade:
         send_err: list[str] = []
 
         async def _send_and_track() -> None:
-            loop = asyncio.get_running_loop()
+            loop_inner = asyncio.get_running_loop()
             # Регистрируем future, чтобы reader-loop (_dispatch) мог
             # доставить ack. _watch_ack ждёт его в фоне и логирует reject.
-            fut: asyncio.Future = loop.create_future()
+            fut: asyncio.Future = loop_inner.create_future()
             with self._pending_lock:
                 self._pending[req_id] = fut
-            loop.create_task(self._watch_ack(req_id, fut, symbol))
+            loop_inner.create_task(self._watch_ack(req_id, fut, symbol))
 
             try:
-                ws = self._ws
+                # FIX: повторная проверка ws внутри coroutine (может стать None
+                # между outer check и этим моментом). Используем зафиксированный
+                # ws из outer scope, но проверяем что он всё ещё валиден.
                 if ws is None:
                     send_err.append("ws_none")
                     return
@@ -513,14 +541,18 @@ class BybitWsTrade:
                         await ws.send(payload_str)
                 else:
                     await ws.send(payload_str)
-            except (ConnectionClosedError, OSError, AttributeError) as e:
+            except (ConnectionClosedError, ConnectionClosedOK) as e:
+                # FIX: если ws закрылся между check и send, ловим и возвращаем
+                # None для REST fallback (вместо partial send + REST = дубликат)
+                send_err.append(f"connection_closed: {type(e).__name__}")
+            except (OSError, AttributeError) as e:
                 send_err.append(f"transport: {type(e).__name__}: {e}")
             except Exception as e:  # noqa: BLE001
                 send_err.append(repr(e))
             finally:
                 send_done.set()
 
-        asyncio.run_coroutine_threadsafe(_send_and_track(), self._loop)
+        asyncio.run_coroutine_threadsafe(_send_and_track(), loop)
 
         # Ждём только окончания send (это ~1-5мс, локально), не ack.
         # 0.5с — потолок на случай зависшего loop'а; в норме сразу.
@@ -648,6 +680,48 @@ def place_order_ws_fast(args: dict, _warmup_mode: bool = False) -> dict | None:
         inst.warmup(timeout=0.5)
         return {"sent": True, "reqId": "warmup-mode"}
     return inst.place_order_fast(args)
+
+
+def place_batch_orders_ws_ack(args_list: list[dict],
+                              timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
+    """
+    FIX 2026-06-19 (R2): batch ack-waiting. N ордеров → 1 WS-фрейм через
+    op:order.create-batch. Маршрутизация ТОЛЬКО через sync (async-клиент
+    батч не поддерживает; если sync не подключён — caller fallback к
+    per-order REST).
+
+    Возврат:
+      dict — ack от Bybit. result.list / retExtInfo.list содержат per-order
+             retCode/retMsg. Caller сам парсит.
+      None — sync не подключён / таймаут → caller fallback per-order.
+    """
+    sync = _sync_preferred
+    if sync is None or not sync.is_ready():
+        return None
+    return sync.place_batch_orders(args_list, timeout=timeout)
+
+
+def place_order_ws_ack(args: dict, timeout: float = _ORDER_ACK_TIMEOUT) -> dict | None:
+    """
+    FIX 2026-06-05: ack-waiting вариант с той же sync→async маршрутизацией,
+    что place_order_ws_fast. Нужен для ретраев на 30208 (price-cap): caller
+    должен ЗНАТЬ retCode, чтобы решить ретраить или нет.
+
+    Возврат:
+      dict с retCode (0=ok, !=0=reject) — ack от Bybit получен.
+      None — WS не подключён / таймаут ack → caller делает REST fallback.
+    """
+    sync = _sync_preferred
+    if sync is not None and sync.is_ready():
+        result = sync.place_order(args, timeout=timeout)
+        if result is not None:
+            return result
+        # sync вернул None (transport/таймаут) — пробуем async.
+
+    inst = _global_instance
+    if inst is None:
+        return None
+    return inst.place_order(args, timeout=timeout)
 
 
 # ── периодический прогрев hot-path ────────────────────────────────

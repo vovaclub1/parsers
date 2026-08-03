@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import websockets
@@ -47,6 +49,11 @@ _RECONNECT_DELAY_MIN = 1.0
 _RECONNECT_DELAY_MAX = 30.0
 _PING_INTERVAL       = 20.0
 _PING_TIMEOUT        = 10.0
+
+# S1: long-lived пул вместо threading.Thread(...).start() на каждое сообщение
+# (как уже сделано в parser_delist/parser_listing). Спавн нового OS-потока =
+# syscall + GIL ~50-200µs на сообщение; submit в тёплый пул ~5-20µs.
+_toa_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="toa-cb")
 
 
 # Keywords для классификации сообщений.
@@ -121,13 +128,49 @@ LISTING_NEG = [
     # FIX: Earn / Launchpool / promo — раскрываем в общий LISTING_NEG
     # чтобы не дублировать сравнение в _classify.
     *_EARN_PROMO_NEG,
+    # FIX 2026-06-02: Pre-IPO / TradFi (Anthropic, OpenAI ... Perpetual
+    # Contract Pre-IPO Trading). Те же фильтры что в parser_listing.TG_LISTING_NEG.
+    "pre-ipo", "pre ipo",
+    "tradfi",
+    "perpetual contract pre",
+    "multiple usd",
+    "multiple usdⓈ",
+    # FIX 2026-06-05: новостные/регуляторные заголовки. Инцидент: TOA Scrapers
+    # прислал "SEC Proposes New Listing Criteria for Crypto-Based Options on
+    # Commodity Trusts: Filing" → "new listing" дало listing-классификацию →
+    # parser выдрал BASED из "crypto-Based" → ложный лонг. Эти фразы есть в
+    # новостях/регуляторике, но НИКОГДА в терсном анонсе "X: New Listing: TICKER"
+    # / "Will List" / корейском "마켓 추가", поэтому реальные листинги не задеты.
+    # source=Scrapers НЕ блокируем — оттуда идут и реальные Robinhood-листинги.
+    "listing criteria",
+    "proposes", "proposal",
+    "filing",
+    "lawsuit", "court", "ruling",
+    "regulator", "regulatory", "regulation",
+    "commodity trust",
+    "options on",
+    "settlement",
+    "investigation",
+    " sec ",   # с пробелами — только отдельное слово SEC, не Secret/SECID
+    # FIX 2026-06-05: Bybit-листинги — НЕ торгуем (открываем позицию НА Bybit,
+    # листинг там не даёт пампа). Инцидент ZEST через TG, защита и для TOA.
+    "listed on bybit", "bybit futures", "on bybit futures",
 ]
+
+
+# FIX-perf: компилируем фильтры в regex-альтернацию ОДИН раз из списков выше
+# (списки — источник правды). re.search по DFA вместо N×substring-сканов в
+# hot-path WS-классификатора (~10-30µs/сообщение).
+_DELIST_KW_RE   = re.compile("|".join(re.escape(k) for k in DELIST_KEYWORDS))
+_LISTING_KW_RE  = re.compile("|".join(re.escape(k) for k in LISTING_KEYWORDS))
+_DELIST_NEG_RE  = re.compile("|".join(re.escape(k) for k in DELIST_NEG))
+_LISTING_NEG_RE = re.compile("|".join(re.escape(k) for k in LISTING_NEG))
 
 
 def _classify(text: str) -> str | None:
     tl = text.lower()
-    has_delist = any(kw in tl for kw in DELIST_KEYWORDS)
-    has_listing = any(kw in tl for kw in LISTING_KEYWORDS)
+    has_delist = bool(_DELIST_KW_RE.search(tl))
+    has_listing = bool(_LISTING_KW_RE.search(tl))
 
     # FIX: если в одном сообщении есть И delist И listing-фразы (например,
     # "We will delist X and will list Y") — не классифицируем как одно,
@@ -137,11 +180,11 @@ def _classify(text: str) -> str | None:
         return None
 
     if has_delist:
-        if any(neg in tl for neg in DELIST_NEG):
+        if _DELIST_NEG_RE.search(tl):
             return None
         return "delist"
     if has_listing:
-        if any(neg in tl for neg in LISTING_NEG):
+        if _LISTING_NEG_RE.search(tl):
             return None
         return "listing"
     return None
@@ -149,12 +192,18 @@ def _classify(text: str) -> str | None:
 
 async def _listener(
     delist_callback: Callable[[str, float], None] | None,
-    listing_callback: Callable[[str, float], None] | None,
+    listing_callback: Callable[[str, float, str], None] | None,
+    on_disconnect: Callable[[], None] | None = None,
 ) -> None:
     """
     Основной цикл WS-листенера. Reconnect с exp backoff.
-    Колбэки вызываются как (text, t_start). Они должны быть thread-safe
-    и БЫСТРЫЕ (не блокировать loop) — в идеале запускают threading.Thread.
+    Колбэки вызываются как delist_callback(text, t_start) и
+    listing_callback(text, t_start, source) — последний получает msg.source
+    ("Binance"/"Upbit"/...) для per-exchange L2-дедупа. Оба должны быть
+    thread-safe и БЫСТРЫЕ (не блокировать loop) — в идеале запускают
+    threading.Thread.
+    on_disconnect() — опциональный thread-safe колбэк, вызывается при каждом
+    разрыве WS (для health-метрики disconnect). Должен быть быстрым и не падать.
     """
     delay = _RECONNECT_DELAY_MIN
 
@@ -191,29 +240,44 @@ async def _listener(
                         continue
 
                     short = title[:120].replace("\n", " ")
-                    print(f"[TOA-WS] [{kind.upper()}] ({source}) {short}", flush=True)
+                    # FIX 2026-06-12: реальная задержка «биржа опубликовала → мы
+                    # получили». TOA шлёт epoch публикации в msg['time'] (ms). Это
+                    # показывает, насколько поздно нас доходит сигнал (корень
+                    # «вошли на пике»). 0 если поля нет/часы расходятся.
+                    lag_str = ""
+                    try:
+                        pub_ms = int(msg.get("time") or 0)
+                        if pub_ms > 0:
+                            lag_ms = time.time() * 1000.0 - pub_ms
+                            if -2000 < lag_ms < 600000:   # отсекаем мусор/рассинхрон часов
+                                lag_str = f" | задержка {lag_ms:.0f}мс"
+                    except (TypeError, ValueError):
+                        pass
+                    print(f"[TOA-WS] [{kind.upper()}] ({source}) {short}{lag_str}", flush=True)
 
-                    # Передаём в callback в отдельном thread — НЕ блокируем
-                    # WS loop никакими сетевыми запросами.
+                    # Передаём в callback через пул — НЕ блокируем WS loop
+                    # сетевыми запросами и не платим за спавн потока (S1).
                     if kind == "delist" and delist_callback:
-                        threading.Thread(
-                            target=delist_callback,
-                            args=(full_text, t_start),
-                            daemon=True,
-                            name="toa-delist-cb",
-                        ).start()
+                        _toa_executor.submit(delist_callback, full_text, t_start)
                     elif kind == "listing" and listing_callback:
-                        threading.Thread(
-                            target=listing_callback,
-                            args=(full_text, t_start),
-                            daemon=True,
-                            name="toa-listing-cb",
-                        ).start()
+                        # FIX 2026-06-02: прокидываем msg.source ("Binance"/
+                        # "Upbit"/"Bithumb") в callback — для per-exchange L2.
+                        _toa_executor.submit(listing_callback, full_text, t_start, source)
 
         except (ConnectionClosedError, OSError, asyncio.TimeoutError) as e:
             print(f"[TOA-WS] разрыв: {e} — переподключение через {delay:.0f}с", flush=True)
+            if on_disconnect is not None:
+                try:
+                    on_disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:
             print(f"[TOA-WS] неожиданная ошибка: {e!r}", flush=True)
+            if on_disconnect is not None:
+                try:
+                    on_disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
 
         await asyncio.sleep(delay)
         delay = min(delay * 2, _RECONNECT_DELAY_MAX)
@@ -221,7 +285,8 @@ async def _listener(
 
 def run_tree_of_alpha_listener(
     delist_callback: Callable[[str, float], None] | None = None,
-    listing_callback: Callable[[str, float], None] | None = None,
+    listing_callback: Callable[[str, float, str], None] | None = None,
+    on_disconnect: Callable[[], None] | None = None,
 ) -> None:
     """
     Точка входа для запуска в отдельном thread.
@@ -250,12 +315,20 @@ def run_tree_of_alpha_listener(
     # ошибок верхнего уровня. После 5 крашей подряд — сдаёмся.
     try:
         consecutive_failures = 0
+        _last_crash_at = 0.0
         while consecutive_failures < 5:
             try:
-                loop.run_until_complete(_listener(delist_callback, listing_callback))
+                loop.run_until_complete(_listener(delist_callback, listing_callback, on_disconnect))
                 # _listener вернулся без исключения (что нормально только при stop) — выходим.
                 break
             except Exception as e:  # noqa: BLE001
+                # FIX (review): сбрасываем счётчик если с прошлого краша прошло
+                # >60с — значит listener работал нормально, краши НЕ «подряд».
+                # Иначе 5 редких крашей за всё время убивали источник навсегда.
+                now = time.monotonic()
+                if now - _last_crash_at > 60.0:
+                    consecutive_failures = 0
+                _last_crash_at = now
                 consecutive_failures += 1
                 print(
                     f"[TOA-WS] listener crashed ({consecutive_failures}/5): {e!r} — restart через 5с",
@@ -266,6 +339,6 @@ def run_tree_of_alpha_listener(
                 except Exception:
                     time.sleep(5)
         else:
-            print("[TOA-WS] 5 крашей подряд — listener остановлен", flush=True)
+            print("[TOA-WS] 5 крашей за <60с — listener остановлен", flush=True)
     finally:
         loop.close()

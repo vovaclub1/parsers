@@ -1,0 +1,27 @@
+services:
+  relay:
+    build: .
+    container_name: seoul-relay
+    restart: unless-stopped
+    ports:
+      # 0.0.0.0:8765 — порт открыт на всех интерфейсах. Доступ
+      # ограничивается firewall'ом (UFW / провайдер) — см. README.md.
+      - "8765:8765"
+    environment:
+      RELAY_PORT: "8765"
+      RELAY_SECRET: "${RELAY_SECRET:?RELAY_SECRET не задан в .env}"
+      BITHUMB_POLL_MS: "${BITHUMB_POLL_MS:-50}"
+      UPBIT_POLL_MS: "${UPBIT_POLL_MS:-80}"
+      # FIX: Korean residential proxies для обхода CF на Upbit.
+      # CSV через запятую, формат socks5://user:pass@host:port или
+      # http://user:pass@host:port. Если пусто — Upbit poll пойдёт direct
+      # (на Korean DC IP CF режет 403 — реальное значение этих прокси).
+      UPBIT_PROXIES: "${UPBIT_PROXIES:-}"
+      UPBIT_IMPERSONATE: "${UPBIT_IMPERSONATE:-chrome124}"
+      UPBIT_ENABLED: "${UPBIT_ENABLED:-1}"
+    # Ротация логов — без неё docker логи копят гигабайтами в /var/lib/docker
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -1,0 +1,40 @@
+# FIX: исключаем секретные и ненужные файлы из образа
+# Они монтируются через volumes в docker-compose.yml
+
+# Секреты (монтируются через volumes)
+.env
+**/.env
+*.session
+*.session-*
+state/
+
+# Диагностические скрипты relay не нужны runtime-образу. Ранее два из них
+# содержали реальные proxy credentials.
+seoul_relay/test_*.py
+
+# Виртуальное окружение
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Логи и временные файлы
+*.log
+*.tmp
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Git
+.git/
+.gitignore
+
+# Локальные тестовые/исследовательские артефакты
+.pytest_cache/
+.ruff_cache/
+tests/
+knowledge/
+PRODUCTION_BASELINE.md
