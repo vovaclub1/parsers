@@ -67,6 +67,10 @@ try:
     class _BybitTicker(_msgspec.Struct, frozen=True):
         symbol:    str = ""
         lastPrice: str = ""
+        bid1Price: str = ""
+        ask1Price: str = ""
+        bid1Size: str = ""
+        ask1Size: str = ""
 
     # Поле называется `list` (как в JSON), но в аннотации используем
     # typing.List — иначе `from __future__ import annotations` превращает
@@ -260,10 +264,47 @@ EXCLUDED_TOKENS = EXCLUDED_TOKENS - AMBIGUOUS_TOKENS
 
 # ── Кэш цен ──────────────────────────────────────────────────────
 price_cache: dict[str, float] = {}
+_bbo_cache: dict[str, dict[str, float]] = {}
 price_cache_prev: dict[str, float] = {}   # снапшот предыдущего цикла (~2с назад)
 _price_prev_at = 0.0
 cache_lock  = threading.Lock()
 known_coins: set[str] = set()
+
+
+def _replace_market_cache(markets: dict[str, dict], updated_at: float | None = None) -> None:
+    global _price_cache_updated_at
+    ts = time.monotonic() if updated_at is None else float(updated_at)
+    new_prices = {}
+    new_bbo = {}
+    for coin, row in markets.items():
+        last = float(row.get("last", 0) or 0)
+        if last > 0:
+            new_prices[f"{coin}/USDT:USDT"] = last
+        bid, ask = float(row.get("bid", 0) or 0), float(row.get("ask", 0) or 0)
+        if bid > 0 and ask > bid:
+            new_bbo[coin] = {
+                "bid1Price": bid, "ask1Price": ask,
+                "bid1Size": float(row.get("bid_qty", 0) or 0),
+                "ask1Size": float(row.get("ask_qty", 0) or 0),
+                "updated_at": ts,
+            }
+    with cache_lock:
+        price_cache.clear()
+        price_cache.update(new_prices)
+        _bbo_cache.clear()
+        _bbo_cache.update(new_bbo)
+        known_coins.clear()
+        known_coins.update(markets.keys())
+        _price_cache_updated_at = ts
+
+
+def get_bbo(coin: str, now: float | None = None) -> dict | None:
+    current = time.monotonic() if now is None else float(now)
+    with cache_lock:
+        row = _bbo_cache.get(coin)
+        if row is None or current - row["updated_at"] > _PRICE_STALE_SEC:
+            return None
+        return dict(row)
 
 # FIX (review high): монотонный timestamp последнего УСПЕШНОГО обновления.
 # Без него при сбое Bybit (outage / parse-fail) price_updater молча
@@ -764,6 +805,7 @@ def price_updater() -> None:
             resp.raise_for_status()
 
             new_cache: dict[str, float] = {}
+            new_bbo: dict[str, dict[str, float]] = {}
             new_known: set[str] = set()
 
             if use_msgspec:
@@ -778,6 +820,17 @@ def price_updater() -> None:
                             continue
                         coin = symbol[:-4]
                         new_cache[coin + "/USDT:USDT"] = price
+                        try:
+                            bid, ask = float(tk.bid1Price or 0), float(tk.ask1Price or 0)
+                            if bid > 0 and ask > bid:
+                                new_bbo[coin] = {
+                                    "bid1Price": bid, "ask1Price": ask,
+                                    "bid1Size": float(tk.bid1Size or 0),
+                                    "ask1Size": float(tk.ask1Size or 0),
+                                    "updated_at": time.monotonic(),
+                                }
+                        except (TypeError, ValueError):
+                            pass
                         new_known.add(coin)
             else:
                 items = _json_loads(resp.content).get("result", {}).get("list", [])
@@ -788,6 +841,19 @@ def price_updater() -> None:
                         price = float(last_price)
                         key = symbol[:-4] + "/USDT:USDT"
                         new_cache[key] = price
+                        coin = symbol[:-4]
+                        try:
+                            bid = float(item.get("bid1Price", 0) or 0)
+                            ask = float(item.get("ask1Price", 0) or 0)
+                            if bid > 0 and ask > bid:
+                                new_bbo[coin] = {
+                                    "bid1Price": bid, "ask1Price": ask,
+                                    "bid1Size": float(item.get("bid1Size", 0) or 0),
+                                    "ask1Size": float(item.get("ask1Size", 0) or 0),
+                                    "updated_at": time.monotonic(),
+                                }
+                        except (TypeError, ValueError):
+                            pass
                         new_known.add(symbol[:-4])
 
             with cache_lock:
@@ -801,6 +867,8 @@ def price_updater() -> None:
                     _price_prev_at = _price_cache_updated_at
                 price_cache.clear()
                 price_cache.update(new_cache)
+                _bbo_cache.clear()
+                _bbo_cache.update(new_bbo)
                 known_coins.clear()
                 known_coins.update(new_known)
                 # FIX (review high): отмечаем успешное обновление.
@@ -929,6 +997,35 @@ def effective_leverage(coin: str) -> float:
 
 def min_order_qty(coin: str) -> float:
     return _min_qty_cache.get(coin, 0.0)
+
+
+def _record_order_intent(event_type: str, coin: str, symbol: str, side: str,
+                         qty: float, order_link_id: str, route: str) -> None:
+    """Неблокирующая запись intent+BBO из локального cache."""
+    try:
+        from storage.runtime import get_writer
+        writer = get_writer()
+        if writer is None:
+            return
+        signal_id = f"{event_type}:{coin}:{time.time_ns()}"
+        writer.submit(
+            "record_intent", signal_id=signal_id,
+            client_order_id=order_link_id, venue="bybit", symbol=symbol,
+            side=side, requested_qty=qty, route=route, ts_ns=time.time_ns(),
+        )
+        bbo = get_bbo(coin)
+        if bbo:
+            writer.submit(
+                "record_market_snapshot", signal_id=signal_id,
+                client_order_id=order_link_id, venue="bybit", symbol=symbol,
+                stage="send", bid=bbo["bid1Price"], ask=bbo["ask1Price"],
+                bid_qty=bbo["bid1Size"], ask_qty=bbo["ask1Size"],
+                depth_bids=[[bbo["bid1Price"], bbo["bid1Size"]]],
+                depth_asks=[[bbo["ask1Price"], bbo["ask1Size"]]],
+                ts_ns=time.time_ns(),
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[EXEC-STORE] intent enqueue failed: {e!r}", flush=True)
 
 
 def calculate_bybit_qty(coin: str, margin: float, price: float, step: float) -> tuple[float, float]:
@@ -1068,6 +1165,10 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 # реально прошёл, но ack не пришёл, REST с тем же
                 # orderLinkId Bybit отвергнет (retCode 30050 → success).
                 order_link_id = _new_order_link_id()
+                _record_order_intent(
+                    "listing", ticker_name, symbol, "Sell",
+                    amount_tokens, order_link_id, "sync_ws_or_rest",
+                )
 
                 # FIX 2026-06-17: bundled SL прямо в order.create (как на листинге).
                 # Раньше делистовый шорт открывался ГОЛЫМ — защита приходила только

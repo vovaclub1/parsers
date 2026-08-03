@@ -19,6 +19,7 @@ from api.delist_api import (
     _get_qty_step,
     calculate_bybit_qty,
     min_order_qty,
+    _record_order_intent,
     _round_qty,
     get_price,
     # FIX 2026-06-19: price_ago/fetch_live_price удалены вместе с python
@@ -247,6 +248,10 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 # дубль с retCode 30050, защита от double-position при WS
                 # ack timeout (см. post_order в delist_api).
                 order_link_id = new_order_link_id()
+                _record_order_intent(
+                    "delisting", ticker_name, symbol, "Buy",
+                    amount_tokens, order_link_id, "sync_ws_or_rest",
+                )
                 # Bundle SL в order.create — failsafe stop loss попадает на
                 # сервер в одной WS-фрейме с открытием, без зависимости от
                 # отдельного /v5/position/trading-stop (который добавляет
@@ -413,6 +418,10 @@ def market_open_long_batch(
 
         qty_str = str(amount_tokens)
         link_id = new_order_link_id()
+        _record_order_intent(
+            "delisting", ticker, symbol, "Buy",
+            amount_tokens, link_id, "sync_ws_batch",
+        )
         sl_price = round(bybit_price * _SL_MULT, 8)
         order_args: dict = {
             "category":    "linear",

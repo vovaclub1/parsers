@@ -129,6 +129,16 @@ class BybitWsPrivate:
     def set_execution_store(self, store) -> None:
         self._execution_store = store
 
+    def _persist(self, method: str, **kwargs) -> None:
+        """Поддерживает direct store и bounded async writer."""
+        store = self._execution_store
+        if store is None:
+            return
+        if hasattr(store, "submit"):
+            store.submit(method, **kwargs)
+        else:
+            getattr(store, method)(**kwargs)
+
     # ── lifecycle ───────────────────────────────────────────────────
     def _start(self) -> None:
         if self._mgr_thread is not None and self._mgr_thread.is_alive():
@@ -321,7 +331,8 @@ class BybitWsPrivate:
                 store = self._execution_store
                 if store is not None:
                     try:
-                        store.record_position(
+                        self._persist(
+                            "record_position",
                             venue="bybit", symbol=sym, position_idx=idx,
                             side=it.get("side", ""), size=size,
                             avg_price=avg, trailing_stop=trail,
@@ -372,7 +383,8 @@ class BybitWsPrivate:
                 store = self._execution_store
                 if store is not None:
                     try:
-                        store.record_order_event(
+                        self._persist(
+                            "record_order_event",
                             client_order_id=link, status=status,
                             exchange_order_id=order_id, avg_price=avg,
                             cum_exec_qty=cum,
@@ -393,7 +405,8 @@ class BybitWsPrivate:
             if not exec_id:
                 continue
             try:
-                store.record_fill(
+                self._persist(
+                    "record_fill",
                     exec_id=exec_id,
                     client_order_id=it.get("orderLinkId", ""),
                     exchange_order_id=it.get("orderId", ""),

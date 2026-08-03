@@ -1810,10 +1810,9 @@ if __name__ == "__main__":
                 from api import bybit_ws_private as _priv_mod
                 priv_inst = _priv_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
                 try:
-                    from storage.execution_store import ExecutionStore
-                    priv_inst.set_execution_store(
-                        ExecutionStore(Path(STATE_DIR) / "execution.sqlite3")
-                    )
+                    from storage import runtime as _storage_runtime
+                    writer = _storage_runtime.init(Path(STATE_DIR) / "execution.sqlite3")
+                    priv_inst.set_execution_store(writer)
                     log_ok("PARSER", "ExecutionStore SQLite WAL подключён ✓")
                 except Exception as e:
                     log_warn("PARSER", f"ExecutionStore init упал: {e!r}")
