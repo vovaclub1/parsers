@@ -3007,8 +3007,16 @@ if __name__ == "__main__":
             try:
                 from api import bybit_ws_private as _priv_mod
                 priv_inst = _priv_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                try:
+                    from storage.execution_store import ExecutionStore
+                    priv_inst.set_execution_store(
+                        ExecutionStore(Path(STATE_DIR) / "execution.sqlite3")
+                    )
+                    log_ok("PARSER", "ExecutionStore SQLite WAL подключён ✓")
+                except Exception as e:
+                    log_warn("PARSER", f"ExecutionStore init упал: {e!r}")
                 if priv_inst.is_ready(wait_sec=5.0):
-                    log_ok("PARSER", "Bybit PRIVATE WS (order+position) готов ✓")
+                    log_ok("PARSER", "Bybit PRIVATE WS (order+execution+position) готов ✓")
                 else:
                     log_warn("PARSER", "Bybit PRIVATE WS не подключился за 5с — fallback на REST poll")
             except Exception as e:
