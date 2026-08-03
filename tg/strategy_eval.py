@@ -28,6 +28,7 @@ from tg.exit_strategies import (
     slug_for,
 )
 from tg.shadow_eval import evaluate_directions
+from research.cohorts import classify_subtype
 try:
     from config.config import TG_LOG_BOT_TOKEN
 except Exception:  # noqa: BLE001
@@ -257,6 +258,7 @@ def evaluate(record, actual_pnl, results_path,
     try:
         row = {
             "coin": coin, "side": side, "event_type": event_type,
+            "event_subtype": classify_subtype(src),
             "strategy_version": strategy_version, "src": src, "venue": venue,
             "entry_ts": entry_ts, "complete_ts": complete_ts,
             "actual_pnl": actual_pnl, "margin": margin_usdt,

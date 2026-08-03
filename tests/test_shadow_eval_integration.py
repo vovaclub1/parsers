@@ -21,5 +21,6 @@ def test_strategy_result_persists_direction_shadow(tmp_path, monkeypatch):
     )
     row = json.loads(path.read_text().strip())
     assert row["direction_shadow"]["actual_strategy"] == "contrarian"
+    assert row["event_subtype"] == "unknown"
     assert row["direction_shadow"]["momentum"]["side"] == "long"
     assert row["direction_shadow"]["contrarian"]["side"] == "short"
