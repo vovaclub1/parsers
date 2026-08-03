@@ -162,6 +162,9 @@ CATEGORY_ID        = 161
 # если 3с надёжно держит и хочется быстрее, или увеличить если 3с всё
 # ещё ловит 429 (тогда Binance срезал лимиты — попробуй 5.0 или 6.0).
 POLL_INTERVAL_BASE = float(os.getenv("DELIST_POLL_INTERVAL", "3.0"))
+# Direct Binance CMS article polling produced no successful source wins and
+# sustained 429/error storms in production. Keep opt-in for future experiments.
+BINANCE_DIRECT_POLLER_ENABLED = os.getenv("BINANCE_DIRECT_POLLER_ENABLED", "0").lower() in ("1", "true", "yes", "on")
 # Анти-стадо: добавляем ±jitter на каждый sleep, чтобы N поллеров,
 # стартовавших на одном CPU-тике, не били Binance синхронно.
 # 0.10 = ±10% — при 3с интервале это ±300мс, незаметно для детекции,
@@ -1861,30 +1864,20 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         log_warn("PARSER", f"Chain warmup упал: {e!r} — первый делистинг будет медленнее")
 
-    tg_log(f"🚀 <b>DELIST парсер запущен</b>\nПоллеры: {len(_sessions)}\nБиржи: Bybit + Gate.io (fallback)")
-    log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → base={POLL_INTERVAL_BASE:.1f}с, jitter=±{POLL_INTERVAL_JITTER*100:.0f}%, ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами глобально")
-
-    # Startup proxy health-probe — отсеиваем заведомо мёртвые прокси
-    # (Connection refused / DNS-фейл / 4xx-блок), чтобы не молотить TCP-connect
-    # 1× в секунду по dead endpoint'у и не наполнять лог 5-ю одинаковыми
-    # ошибками за первые 15с. Помеченные DEAD поллеры стартуют в DEAD-режиме
-    # (60с интервал) и сами восстанавливаются на первом 200.
-    _probe_proxy_health()
-
-    # FIX: поллеры — daemon=True. Если main thread (TG listener) умирает,
-    # Docker должен иметь возможность перезапустить контейнер.
-    for i in range(len(_sessions)):
-        t = threading.Thread(target=poller, args=(i,), daemon=True, name=f"poller-{i}")
-        t.start()
-        _poller_threads[i] = t
-        # FIX-batch-8: stagger между запусками поллеров.
-        # Делим POLL_INTERVAL_BASE на число поллеров, чтобы они стартовали равномерно
-        # и median детекции была не INTERVAL/2, а INTERVAL/(2*N).
-        time.sleep(POLL_INTERVAL_BASE / max(len(_sessions), 1))
-
-    # Watchdog
-    threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
-    log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
+    if BINANCE_DIRECT_POLLER_ENABLED:
+        tg_log(f"🚀 <b>DELIST парсер запущен</b>\nПоллеры: {len(_sessions)}\nБиржи: Bybit + Gate.io (fallback)")
+        log_ok("PARSER", f"Запускаем {len(_sessions)} поллера(ов) → base={POLL_INTERVAL_BASE:.1f}с, jitter=±{POLL_INTERVAL_JITTER*100:.0f}%, ~{POLL_INTERVAL_BASE / max(len(_sessions),1):.2f}с между запросами глобально")
+        _probe_proxy_health()
+        for i in range(len(_sessions)):
+            t = threading.Thread(target=poller, args=(i,), daemon=True, name=f"poller-{i}")
+            t.start()
+            _poller_threads[i] = t
+            time.sleep(POLL_INTERVAL_BASE / max(len(_sessions), 1))
+        threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
+        log_ok("PARSER", f"Watchdog запущен (таймаут {WATCHDOG_TIMEOUT}с)")
+    else:
+        tg_log("🚀 <b>DELIST парсер запущен</b>\nDirect Binance article poller: OFF\nИсточники: TG + TOA")
+        log_warn("PARSER", "direct Binance article poller ОТКЛЮЧЁН по source stats — coverage: TG + TOA")
 
     # FIX-PERF: глобальный sweeper для L1 _fired_coins вместо thread-per-claim.
     threading.Thread(target=_fired_sweeper, daemon=True, name="fired-sweeper").start()
