@@ -27,6 +27,7 @@ from tg.exit_strategies import (
     simulate_candidates, clean_samples, build_candidates, strategy_help,
     slug_for,
 )
+from tg.shadow_eval import evaluate_directions
 try:
     from config.config import TG_LOG_BOT_TOKEN
 except Exception:  # noqa: BLE001
@@ -227,6 +228,11 @@ def evaluate(record, actual_pnl, results_path,
 
     pts = clean_samples(record.get("samples"))
     sims = simulate_candidates(pts, side, entry, leverage, taker) if (pts and entry > 0) else {}
+    direction_shadow = {}
+    if pts and entry > 0 and event_type in ("listing", "delisting"):
+        direction_shadow = evaluate_directions(
+            event_type, side, entry, record.get("samples"), leverage, taker,
+        )
 
     # winner = макс PnL; тай → первый по порядку кандидатов.
     winner = None
@@ -255,6 +261,7 @@ def evaluate(record, actual_pnl, results_path,
             "entry_ts": entry_ts, "complete_ts": complete_ts,
             "actual_pnl": actual_pnl, "margin": margin_usdt,
             "strategies": {k: round(v["pnl"], 2) for k, v in sims.items()},
+            "direction_shadow": direction_shadow,
             "winner": winner,
             "text": text,
         }
