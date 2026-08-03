@@ -683,7 +683,10 @@ def _record_path(coin: str, side: str, src: str, venue: str, entry) -> None:
     """Безопасная регистрация траектории (no-op если рекордер не загрузился)."""
     if _recorder is not None:
         try:
-            _recorder.track(coin, side, src, venue, entry)
+            _recorder.track(
+                coin, side, src, venue, entry,
+                event_type="delisting", strategy_version="contrarian-v1",
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -1806,8 +1809,22 @@ if __name__ == "__main__":
             try:
                 from api import bybit_ws_private as _priv_mod
                 priv_inst = _priv_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                try:
+                    from storage import runtime as _storage_runtime
+                    writer = _storage_runtime.init(Path(STATE_DIR) / "execution.sqlite3")
+                    priv_inst.set_execution_store(writer)
+                    from api.delist_api import _get as _bybit_public_get
+                    _storage_runtime.init_l2(
+                        lambda symbol, limit: _bybit_public_get(
+                            "/v5/market/orderbook",
+                            {"category": "linear", "symbol": symbol, "limit": limit},
+                        ).get("result", {})
+                    )
+                    log_ok("PARSER", "ExecutionStore SQLite WAL + L2 capture подключены ✓")
+                except Exception as e:
+                    log_warn("PARSER", f"ExecutionStore init упал: {e!r}")
                 if priv_inst.is_ready(wait_sec=5.0):
-                    log_ok("PARSER", "Bybit PRIVATE WS (order+position) готов ✓")
+                    log_ok("PARSER", "Bybit PRIVATE WS (order+execution+position) готов ✓")
                 else:
                     log_warn("PARSER", "Bybit PRIVATE WS не подключился за 5с — fallback на REST poll")
             except Exception as e:

@@ -2,13 +2,10 @@
 + что отвечает Upbit для каждого прокси отдельно.
 """
 import asyncio
+import os
 from curl_cffi.requests import AsyncSession
 
-PROXIES = [
-    "http://jGxDRQQi:iqTupHAT@154.219.217.67:64458",
-    "http://jGxDRQQi:iqTupHAT@154.219.236.208:64768",
-    "http://jGxDRQQi:iqTupHAT@135.106.76.31:63056",
-]
+PROXIES = [p.strip() for p in os.getenv("UPBIT_TEST_PROXIES", "").split(",") if p.strip()]
 
 
 async def check(proxy):
@@ -44,6 +41,8 @@ async def check(proxy):
 
 
 async def main():
+    if not PROXIES:
+        raise SystemExit("UPBIT_TEST_PROXIES не задан")
     for p in PROXIES:
         await check(p)
         # пауза между прокси чтобы не нагружать

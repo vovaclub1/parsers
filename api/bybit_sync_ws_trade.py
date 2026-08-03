@@ -79,11 +79,32 @@ _AUTH_EXPIRES_SEC = 60
 # Таймаут для ожидания ack в ack-варианте place_order().
 _ORDER_ACK_TIMEOUT = 1.5
 
-# Таймаут recv() в reader-loop'е. Используется чтобы периодически
-# проверять _stop. На самом recv внутри websockets.sync есть свой
-# keepalive-thread с ping/pong, так что connection-drop замечается
-# независимо от этого таймаута.
+# Таймаут recv() в reader-loop'е. На websockets 12 sync-клиент не имеет
+# встроенного keepalive, поэтому idle timeout используется для ручного ping.
 _READER_RECV_TIMEOUT = 30.0
+
+_WS_PING_INTERVAL = 20.0
+_WS_PING_TIMEOUT = 10.0
+_MAX_SILENT_TIMEOUTS = 2
+_WARMUP_FAIL_LIMIT = 2
+
+
+def _detect_keepalive_kwargs() -> dict:
+    """Включает native keepalive только если sync connect его поддерживает."""
+    try:
+        import inspect
+        from websockets.sync.client import connect as _sync_connect
+        params = inspect.signature(_sync_connect).parameters
+        if "ping_interval" in params and "ping_timeout" in params:
+            return {"ping_interval": _WS_PING_INTERVAL,
+                    "ping_timeout": _WS_PING_TIMEOUT}
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+_KEEPALIVE_KW = _detect_keepalive_kwargs()
+_MANUAL_PING_NEEDED = not _KEEPALIVE_KW
 
 
 class BybitSyncWsTrade:
@@ -148,6 +169,19 @@ class BybitSyncWsTrade:
             except Exception:
                 pass
 
+    def force_reconnect(self) -> None:
+        """Сразу помечает transport мёртвым; manager-loop поднимет новый."""
+        self._connected.clear()
+        with self._ws_lock:
+            ws = self._ws
+            self._ws = None
+        self._fail_pending()
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     # ── manager-loop: connect + auth + reader, с reconnect ──────────
     def _mgr_loop(self) -> None:
         # Импорты в функции: модуль bybit_sync_ws_trade грузится из
@@ -176,6 +210,7 @@ class BybitSyncWsTrade:
                     open_timeout=10,
                     close_timeout=5,
                     max_size=2**20,  # 1MB, ack-фреймы крошечные
+                    **_KEEPALIVE_KW,
                 )
             except Exception as e:
                 print(f"[BYBIT-SYNC-WS] connect failed: {e!r} — retry через {delay:.0f}с", flush=True)
@@ -232,12 +267,22 @@ class BybitSyncWsTrade:
                 delay = _RECONNECT_DELAY_MIN
 
                 # ── Reader-loop ────────────────────────────────────
+                silent_timeouts = 0
                 while not self._stop:
                     try:
                         raw = ws.recv(timeout=_READER_RECV_TIMEOUT)
                     except TimeoutError:
-                        # Нет фрейма за 30с — websockets keepalive сам
-                        # шлёт ping каждые 20с; нет фрейма = idle, OK.
+                        if not _MANUAL_PING_NEEDED:
+                            continue
+                        silent_timeouts += 1
+                        if silent_timeouts > _MAX_SILENT_TIMEOUTS:
+                            print("[BYBIT-SYNC-WS] нет pong — reconnect", flush=True)
+                            break
+                        try:
+                            with self._send_lock:
+                                ws.send(_json_dumps({"op": "ping"}))
+                        except Exception:
+                            break
                         continue
                     except ConnectionClosed:
                         print("[BYBIT-SYNC-WS] connection closed by peer", flush=True)
@@ -246,6 +291,7 @@ class BybitSyncWsTrade:
                         print(f"[BYBIT-SYNC-WS] recv error: {e!r}", flush=True)
                         break
 
+                    silent_timeouts = 0
                     try:
                         msg = _json_loads(raw)
                     except Exception:
@@ -600,15 +646,22 @@ _periodic_warmup_lock = threading.Lock()
 
 
 def _periodic_warmup_loop() -> None:
+    consecutive_failures = 0
     while True:
         time.sleep(_PERIODIC_WARMUP_INTERVAL)
         inst = _global_instance
         if inst is None:
             continue
         try:
-            inst.warmup(timeout=1.0)
+            if inst.warmup(timeout=1.0):
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
         except Exception:
-            pass
+            consecutive_failures += 1
+        if consecutive_failures >= _WARMUP_FAIL_LIMIT:
+            inst.force_reconnect()
+            consecutive_failures = 0
 
 
 def start_periodic_warmup() -> None:

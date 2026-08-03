@@ -67,6 +67,10 @@ try:
     class _BybitTicker(_msgspec.Struct, frozen=True):
         symbol:    str = ""
         lastPrice: str = ""
+        bid1Price: str = ""
+        ask1Price: str = ""
+        bid1Size: str = ""
+        ask1Size: str = ""
 
     # Поле называется `list` (как в JSON), но в аннотации используем
     # typing.List — иначе `from __future__ import annotations` превращает
@@ -248,12 +252,59 @@ EXCLUDED_TOKENS = {
     "EVENT", "EVENTS", "CELEBRATION", "CELEBRATE",
 }
 
+# Слова, которые одновременно являются реальными тикерами. В строгом
+# структурированном контексте их разрешаем при подтверждении инструментом;
+# в широком скане блокируем, чтобы английские слова не стали сигналом.
+AMBIGUOUS_TOKENS = {
+    "THE", "AT", "ON", "IN", "ALL", "NOT", "BE", "MAY",
+    "OPEN", "ORDER", "CROSS", "TAG", "COIN", "BOT",
+    "APR", "NFT", "USDC", "USDS",
+}
+EXCLUDED_TOKENS = EXCLUDED_TOKENS - AMBIGUOUS_TOKENS
+
 # ── Кэш цен ──────────────────────────────────────────────────────
 price_cache: dict[str, float] = {}
+_bbo_cache: dict[str, dict[str, float]] = {}
 price_cache_prev: dict[str, float] = {}   # снапшот предыдущего цикла (~2с назад)
 _price_prev_at = 0.0
 cache_lock  = threading.Lock()
 known_coins: set[str] = set()
+
+
+def _replace_market_cache(markets: dict[str, dict], updated_at: float | None = None) -> None:
+    global _price_cache_updated_at
+    ts = time.monotonic() if updated_at is None else float(updated_at)
+    new_prices = {}
+    new_bbo = {}
+    for coin, row in markets.items():
+        last = float(row.get("last", 0) or 0)
+        if last > 0:
+            new_prices[f"{coin}/USDT:USDT"] = last
+        bid, ask = float(row.get("bid", 0) or 0), float(row.get("ask", 0) or 0)
+        if bid > 0 and ask > bid:
+            new_bbo[coin] = {
+                "bid1Price": bid, "ask1Price": ask,
+                "bid1Size": float(row.get("bid_qty", 0) or 0),
+                "ask1Size": float(row.get("ask_qty", 0) or 0),
+                "updated_at": ts,
+            }
+    with cache_lock:
+        price_cache.clear()
+        price_cache.update(new_prices)
+        _bbo_cache.clear()
+        _bbo_cache.update(new_bbo)
+        known_coins.clear()
+        known_coins.update(markets.keys())
+        _price_cache_updated_at = ts
+
+
+def get_bbo(coin: str, now: float | None = None) -> dict | None:
+    current = time.monotonic() if now is None else float(now)
+    with cache_lock:
+        row = _bbo_cache.get(coin)
+        if row is None or current - row["updated_at"] > _PRICE_STALE_SEC:
+            return None
+        return dict(row)
 
 # FIX (review high): монотонный timestamp последнего УСПЕШНОГО обновления.
 # Без него при сбое Bybit (outage / parse-fail) price_updater молча
@@ -754,6 +805,7 @@ def price_updater() -> None:
             resp.raise_for_status()
 
             new_cache: dict[str, float] = {}
+            new_bbo: dict[str, dict[str, float]] = {}
             new_known: set[str] = set()
 
             if use_msgspec:
@@ -768,6 +820,17 @@ def price_updater() -> None:
                             continue
                         coin = symbol[:-4]
                         new_cache[coin + "/USDT:USDT"] = price
+                        try:
+                            bid, ask = float(tk.bid1Price or 0), float(tk.ask1Price or 0)
+                            if bid > 0 and ask > bid:
+                                new_bbo[coin] = {
+                                    "bid1Price": bid, "ask1Price": ask,
+                                    "bid1Size": float(tk.bid1Size or 0),
+                                    "ask1Size": float(tk.ask1Size or 0),
+                                    "updated_at": time.monotonic(),
+                                }
+                        except (TypeError, ValueError):
+                            pass
                         new_known.add(coin)
             else:
                 items = _json_loads(resp.content).get("result", {}).get("list", [])
@@ -778,6 +841,19 @@ def price_updater() -> None:
                         price = float(last_price)
                         key = symbol[:-4] + "/USDT:USDT"
                         new_cache[key] = price
+                        coin = symbol[:-4]
+                        try:
+                            bid = float(item.get("bid1Price", 0) or 0)
+                            ask = float(item.get("ask1Price", 0) or 0)
+                            if bid > 0 and ask > bid:
+                                new_bbo[coin] = {
+                                    "bid1Price": bid, "ask1Price": ask,
+                                    "bid1Size": float(item.get("bid1Size", 0) or 0),
+                                    "ask1Size": float(item.get("ask1Size", 0) or 0),
+                                    "updated_at": time.monotonic(),
+                                }
+                        except (TypeError, ValueError):
+                            pass
                         new_known.add(symbol[:-4])
 
             with cache_lock:
@@ -791,6 +867,8 @@ def price_updater() -> None:
                     _price_prev_at = _price_cache_updated_at
                 price_cache.clear()
                 price_cache.update(new_cache)
+                _bbo_cache.clear()
+                _bbo_cache.update(new_bbo)
                 known_coins.clear()
                 known_coins.update(new_known)
                 # FIX (review high): отмечаем успешное обновление.
@@ -870,6 +948,8 @@ def calculate_margin_for_delist() -> float:
 
 _lot_step_cache: dict[str, float] = {}
 _lot_step_lock = threading.Lock()
+_max_leverage_cache: dict[str, float] = {}
+_min_qty_cache: dict[str, float] = {}
 
 
 def preload_lot_steps() -> None:
@@ -893,9 +973,76 @@ def preload_lot_steps() -> None:
                             _lot_step_cache[coin] = step
                         except (ValueError, TypeError):
                             continue  # Пропускаем некорректные данные
+                        try:
+                            _min_qty_cache[coin] = float(lot_filter.get("minOrderQty", 0) or 0)
+                        except (ValueError, TypeError):
+                            _min_qty_cache[coin] = 0.0
+                        try:
+                            max_lev = (item.get("leverageFilter") or {}).get("maxLeverage")
+                            if max_lev is not None:
+                                _max_leverage_cache[coin] = float(max_lev)
+                        except (ValueError, TypeError):
+                            pass
         print(f"[PRELOAD] Загружено {len(_lot_step_cache)} шагов лота")
     except Exception as e:
         print(f"[PRELOAD ERROR] {e}")
+
+
+def effective_leverage(coin: str) -> float:
+    limit = _max_leverage_cache.get(coin)
+    if limit is None or limit <= 0:
+        return float(LEVERAGE)
+    return float(min(LEVERAGE, limit))
+
+
+def min_order_qty(coin: str) -> float:
+    return _min_qty_cache.get(coin, 0.0)
+
+
+def _record_order_intent(event_type: str, coin: str, symbol: str, side: str,
+                         qty: float, order_link_id: str, route: str) -> None:
+    """Неблокирующая запись intent+BBO из локального cache."""
+    try:
+        from storage.runtime import get_writer
+        writer = get_writer()
+        if writer is None:
+            return
+        signal_id = f"{event_type}:{coin}:{time.time_ns()}"
+        writer.submit(
+            "record_intent", signal_id=signal_id,
+            client_order_id=order_link_id, venue="bybit", symbol=symbol,
+            side=side, requested_qty=qty, route=route, ts_ns=time.time_ns(),
+        )
+        bbo = get_bbo(coin)
+        if bbo:
+            writer.submit(
+                "record_market_snapshot", signal_id=signal_id,
+                client_order_id=order_link_id, venue="bybit", symbol=symbol,
+                stage="send", bid=bbo["bid1Price"], ask=bbo["ask1Price"],
+                bid_qty=bbo["bid1Size"], ask_qty=bbo["ask1Size"],
+                depth_bids=[[bbo["bid1Price"], bbo["bid1Size"]]],
+                depth_asks=[[bbo["ask1Price"], bbo["ask1Size"]]],
+                ts_ns=time.time_ns(),
+            )
+        from storage.runtime import get_l2_worker
+        l2_worker = get_l2_worker()
+        if l2_worker is not None:
+            l2_worker.submit(
+                signal_id=signal_id, client_order_id=order_link_id,
+                symbol=symbol, stage="send_l2",
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[EXEC-STORE] intent enqueue failed: {e!r}", flush=True)
+
+
+def calculate_bybit_qty(coin: str, margin: float, price: float, step: float) -> tuple[float, float]:
+    """Возвращает (qty, effective_leverage); qty=0 если ниже minOrderQty."""
+    lev = effective_leverage(coin)
+    qty = _round_qty((margin / price) * lev, step)
+    minimum = min_order_qty(coin)
+    if qty > 0 and minimum > 0 and qty < minimum:
+        return 0.0, lev
+    return qty, lev
 
 
 class QtyStepUnavailable(Exception):
@@ -966,21 +1113,18 @@ _qty_precision_cache: dict[float, int] = {}
 
 
 def _round_qty(qty: float, step: float) -> float:
-    """
-    Округляет количество вниз до ближайшего шага лота.
-
-    FIX: считаем precision через Decimal, потому что str(1e-05) == '1e-05'
-    и старый код возвращал precision=0 (нет точки → ветка else), а потом
-    round(..., 0) обнулял дробную часть → qty=0 → ордер не размещался либо
-    падал на минимальный 1 контракт.
-    """
+    """Округляет количество вниз до шага без артефактов float division."""
+    if step <= 0:
+        raise ValueError(f"qty step должен быть > 0, получено {step}")
+    qty_dec = _Decimal(str(qty))
+    step_dec = _Decimal(str(step))
     precision = _qty_precision_cache.get(step)
     if precision is None:
-        exponent  = _Decimal(str(step)).as_tuple().exponent
-        precision = max(0, -int(exponent))
+        precision = max(0, -int(step_dec.as_tuple().exponent))
         _qty_precision_cache[step] = precision
-    rounded = (qty // step) * step
-    return round(rounded, precision)
+    units = qty_dec // step_dec
+    rounded = units * step_dec
+    return round(float(rounded), precision)
 
 
 # Биржа на которой открыт шорт — нужна для роутера set_tp_sl
@@ -1006,7 +1150,6 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
     # FIX: проверка на 0 или отрицательную цену (защита от деления на ноль)
     if bybit_price and bybit_price > 0:
         symbol  = f"{ticker_name}USDT"
-        raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магическое число → константа
 
         try:
             step = _get_qty_step(symbol)
@@ -1016,7 +1159,10 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
             print(f"[QTY STEP MISSING BYBIT] {e} — пробуем Gate.io")
             bybit_price = None
         else:
-            amount_tokens = _round_qty(raw_qty, step)
+            amount_tokens, lev = calculate_bybit_qty(ticker_name, usdt_amount, bybit_price, step)
+            if amount_tokens <= 0 and min_order_qty(ticker_name) > 0:
+                print(f"[QTY BELOW MIN BYBIT] {symbol}: margin={usdt_amount}, lev={lev:g} — Gate fallback")
+                bybit_price = None
 
             if amount_tokens > 0:
                 qty_str = str(amount_tokens)
@@ -1026,6 +1172,10 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
                 # реально прошёл, но ack не пришёл, REST с тем же
                 # orderLinkId Bybit отвергнет (retCode 30050 → success).
                 order_link_id = _new_order_link_id()
+                _record_order_intent(
+                    "listing", ticker_name, symbol, "Sell",
+                    amount_tokens, order_link_id, "sync_ws_or_rest",
+                )
 
                 # FIX 2026-06-17: bundled SL прямо в order.create (как на листинге).
                 # Раньше делистовый шорт открывался ГОЛЫМ — защита приходила только
@@ -1493,10 +1643,13 @@ def find_pairs(text: str) -> list[str]:
     cleaned = _RE_LINK_CONTEXT.sub(" ", text_upper)
     all_tokens = _RE_ALL_TOKENS.findall(cleaned)
     known = _known_union()
-    return [t for t in _filter_tokens(all_tokens) if t in known]
+    return [
+        t for t in _filter_tokens(all_tokens, allow_ambiguous=False)
+        if t in known
+    ]
 
 
-def _filter_tokens(tokens: list[str]) -> list[str]:
+def _filter_tokens(tokens: list[str], allow_ambiguous: bool = True) -> list[str]:
     """
     Фильтрует список токенов: убирает стоп-слова, дубликаты и слишком короткие/длинные.
     Также отсеивает токены состоящие только из цифр.
@@ -1512,6 +1665,9 @@ def _filter_tokens(tokens: list[str]) -> list[str]:
             continue
         if t.isdigit():
             continue
+        if t in AMBIGUOUS_TOKENS:
+            if not allow_ambiguous or t not in _known_union():
+                continue
         if t in seen:
             continue
         seen.add(t)

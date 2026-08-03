@@ -609,7 +609,10 @@ def _record_path(coin: str, side: str, src: str, venue: str, entry) -> None:
     """Безопасная регистрация траектории (no-op если рекордер не загрузился)."""
     if _recorder is not None:
         try:
-            _recorder.track(coin, side, src, venue, entry)
+            _recorder.track(
+                coin, side, src, venue, entry,
+                event_type="listing", strategy_version="contrarian-v1",
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -1616,6 +1619,14 @@ def _load_upbit_tickers(session: requests.Session) -> set[str]:
     return set()
 
 
+MAX_NEW_TICKERS_PER_TICK = int(os.getenv("MAX_NEW_TICKERS_PER_TICK", "10"))
+_initial_snapshot_ok = {"UPBIT": False, "BITHUMB": False, "BINANCE": False}
+
+
+def _is_bulk_update(new_tickers: set[str]) -> bool:
+    return len(new_tickers) > MAX_NEW_TICKERS_PER_TICK
+
+
 def run_upbit_poller() -> None:
     global _upbit_last_ts
     session = requests.Session()
@@ -1624,12 +1635,14 @@ def run_upbit_poller() -> None:
     log_ok("UPBIT", "Загружаем начальный список тикеров...")
     try:
         known: set[str] = _load_upbit_tickers(session)
+        _initial_snapshot_ok["UPBIT"] = True
         log_ok("UPBIT", f"Загружено {len(known)} тикеров, жду новые (poll {POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
             _upbit_last_ts = time.monotonic()
     except Exception as e:
         log_err("UPBIT", f"Ошибка инициализации: {e}")
         known = set()
+        _initial_snapshot_ok["UPBIT"] = False
 
     ever_seen: set[str] = set(known)
 
@@ -1644,10 +1657,21 @@ def run_upbit_poller() -> None:
             current = _load_upbit_tickers(session)
             t_recv = time.perf_counter()
 
+            if not _initial_snapshot_ok["UPBIT"]:
+                ever_seen = set(current)
+                _initial_snapshot_ok["UPBIT"] = True
+                log_ok("UPBIT", f"Baseline восстановлен: {len(ever_seen)} тикеров; торговля со следующего тика")
+                continue
+
             with _ts_lock:
                 _upbit_last_ts = time.monotonic()
 
             new_tickers = current - ever_seen
+
+            if _is_bulk_update(new_tickers):
+                log_warn("UPBIT", f"Подозрительно много новых тикеров ({len(new_tickers)}), пропускаем")
+                ever_seen |= current
+                continue
 
             if new_tickers:
                 fetch_ms = (t_recv - t_send) * 1000
@@ -1704,12 +1728,14 @@ def run_bithumb_poller() -> None:
     log_ok("BITHUMB", "Загружаем начальный список тикеров...")
     try:
         known: set[str] = _load_bithumb_tickers(session)
+        _initial_snapshot_ok["BITHUMB"] = True
         log_ok("BITHUMB", f"Загружено {len(known)} тикеров, жду новые (poll {POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
             _bithumb_last_ts = time.monotonic()
     except Exception as e:
         log_err("BITHUMB", f"Ошибка инициализации: {e}")
         known = set()
+        _initial_snapshot_ok["BITHUMB"] = False
 
     ever_seen: set[str] = set(known)
 
@@ -1721,6 +1747,12 @@ def run_bithumb_poller() -> None:
             current = _load_bithumb_tickers(session)
             t_recv = time.perf_counter()
 
+            if not _initial_snapshot_ok["BITHUMB"]:
+                ever_seen = set(current)
+                _initial_snapshot_ok["BITHUMB"] = True
+                log_ok("BITHUMB", f"Baseline восстановлен: {len(ever_seen)} тикеров; торговля со следующего тика")
+                continue
+
             with _ts_lock:
                 _bithumb_last_ts = time.monotonic()
 
@@ -1728,7 +1760,7 @@ def run_bithumb_poller() -> None:
 
             # FIX: порог 3 → 10. После maintenance Bithumb может разово отдать
             # 5-8 новых тикеров — мы их пропускали все, теряя реальный листинг.
-            if len(new_tickers) > 10:
+            if _is_bulk_update(new_tickers):
                 log_warn("BITHUMB", f"Подозрительно много новых тикеров ({len(new_tickers)}), пропускаем")
                 ever_seen |= current
                 continue
@@ -2645,6 +2677,7 @@ def run_binance_futures_poller() -> None:
     log_ok("BINANCE", "Загружаем начальный список futures-тикеров...")
     try:
         known: set[str] = _load_binance_futures_tickers(session)
+        _initial_snapshot_ok["BINANCE"] = True
         log_ok("BINANCE", f"Загружено {len(known)} тикеров, жду новые "
                           f"(poll {BINANCE_POLL_INTERVAL*1000:.0f}мс)...")
         with _ts_lock:
@@ -2652,6 +2685,7 @@ def run_binance_futures_poller() -> None:
     except Exception as e:
         log_err("BINANCE", f"Ошибка инициализации: {e}")
         known = set()
+        _initial_snapshot_ok["BINANCE"] = False
 
     ever_seen: set[str] = set(known)
 
@@ -2662,6 +2696,12 @@ def run_binance_futures_poller() -> None:
             current = _load_binance_futures_tickers(session)
             t_recv = time.perf_counter()
 
+            if not _initial_snapshot_ok["BINANCE"]:
+                ever_seen = set(current)
+                _initial_snapshot_ok["BINANCE"] = True
+                log_ok("BINANCE", f"Baseline восстановлен: {len(ever_seen)} тикеров; торговля со следующего тика")
+                continue
+
             with _ts_lock:
                 _binance_last_ts = time.monotonic()
 
@@ -2670,7 +2710,7 @@ def run_binance_futures_poller() -> None:
             # Защита от bulk-апдейта (рестарт API / временная подгрузка
             # списка после maintenance): >10 новых за тик — почти точно
             # not-a-listing event.
-            if len(new_tickers) > 10:
+            if _is_bulk_update(new_tickers):
                 log_warn("BINANCE", f"Подозрительно много новых тикеров "
                                     f"({len(new_tickers)}), пропускаем")
                 ever_seen |= current
@@ -2967,8 +3007,22 @@ if __name__ == "__main__":
             try:
                 from api import bybit_ws_private as _priv_mod
                 priv_inst = _priv_mod.init(BYBIT_API_KEY, BYBIT_SECRET_KEY)
+                try:
+                    from storage import runtime as _storage_runtime
+                    writer = _storage_runtime.init(Path(STATE_DIR) / "execution.sqlite3")
+                    priv_inst.set_execution_store(writer)
+                    from api.delist_api import _get as _bybit_public_get
+                    _storage_runtime.init_l2(
+                        lambda symbol, limit: _bybit_public_get(
+                            "/v5/market/orderbook",
+                            {"category": "linear", "symbol": symbol, "limit": limit},
+                        ).get("result", {})
+                    )
+                    log_ok("PARSER", "ExecutionStore SQLite WAL + L2 capture подключены ✓")
+                except Exception as e:
+                    log_warn("PARSER", f"ExecutionStore init упал: {e!r}")
                 if priv_inst.is_ready(wait_sec=5.0):
-                    log_ok("PARSER", "Bybit PRIVATE WS (order+position) готов ✓")
+                    log_ok("PARSER", "Bybit PRIVATE WS (order+execution+position) готов ✓")
                 else:
                     log_warn("PARSER", "Bybit PRIVATE WS не подключился за 5с — fallback на REST poll")
             except Exception as e:

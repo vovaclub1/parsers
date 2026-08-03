@@ -58,13 +58,17 @@ def _interval_for(elapsed: float):
 
 class _Rec:
     """Одна активная запись траектории."""
-    __slots__ = ("coin", "side", "src", "venue", "entry", "entry_ts",
+    __slots__ = ("coin", "side", "event_type", "strategy_version",
+                 "src", "venue", "entry", "entry_ts",
                  "t0", "samples", "next_at")
 
-    def __init__(self, coin: str, side: str, src: str, venue: str,
+    def __init__(self, coin: str, side: str, event_type: str,
+                 strategy_version: str, src: str, venue: str,
                  entry: float, entry_ts: int, t0: float) -> None:
         self.coin = coin
         self.side = side
+        self.event_type = event_type
+        self.strategy_version = strategy_version
         self.src = src
         self.venue = venue
         self.entry = entry
@@ -93,7 +97,8 @@ class PriceRecorder:
 
     # ── hot-path: регистрация (вызывается из worker после открытия) ──
     def track(self, coin: str, side: str, src: str, venue: str,
-              entry, entry_ts=None) -> None:
+              entry, entry_ts=None, event_type="unknown",
+              strategy_version="legacy") -> None:
         if not coin or entry is None:
             return
         try:
@@ -111,7 +116,8 @@ class PriceRecorder:
                 print(f"[PRICE-REC] max_active={self._max_active} достигнут, "
                       f"{coin} пропущен", flush=True)
                 return
-            self._active[coin] = _Rec(coin, side, src or "?", venue or "?",
+            self._active[coin] = _Rec(coin, side, event_type, strategy_version,
+                                      src or "?", venue or "?",
                                       entry_f, ets, now)
 
     # ── фоновый поток ─────────────────────────────────────────────
@@ -174,6 +180,8 @@ class PriceRecorder:
         return {
             "coin": rec.coin,
             "side": rec.side,
+            "event_type": rec.event_type,
+            "strategy_version": rec.strategy_version,
             "src": rec.src,
             "venue": rec.venue,
             "entry_ts": rec.entry_ts,

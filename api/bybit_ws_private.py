@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # ── bybit_ws_private.py ───────────────────────────────────────────
-# Sync Bybit V5 Private WS: подписки `order` и `position`.
+# Sync Bybit V5 Private WS: подписки `order`, `execution` и `position`.
 # wallet НЕ подписываем (требование пользователя).
 #
 # Зачем: после market_open_long нам нужно дождаться появления позиции
@@ -61,6 +61,24 @@ _PING_INTERVAL = 20.0   # Bybit V5: ping каждые ≤20с (см. /docs/v5/ws
 # несколько секунд после open). Чистится по TTL в reader-loop.
 _ORDER_CACHE_TTL = 60.0
 _POSITION_CACHE_TTL = 24 * 3600  # позиция может жить долго
+
+
+def _epoch_ns(value, fallback: int | None = None) -> int:
+    """Нормализует epoch seconds/ms/us/ns к наносекундам."""
+    if value in (None, ""):
+        return int(fallback if fallback is not None else time.time_ns())
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        return int(fallback if fallback is not None else time.time_ns())
+    digits = len(str(abs(raw)))
+    if digits <= 10:
+        return raw * 1_000_000_000
+    if digits <= 13:
+        return raw * 1_000_000
+    if digits <= 16:
+        return raw * 1_000
+    return raw
 
 
 class _PositionSnap:
@@ -124,6 +142,20 @@ class BybitWsPrivate:
 
         self._stop = False
         self._mgr_thread: threading.Thread | None = None
+        self._execution_store = None
+
+    def set_execution_store(self, store) -> None:
+        self._execution_store = store
+
+    def _persist(self, method: str, **kwargs) -> None:
+        """Поддерживает direct store и bounded async writer."""
+        store = self._execution_store
+        if store is None:
+            return
+        if hasattr(store, "submit"):
+            store.submit(method, **kwargs)
+        else:
+            getattr(store, method)(**kwargs)
 
     # ── lifecycle ───────────────────────────────────────────────────
     def _start(self) -> None:
@@ -211,10 +243,10 @@ class BybitWsPrivate:
                     continue
 
                 # ── Subscribe ───────────────────────────────────────
-                # Только order+position (wallet НЕ подписываем по требованию).
+                # wallet НЕ подписываем по требованию пользователя.
                 ws.send(_json_dumps({
                     "op":   "subscribe",
-                    "args": ["order", "position"],
+                    "args": ["order", "execution", "position"],
                 }))
 
                 with self._ws_lock:
@@ -275,6 +307,8 @@ class BybitWsPrivate:
             self._on_position(msg.get("data", []))
         elif topic == "order":
             self._on_order(msg.get("data", []))
+        elif topic == "execution":
+            self._on_execution(msg.get("data", []))
         # auth/subscribe/pong ack — игнор
 
     def _on_position(self, items: list[dict]) -> None:
@@ -312,6 +346,19 @@ class BybitWsPrivate:
                 snap.trailing_stop = trail
                 snap.updated_ts = now
                 notify.append(key)
+                store = self._execution_store
+                if store is not None:
+                    try:
+                        self._persist(
+                            "record_position",
+                            venue="bybit", symbol=sym, position_idx=idx,
+                            side=it.get("side", ""), size=size,
+                            avg_price=avg, trailing_stop=trail,
+                            ts_ns=_epoch_ns(it.get("updatedTime")),
+                            raw=it,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[BYBIT-WS-PRIV] position persist failed: {e!r}", flush=True)
             if notify:
                 # notify_all: все wait_for_position'ы перепроверят свои keys.
                 self._pos_cond.notify_all()
@@ -351,8 +398,62 @@ class BybitWsPrivate:
                 snap.cum_exec_qty = cum
                 snap.order_id = order_id
                 snap.updated_ts = now
+                store = self._execution_store
+                if store is not None:
+                    try:
+                        self._persist(
+                            "record_order_event",
+                            client_order_id=link, status=status,
+                            exchange_order_id=order_id, avg_price=avg,
+                            cum_exec_qty=cum,
+                            ts_ns=_epoch_ns(it.get("updatedTime")),
+                            raw=it,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[BYBIT-WS-PRIV] order persist failed: {e!r}", flush=True)
             if items:
                 self._ord_cond.notify_all()
+
+    def _on_execution(self, items: list[dict]) -> None:
+        store = self._execution_store
+        if store is None:
+            return
+        for it in items:
+            exec_id = it.get("execId", "")
+            if not exec_id:
+                continue
+            try:
+                self._persist(
+                    "record_fill",
+                    exec_id=exec_id,
+                    client_order_id=it.get("orderLinkId", ""),
+                    exchange_order_id=it.get("orderId", ""),
+                    symbol=it.get("symbol", ""), side=it.get("side", ""),
+                    price=float(it.get("execPrice", 0) or 0),
+                    qty=float(it.get("execQty", 0) or 0),
+                    fee=float(it.get("execFee", 0) or 0),
+                    fee_asset=it.get("feeCurrency", ""),
+                    ts_ns=_epoch_ns(it.get("execTime")),
+                    raw=it,
+                )
+                symbol = it.get("symbol", "")
+                link = it.get("orderLinkId", "")
+                if symbol.endswith("USDT") and link:
+                    from api.delist_api import get_bbo
+                    bbo = get_bbo(symbol[:-4])
+                    if bbo:
+                        self._persist(
+                            "record_market_snapshot",
+                            signal_id="", client_order_id=link,
+                            venue="bybit", symbol=symbol, stage="fill",
+                            bid=bbo["bid1Price"], ask=bbo["ask1Price"],
+                            bid_qty=bbo["bid1Size"], ask_qty=bbo["ask1Size"],
+                            depth_bids=[[bbo["bid1Price"], bbo["bid1Size"]]],
+                            depth_asks=[[bbo["ask1Price"], bbo["ask1Size"]]],
+                            ts_ns=time.time_ns(),
+                        )
+            except Exception as e:  # noqa: BLE001
+                print(f"[BYBIT-WS-PRIV] execution persist failed: {e!r}", flush=True)
 
     # ── public sync API ─────────────────────────────────────────────
     def is_ready(self, wait_sec: float = 0.0) -> bool:

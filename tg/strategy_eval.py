@@ -27,6 +27,8 @@ from tg.exit_strategies import (
     simulate_candidates, clean_samples, build_candidates, strategy_help,
     slug_for,
 )
+from tg.shadow_eval import evaluate_directions
+from research.cohorts import classify_subtype
 try:
     from config.config import TG_LOG_BOT_TOKEN
 except Exception:  # noqa: BLE001
@@ -110,7 +112,8 @@ def _bot_username():
 
 
 # ── винрейт из журнала результатов ────────────────────────────────
-def winrates_from_results(results_path, since_ts=0, extra_winner=None):
+def winrates_from_results(results_path, since_ts=0, extra_winner=None,
+                          event_type=None, side=None, strategy_version=None):
     """
     Считает {name: (wins, total)} из *_strategy_results.jsonl за окно
     [since_ts, ∞). wins = сколько раз стратегия была winner; total = число
@@ -131,6 +134,16 @@ def winrates_from_results(results_path, since_ts=0, extra_winner=None):
                     except Exception:  # noqa: BLE001
                         continue
                     if int(row.get("complete_ts", 0)) < since_ts:
+                        continue
+                    # Не смешиваем результаты разных торговых режимов. Legacy-
+                    # записи без cohort metadata остаются в журнале, но не
+                    # участвуют в статистике нового режима.
+                    if event_type is not None and row.get("event_type") != event_type:
+                        continue
+                    if side is not None and row.get("side") != side:
+                        continue
+                    if (strategy_version is not None
+                            and row.get("strategy_version") != strategy_version):
                         continue
                     total += 1
                     w = row.get("winner")
@@ -153,14 +166,19 @@ def _strat_label(name, bot_username):
 
 
 def render_card(side, coin, complete_ts, src, actual_pnl, sims, winner,
-                wins, total, margin_usdt, bot_username=None):
+                wins, total, margin_usdt, bot_username=None,
+                event_type="unknown", strategy_version="legacy"):
     """
     Карточка 6ч-итогов. Имена стратегий — тапаемые ссылки (тап → бот шлёт
     описание). Рядом с % — доллары (pct% × маржа сделки). wins/total — карта
     винрейта и общее число сделок (из журнала, вкл. текущую).
     """
     when = datetime.fromtimestamp(int(complete_ts), MSK).strftime("%d.%m %H:%M")
-    side_lbl = "🟢 LISTING" if side == "long" else "🔴 DELIST"
+    event_lbl = {
+        "listing": "LISTING",
+        "delisting": "DELIST",
+    }.get(event_type, str(event_type or "UNKNOWN").upper())
+    side_lbl = f"{'🟢' if side == 'long' else '🔴'} {event_lbl} {side.upper()}"
     pnl_str = "н/д" if actual_pnl is None else f"{actual_pnl:+.2f}$"
     # Стиль = как в стате (Format A): эмодзи-заголовок, отступ "└", чистые строки.
     lines = [
@@ -201,6 +219,8 @@ def evaluate(record, actual_pnl, results_path,
     """
     coin = record.get("coin", "?")
     side = record.get("side", "long")
+    event_type = record.get("event_type", "unknown")
+    strategy_version = record.get("strategy_version", "legacy")
     src = record.get("src", "?")
     venue = record.get("venue", "?")
     entry = float(record.get("entry") or 0.0)
@@ -209,6 +229,11 @@ def evaluate(record, actual_pnl, results_path,
 
     pts = clean_samples(record.get("samples"))
     sims = simulate_candidates(pts, side, entry, leverage, taker) if (pts and entry > 0) else {}
+    direction_shadow = {}
+    if pts and entry > 0 and event_type in ("listing", "delisting"):
+        direction_shadow = evaluate_directions(
+            event_type, side, entry, record.get("samples"), leverage, taker,
+        )
 
     # winner = макс PnL; тай → первый по порядку кандидатов.
     winner = None
@@ -221,17 +246,24 @@ def evaluate(record, actual_pnl, results_path,
                 winner = name
 
     # Винрейт из журнала (all-time) + текущая сделка.
-    wins, total = winrates_from_results(results_path, since_ts=0, extra_winner=winner)
+    wins, total = winrates_from_results(
+        results_path, since_ts=0, extra_winner=winner,
+        event_type=event_type, side=side, strategy_version=strategy_version,
+    )
     text = render_card(side, coin, complete_ts, src, actual_pnl, sims, winner,
-                       wins, total, margin_usdt, bot_username=_bot_username())
+                       wins, total, margin_usdt, bot_username=_bot_username(),
+                       event_type=event_type, strategy_version=strategy_version)
 
     # дописываем результат (с готовым текстом — деталь по тапу = тот же текст)
     try:
         row = {
-            "coin": coin, "side": side, "src": src, "venue": venue,
+            "coin": coin, "side": side, "event_type": event_type,
+            "event_subtype": classify_subtype(src),
+            "strategy_version": strategy_version, "src": src, "venue": venue,
             "entry_ts": entry_ts, "complete_ts": complete_ts,
             "actual_pnl": actual_pnl, "margin": margin_usdt,
             "strategies": {k: round(v["pnl"], 2) for k, v in sims.items()},
+            "direction_shadow": direction_shadow,
             "winner": winner,
             "text": text,
         }

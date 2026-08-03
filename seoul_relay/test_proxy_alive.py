@@ -3,14 +3,11 @@
    docker exec seoul-relay python3 /tmp/test_proxy_alive.py
 """
 import asyncio
+import os
 from curl_cffi.requests import AsyncSession
 
 # Базовые координаты — будем пробовать с разными схемами
-HOSTS = [
-    ("jGxDRQQi:iqTupHAT@154.219.217.67:64459"),
-    ("jGxDRQQi:iqTupHAT@154.219.236.208:64769"),
-    ("jGxDRQQi:iqTupHAT@135.106.76.31:63057"),
-]
+HOSTS = [p.strip() for p in os.getenv("UPBIT_TEST_PROXY_HOSTS", "").split(",") if p.strip()]
 
 SCHEMES = ["socks5", "socks5h", "http"]
 
@@ -32,6 +29,8 @@ async def probe(scheme: str, hostcred: str):
 
 
 async def main():
+    if not HOSTS:
+        raise SystemExit("UPBIT_TEST_PROXY_HOSTS не задан")
     for scheme in SCHEMES:
         print(f"=== scheme={scheme} ===")
         for hostcred in HOSTS:

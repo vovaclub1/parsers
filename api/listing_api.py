@@ -17,6 +17,9 @@ from api.delist_api import (
     post_order,              # FIX-10: публичный алиас вместо _post_order
     new_order_link_id,       # FIX-10: публичный алиас вместо _new_order_link_id
     _get_qty_step,
+    calculate_bybit_qty,
+    min_order_qty,
+    _record_order_intent,
     _round_qty,
     get_price,
     # FIX 2026-06-19: price_ago/fetch_live_price удалены вместе с python
@@ -24,6 +27,7 @@ from api.delist_api import (
     get_position,            # FIX 2026-06-17: реальная позиция (size/avgPrice/trailing) для верификации TP/SL
     known_coins,
     EXCLUDED_TOKENS,
+    AMBIGUOUS_TOKENS,
     price_updater,
     warmup_bybit_connection,
     start_bybit_heartbeat,   # FIX: TLS pool heartbeat
@@ -223,7 +227,6 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
     # FIX: явная проверка > 0 (защита от деления на ноль и отрицательных цен)
     if bybit_price and bybit_price > 0:
         symbol  = f"{ticker_name}USDT"
-        raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магия → константа
 
         try:
             step = _get_qty_step(symbol)
@@ -232,7 +235,10 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
             print(f"[QTY STEP MISSING BYBIT] {e} — пробуем Gate.io")
             bybit_price = None
         else:
-            amount_tokens = _round_qty(raw_qty, step)
+            amount_tokens, lev = calculate_bybit_qty(ticker_name, usdt_amount, bybit_price, step)
+            if amount_tokens <= 0 and min_order_qty(ticker_name) > 0:
+                print(f"[QTY BELOW MIN BYBIT] {symbol}: margin={usdt_amount}, lev={lev:g} — Gate fallback")
+                bybit_price = None
 
             if amount_tokens <= 0:
                 print(f"[QTY ZERO BYBIT] {symbol}")
@@ -242,6 +248,10 @@ def market_open_long(ticker_name: str, usdt_amount: float) -> tuple[float, float
                 # дубль с retCode 30050, защита от double-position при WS
                 # ack timeout (см. post_order в delist_api).
                 order_link_id = new_order_link_id()
+                _record_order_intent(
+                    "delisting", ticker_name, symbol, "Buy",
+                    amount_tokens, order_link_id, "sync_ws_or_rest",
+                )
                 # Bundle SL в order.create — failsafe stop loss попадает на
                 # сервер в одной WS-фрейме с открытием, без зависимости от
                 # отдельного /v5/position/trading-stop (который добавляет
@@ -396,8 +406,11 @@ def market_open_long_batch(
             gate_only.append((ticker, margin))
             continue
 
-        raw_qty = (margin / bybit_price) * LEVERAGE
-        amount_tokens = _round_qty(raw_qty, step)
+        amount_tokens, lev = calculate_bybit_qty(ticker, margin, bybit_price, step)
+        if amount_tokens <= 0 and min_order_qty(ticker) > 0:
+            print(f"[QTY BELOW MIN BYBIT] {symbol}: margin={margin}, lev={lev:g} — Gate fallback", flush=True)
+            gate_only.append((ticker, margin))
+            continue
         if amount_tokens <= 0:
             print(f"[QTY ZERO BYBIT] {symbol}", flush=True)
             out[ticker] = (0, 0)
@@ -405,6 +418,10 @@ def market_open_long_batch(
 
         qty_str = str(amount_tokens)
         link_id = new_order_link_id()
+        _record_order_intent(
+            "delisting", ticker, symbol, "Buy",
+            amount_tokens, link_id, "sync_ws_batch",
+        )
         sl_price = round(bybit_price * _SL_MULT, 8)
         order_args: dict = {
             "category":    "linear",
@@ -974,6 +991,7 @@ def find_listing_pairs(text: str) -> list[str]:
     return list(dict.fromkeys(
         t for t in _RE_TICKER_PLAIN.findall(text_upper)
         if t not in EXCLUDED_TOKENS
+        and t not in AMBIGUOUS_TOKENS
         and 2 <= len(t) <= 8
         and not t.isdigit()
         and t in known_coins

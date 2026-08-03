@@ -3,7 +3,14 @@
 
 # Секреты (монтируются через volumes)
 .env
+**/.env
 *.session
+*.session-*
+state/
+
+# Диагностические скрипты relay не нужны runtime-образу. Ранее два из них
+# содержали реальные proxy credentials.
+seoul_relay/test_*.py
 
 # Виртуальное окружение
 .venv/
@@ -24,3 +31,10 @@ __pycache__/
 # Git
 .git/
 .gitignore
+
+# Локальные тестовые/исследовательские артефакты
+.pytest_cache/
+.ruff_cache/
+tests/
+knowledge/
+PRODUCTION_BASELINE.md
