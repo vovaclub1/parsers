@@ -2002,6 +2002,10 @@ UPBIT_INTERVAL_MIN = float(os.getenv("UPBIT_INTERVAL_MIN", "0.10"))    # 100мс
 # datacenter-прокси банятся Cloudflare наглухо (см. main()). Включать только
 # с корейскими residential прокси.
 UPBIT_DIRECT_POLLER_ENABLED = os.getenv("UPBIT_DIRECT_POLLER_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+# Production stats: оба источника дали 0 успешных открытий при сотнях тысяч
+# ошибок/429. Оставляем код для controlled experiment, default OFF.
+BITHUMB_NOTICE_POLLER_ENABLED = os.getenv("BITHUMB_NOTICE_POLLER_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+BINANCE_NOTICE_POLLER_ENABLED = os.getenv("BINANCE_NOTICE_POLLER_ENABLED", "0").lower() in ("1", "true", "yes", "on")
 
 # Категории, которые ВЕДУТ к торговле. У Upbit поле "category" в JSON:
 # наблюдали "거래" для трейд-нотисов (включая листинги, делисты, изменения).
@@ -3097,11 +3101,14 @@ if __name__ == "__main__":
     #   Bithumb — api.bithumb.com/v1/notices (готовый list)
     #   Upbit   — api-manager.upbit.com/api/v1/announcements/{id} (по next_id)
     # Цель: −1-2с до сигнала против MASKED-path CoinListing.
-    threading.Thread(
-        target=run_bithumb_announcement_poller,
-        daemon=True,
-        name="bithumb-notice-poller",
-    ).start()
+    if BITHUMB_NOTICE_POLLER_ENABLED:
+        threading.Thread(
+            target=run_bithumb_announcement_poller,
+            daemon=True,
+            name="bithumb-notice-poller",
+        ).start()
+    else:
+        log_warn("BITHUMB-NOTICE", "поллер ОТКЛЮЧЁН по source stats — coverage: CoinListing + TG + TOA + market poll")
     # FIX (2026-06-04): Upbit direct-поллер ОТКЛЮЧЁН по умолчанию. На текущем
     # datacenter proxy-пуле (pool=4) Cloudflare на api-manager.upbit.com банит
     # все IP наглухо — за прогон 4712 CF-1015 троттлов, 0 успешных ответов,
@@ -3119,11 +3126,14 @@ if __name__ == "__main__":
     else:
         log_warn("UPBIT-NOTICE", "direct-поллер ОТКЛЮЧЁН (UPBIT_DIRECT_POLLER_ENABLED=0) "
                                  "— Upbit идёт через TG + TOA + CoinListing")
-    threading.Thread(
-        target=run_binance_announcement_poller,
-        daemon=True,
-        name="binance-notice-poller",
-    ).start()
+    if BINANCE_NOTICE_POLLER_ENABLED:
+        threading.Thread(
+            target=run_binance_announcement_poller,
+            daemon=True,
+            name="binance-notice-poller",
+        ).start()
+    else:
+        log_warn("BINANCE-NOTICE", "поллер ОТКЛЮЧЁН по source stats — coverage: Binance market + TG + TOA")
 
     log_ok("PARSER", f"Upbit/Bithumb ({POLL_INTERVAL*1000:.0f}мс) + Binance futures "
                      f"({BINANCE_POLL_INTERVAL*1000:.0f}мс) + CoinListing WS + "
