@@ -248,6 +248,16 @@ EXCLUDED_TOKENS = {
     "EVENT", "EVENTS", "CELEBRATION", "CELEBRATE",
 }
 
+# Слова, которые одновременно являются реальными тикерами. В строгом
+# структурированном контексте их разрешаем при подтверждении инструментом;
+# в широком скане блокируем, чтобы английские слова не стали сигналом.
+AMBIGUOUS_TOKENS = {
+    "THE", "AT", "ON", "IN", "ALL", "NOT", "BE", "MAY",
+    "OPEN", "ORDER", "CROSS", "TAG", "COIN", "BOT",
+    "APR", "NFT", "USDC", "USDS",
+}
+EXCLUDED_TOKENS = EXCLUDED_TOKENS - AMBIGUOUS_TOKENS
+
 # ── Кэш цен ──────────────────────────────────────────────────────
 price_cache: dict[str, float] = {}
 price_cache_prev: dict[str, float] = {}   # снапшот предыдущего цикла (~2с назад)
@@ -870,6 +880,8 @@ def calculate_margin_for_delist() -> float:
 
 _lot_step_cache: dict[str, float] = {}
 _lot_step_lock = threading.Lock()
+_max_leverage_cache: dict[str, float] = {}
+_min_qty_cache: dict[str, float] = {}
 
 
 def preload_lot_steps() -> None:
@@ -893,9 +905,40 @@ def preload_lot_steps() -> None:
                             _lot_step_cache[coin] = step
                         except (ValueError, TypeError):
                             continue  # Пропускаем некорректные данные
+                        try:
+                            _min_qty_cache[coin] = float(lot_filter.get("minOrderQty", 0) or 0)
+                        except (ValueError, TypeError):
+                            _min_qty_cache[coin] = 0.0
+                        try:
+                            max_lev = (item.get("leverageFilter") or {}).get("maxLeverage")
+                            if max_lev is not None:
+                                _max_leverage_cache[coin] = float(max_lev)
+                        except (ValueError, TypeError):
+                            pass
         print(f"[PRELOAD] Загружено {len(_lot_step_cache)} шагов лота")
     except Exception as e:
         print(f"[PRELOAD ERROR] {e}")
+
+
+def effective_leverage(coin: str) -> float:
+    limit = _max_leverage_cache.get(coin)
+    if limit is None or limit <= 0:
+        return float(LEVERAGE)
+    return float(min(LEVERAGE, limit))
+
+
+def min_order_qty(coin: str) -> float:
+    return _min_qty_cache.get(coin, 0.0)
+
+
+def calculate_bybit_qty(coin: str, margin: float, price: float, step: float) -> tuple[float, float]:
+    """Возвращает (qty, effective_leverage); qty=0 если ниже minOrderQty."""
+    lev = effective_leverage(coin)
+    qty = _round_qty((margin / price) * lev, step)
+    minimum = min_order_qty(coin)
+    if qty > 0 and minimum > 0 and qty < minimum:
+        return 0.0, lev
+    return qty, lev
 
 
 class QtyStepUnavailable(Exception):
@@ -966,21 +1009,18 @@ _qty_precision_cache: dict[float, int] = {}
 
 
 def _round_qty(qty: float, step: float) -> float:
-    """
-    Округляет количество вниз до ближайшего шага лота.
-
-    FIX: считаем precision через Decimal, потому что str(1e-05) == '1e-05'
-    и старый код возвращал precision=0 (нет точки → ветка else), а потом
-    round(..., 0) обнулял дробную часть → qty=0 → ордер не размещался либо
-    падал на минимальный 1 контракт.
-    """
+    """Округляет количество вниз до шага без артефактов float division."""
+    if step <= 0:
+        raise ValueError(f"qty step должен быть > 0, получено {step}")
+    qty_dec = _Decimal(str(qty))
+    step_dec = _Decimal(str(step))
     precision = _qty_precision_cache.get(step)
     if precision is None:
-        exponent  = _Decimal(str(step)).as_tuple().exponent
-        precision = max(0, -int(exponent))
+        precision = max(0, -int(step_dec.as_tuple().exponent))
         _qty_precision_cache[step] = precision
-    rounded = (qty // step) * step
-    return round(rounded, precision)
+    units = qty_dec // step_dec
+    rounded = units * step_dec
+    return round(float(rounded), precision)
 
 
 # Биржа на которой открыт шорт — нужна для роутера set_tp_sl
@@ -1006,7 +1046,6 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
     # FIX: проверка на 0 или отрицательную цену (защита от деления на ноль)
     if bybit_price and bybit_price > 0:
         symbol  = f"{ticker_name}USDT"
-        raw_qty = (usdt_amount / bybit_price) * LEVERAGE   # FIX: магическое число → константа
 
         try:
             step = _get_qty_step(symbol)
@@ -1016,7 +1055,10 @@ def market_open_short(ticker_name: str, usdt_amount: float) -> tuple[float, floa
             print(f"[QTY STEP MISSING BYBIT] {e} — пробуем Gate.io")
             bybit_price = None
         else:
-            amount_tokens = _round_qty(raw_qty, step)
+            amount_tokens, lev = calculate_bybit_qty(ticker_name, usdt_amount, bybit_price, step)
+            if amount_tokens <= 0 and min_order_qty(ticker_name) > 0:
+                print(f"[QTY BELOW MIN BYBIT] {symbol}: margin={usdt_amount}, lev={lev:g} — Gate fallback")
+                bybit_price = None
 
             if amount_tokens > 0:
                 qty_str = str(amount_tokens)
@@ -1493,10 +1535,13 @@ def find_pairs(text: str) -> list[str]:
     cleaned = _RE_LINK_CONTEXT.sub(" ", text_upper)
     all_tokens = _RE_ALL_TOKENS.findall(cleaned)
     known = _known_union()
-    return [t for t in _filter_tokens(all_tokens) if t in known]
+    return [
+        t for t in _filter_tokens(all_tokens, allow_ambiguous=False)
+        if t in known
+    ]
 
 
-def _filter_tokens(tokens: list[str]) -> list[str]:
+def _filter_tokens(tokens: list[str], allow_ambiguous: bool = True) -> list[str]:
     """
     Фильтрует список токенов: убирает стоп-слова, дубликаты и слишком короткие/длинные.
     Также отсеивает токены состоящие только из цифр.
@@ -1512,6 +1557,9 @@ def _filter_tokens(tokens: list[str]) -> list[str]:
             continue
         if t.isdigit():
             continue
+        if t in AMBIGUOUS_TOKENS:
+            if not allow_ambiguous or t not in _known_union():
+                continue
         if t in seen:
             continue
         seen.add(t)
