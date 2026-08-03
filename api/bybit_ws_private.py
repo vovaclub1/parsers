@@ -63,6 +63,24 @@ _ORDER_CACHE_TTL = 60.0
 _POSITION_CACHE_TTL = 24 * 3600  # позиция может жить долго
 
 
+def _epoch_ns(value, fallback: int | None = None) -> int:
+    """Нормализует epoch seconds/ms/us/ns к наносекундам."""
+    if value in (None, ""):
+        return int(fallback if fallback is not None else time.time_ns())
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        return int(fallback if fallback is not None else time.time_ns())
+    digits = len(str(abs(raw)))
+    if digits <= 10:
+        return raw * 1_000_000_000
+    if digits <= 13:
+        return raw * 1_000_000
+    if digits <= 16:
+        return raw * 1_000
+    return raw
+
+
 class _PositionSnap:
     __slots__ = ("size", "avg_price", "trailing_stop", "updated_ts")
 
@@ -336,7 +354,7 @@ class BybitWsPrivate:
                             venue="bybit", symbol=sym, position_idx=idx,
                             side=it.get("side", ""), size=size,
                             avg_price=avg, trailing_stop=trail,
-                            ts_ns=int(it.get("updatedTime") or time.time_ns()),
+                            ts_ns=_epoch_ns(it.get("updatedTime")),
                             raw=it,
                         )
                     except Exception as e:  # noqa: BLE001
@@ -388,7 +406,7 @@ class BybitWsPrivate:
                             client_order_id=link, status=status,
                             exchange_order_id=order_id, avg_price=avg,
                             cum_exec_qty=cum,
-                            ts_ns=int(it.get("updatedTime") or time.time_ns()),
+                            ts_ns=_epoch_ns(it.get("updatedTime")),
                             raw=it,
                         )
                     except Exception as e:  # noqa: BLE001
@@ -415,9 +433,25 @@ class BybitWsPrivate:
                     qty=float(it.get("execQty", 0) or 0),
                     fee=float(it.get("execFee", 0) or 0),
                     fee_asset=it.get("feeCurrency", ""),
-                    ts_ns=int(it.get("execTime") or time.time_ns()),
+                    ts_ns=_epoch_ns(it.get("execTime")),
                     raw=it,
                 )
+                symbol = it.get("symbol", "")
+                link = it.get("orderLinkId", "")
+                if symbol.endswith("USDT") and link:
+                    from api.delist_api import get_bbo
+                    bbo = get_bbo(symbol[:-4])
+                    if bbo:
+                        self._persist(
+                            "record_market_snapshot",
+                            signal_id="", client_order_id=link,
+                            venue="bybit", symbol=symbol, stage="fill",
+                            bid=bbo["bid1Price"], ask=bbo["ask1Price"],
+                            bid_qty=bbo["bid1Size"], ask_qty=bbo["ask1Size"],
+                            depth_bids=[[bbo["bid1Price"], bbo["bid1Size"]]],
+                            depth_asks=[[bbo["ask1Price"], bbo["ask1Size"]]],
+                            ts_ns=time.time_ns(),
+                        )
             except Exception as e:  # noqa: BLE001
                 print(f"[BYBIT-WS-PRIV] execution persist failed: {e!r}", flush=True)
 
