@@ -1024,6 +1024,13 @@ def _record_order_intent(event_type: str, coin: str, symbol: str, side: str,
                 depth_asks=[[bbo["ask1Price"], bbo["ask1Size"]]],
                 ts_ns=time.time_ns(),
             )
+        from storage.runtime import get_l2_worker
+        l2_worker = get_l2_worker()
+        if l2_worker is not None:
+            l2_worker.submit(
+                signal_id=signal_id, client_order_id=order_link_id,
+                symbol=symbol, stage="send_l2",
+            )
     except Exception as e:  # noqa: BLE001
         print(f"[EXEC-STORE] intent enqueue failed: {e!r}", flush=True)
 

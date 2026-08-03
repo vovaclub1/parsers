@@ -7,7 +7,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from research.tca import implementation_shortfall_bps
+from research.tca import implementation_shortfall_bps, sweep_book
 
 
 def _summary(values):
@@ -32,6 +32,12 @@ def build_report(db_path: str | Path) -> dict:
             "SELECT * FROM market_snapshots WHERE stage='send' ORDER BY ts_ns"
         ).fetchall()
     }
+    l2_snapshots = {
+        r["client_order_id"]: r
+        for r in con.execute(
+            "SELECT * FROM market_snapshots WHERE stage='send_l2' ORDER BY ts_ns"
+        ).fetchall()
+    }
     grouped = defaultdict(list)
     for fill in fills:
         grouped[fill["client_order_id"]].append(fill)
@@ -53,6 +59,8 @@ def build_report(db_path: str | Path) -> dict:
             "fill_vwap": vwap, "qty": total_qty, "fee": fee,
             "first_fill_ns": first_fill_ns, "has_bbo": snap is not None,
             "shortfall_bps": None, "latency_ms": None, "spread_bps": None,
+            "expected_l2_vwap": None, "l2_complete": False,
+            "fill_vs_l2_slippage_bps": None,
         }
         if snap is not None:
             side = "buy" if str(parts[0]["side"]).lower() == "buy" else "sell"
@@ -61,6 +69,19 @@ def build_report(db_path: str | Path) -> dict:
             )
             row["spread_bps"] = float(snap["spread_bps"])
             row["latency_ms"] = (first_fill_ns - int(snap["ts_ns"])) / 1_000_000
+            l2 = l2_snapshots.get(link)
+            if l2 is not None and order is not None:
+                levels_json = l2["depth_asks_json"] if side == "buy" else l2["depth_bids_json"]
+                levels = json.loads(levels_json or "[]")
+                requested_notional = float(order["requested_qty"] or 0) * float(snap["mid"])
+                if requested_notional > 0:
+                    sweep = sweep_book(levels, requested_notional, side)
+                    row["expected_l2_vwap"] = sweep["vwap"]
+                    row["l2_complete"] = sweep["complete"]
+                    if sweep["vwap"] > 0:
+                        row["fill_vs_l2_slippage_bps"] = implementation_shortfall_bps(
+                            side, sweep["vwap"], vwap, fee_bps=0,
+                        )
         per_order.append(row)
 
     covered = [x for x in per_order if x["has_bbo"]]
@@ -69,6 +90,7 @@ def build_report(db_path: str | Path) -> dict:
     for event_type in sorted({x["event_type"] for x in per_order}):
         rows = [x for x in per_order if x["event_type"] == event_type]
         cov = [x for x in rows if x["has_bbo"]]
+        l2_rows = [x for x in rows if x["expected_l2_vwap"] is not None]
         cohorts[event_type] = {
             "orders": len(rows),
             "orders_with_send_bbo": len(cov),
@@ -78,6 +100,12 @@ def build_report(db_path: str | Path) -> dict:
             "spread_bps_median": statistics.median(x["spread_bps"] for x in cov) if cov else None,
             "implementation_shortfall_bps_median": statistics.median(x["shortfall_bps"] for x in cov) if cov else None,
             "first_fill_latency_ms_median": statistics.median(x["latency_ms"] for x in cov) if cov else None,
+            "expected_l2_vwap_mean": statistics.mean(x["expected_l2_vwap"] for x in l2_rows) if l2_rows else None,
+            "l2_complete_pct": round(100 * sum(x["l2_complete"] for x in l2_rows) / len(l2_rows), 2) if l2_rows else 0.0,
+            "fill_vs_l2_slippage_bps_median": statistics.median(
+                x["fill_vs_l2_slippage_bps"] for x in l2_rows
+                if x["fill_vs_l2_slippage_bps"] is not None
+            ) if any(x["fill_vs_l2_slippage_bps"] is not None for x in l2_rows) else None,
         }
 
     cost_summary = _summary(costs)

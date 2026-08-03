@@ -1813,7 +1813,14 @@ if __name__ == "__main__":
                     from storage import runtime as _storage_runtime
                     writer = _storage_runtime.init(Path(STATE_DIR) / "execution.sqlite3")
                     priv_inst.set_execution_store(writer)
-                    log_ok("PARSER", "ExecutionStore SQLite WAL подключён ✓")
+                    from api.delist_api import _get as _bybit_public_get
+                    _storage_runtime.init_l2(
+                        lambda symbol, limit: _bybit_public_get(
+                            "/v5/market/orderbook",
+                            {"category": "linear", "symbol": symbol, "limit": limit},
+                        ).get("result", {})
+                    )
+                    log_ok("PARSER", "ExecutionStore SQLite WAL + L2 capture подключены ✓")
                 except Exception as e:
                     log_warn("PARSER", f"ExecutionStore init упал: {e!r}")
                 if priv_inst.is_ready(wait_sec=5.0):
