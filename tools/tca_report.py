@@ -40,10 +40,18 @@ def build_report(db_path: str | Path) -> dict:
     }
     grouped = defaultdict(list)
     for fill in fills:
-        grouped[fill["client_order_id"]].append(fill)
+        link = fill["client_order_id"]
+        if link:
+            key = f"link:{link}"
+        elif fill["exchange_order_id"]:
+            key = f"order:{fill['exchange_order_id']}"
+        else:
+            key = f"exec:{fill['exec_id']}"
+        grouped[key].append(fill)
 
     per_order = []
-    for link, parts in grouped.items():
+    for execution_key, parts in grouped.items():
+        link = parts[0]["client_order_id"] or ""
         total_qty = sum(float(x["qty"] or 0) for x in parts)
         if total_qty <= 0:
             continue
@@ -55,7 +63,8 @@ def build_report(db_path: str | Path) -> dict:
         signal_id = str(order["signal_id"] if order else "")
         event_type = signal_id.split(":", 1)[0] if ":" in signal_id else "unknown"
         row = {
-            "link": link, "event_type": event_type,
+            "link": link, "execution_key": execution_key,
+            "event_type": event_type,
             "fill_vwap": vwap, "qty": total_qty, "fee": fee,
             "first_fill_ns": first_fill_ns, "has_bbo": snap is not None,
             "shortfall_bps": None, "latency_ms": None, "spread_bps": None,
@@ -113,7 +122,7 @@ def build_report(db_path: str | Path) -> dict:
         "fills": len(fills),
         "orders_filled": len(per_order),
         "orders_with_send_bbo": len(covered),
-        "fills_with_bbo": sum(len(grouped[x["link"]]) for x in covered),
+        "fills_with_bbo": sum(len(grouped[x["execution_key"]]) for x in covered),
         "coverage_pct": round(100 * len(covered) / len(per_order), 2) if per_order else 0.0,
         "fees_total": sum(x["fee"] for x in per_order),
         "implementation_shortfall_bps_mean": cost_summary["mean"],
