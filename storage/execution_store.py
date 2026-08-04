@@ -349,11 +349,22 @@ class ExecutionStore:
             ).fetchone()
             return int(row[0]) if row and row[0] is not None else None
 
-    def list_intents(self, *, venue: str, symbol: str) -> list[dict]:
+    def list_intents(self, *, venue: str, symbol: str,
+                     executed_only: bool = False) -> list[dict]:
         with self._lock:
+            if executed_only:
+                sql = """SELECT o.* FROM orders o
+                         WHERE o.venue=? AND o.symbol=? AND o.signal_id!=''
+                           AND (o.status='Filled' OR EXISTS(
+                               SELECT 1 FROM fills f
+                               WHERE f.client_order_id=o.client_order_id))
+                         ORDER BY o.created_ts_ns"""
+            else:
+                sql = """SELECT * FROM orders
+                         WHERE venue=? AND symbol=? AND signal_id!=''
+                         ORDER BY created_ts_ns"""
             return [dict(r) for r in self.connection.execute(
-                """SELECT * FROM orders WHERE venue=? AND symbol=? AND signal_id!=''
-                   ORDER BY created_ts_ns""", (venue, symbol)
+                sql, (venue, symbol)
             ).fetchall()]
 
     def find_recent_intent(self, *, venue: str, symbol: str,
@@ -375,16 +386,27 @@ class ExecutionStore:
     ) -> bool:
         ts = int(closed_ts_ns if closed_ts_ns is not None else time.time_ns())
         with self._lock, self.connection:
-            cur = self.connection.execute(
-                """INSERT OR IGNORE INTO authoritative_pnl(
+            existed = self.connection.execute(
+                "SELECT 1 FROM authoritative_pnl WHERE venue=? AND close_id=?",
+                (venue, close_id),
+            ).fetchone() is not None
+            self.connection.execute(
+                """INSERT INTO authoritative_pnl(
                        venue,close_id,signal_id,client_order_id,symbol,side,
                        net_pnl,fees,funding,exit_price,closed_ts_ns,raw_json)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(venue,close_id) DO UPDATE SET
+                       signal_id=excluded.signal_id,
+                       client_order_id=excluded.client_order_id,
+                       symbol=excluded.symbol,side=excluded.side,
+                       net_pnl=excluded.net_pnl,fees=excluded.fees,
+                       funding=excluded.funding,exit_price=excluded.exit_price,
+                       closed_ts_ns=excluded.closed_ts_ns,raw_json=excluded.raw_json""",
                 (venue, close_id, signal_id or "", client_order_id or "",
                  symbol, side or "", float(net_pnl), float(fees or 0),
                  float(funding or 0), float(exit_price or 0), ts, _json(raw)),
             )
-            return cur.rowcount == 1
+            return not existed
 
     def get_authoritative_pnl(self) -> list[dict]:
         with self._lock:

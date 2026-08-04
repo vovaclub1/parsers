@@ -7,6 +7,7 @@ from research.closed_pnl_backfill import backfill_records
 def test_backfill_matches_exchange_records_to_intents(tmp_path):
     s = ExecutionStore(tmp_path / "e.db")
     s.record_intent(signal_id="listing:A:1", client_order_id="l", venue="bybit", symbol="AUSDT", side="Sell", requested_qty=1, route="ws", ts_ns=1_700_000_000_000_000_000)
+    s.record_fill(exec_id="e", client_order_id="l", exchange_order_id="o", symbol="AUSDT", side="Sell", price=100, qty=1, ts_ns=1_700_000_000_100_000_000)
     recs = [{"orderId":"c1","symbol":"AUSDT","side":"Sell","closedPnl":"2.5","avgExitPrice":"90","updatedTime":"1700000001000"}]
     n = backfill_records(s, venue="bybit", symbol="AUSDT", records=recs)
     assert n == 1
