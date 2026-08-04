@@ -49,6 +49,7 @@ _PENDING_TTL = 24 * 3600
 # Период опроса closed-pnl. Закрытие не время-критично (это пост-фактум
 # статистика), поэтому редко — бережём rate-limit. 60с.
 _POLL_INTERVAL = 60.0
+_RECONCILE_HORIZON = 30 * 24 * 3600
 
 
 def _epoch_ns(value) -> int:
@@ -176,7 +177,7 @@ class BybitClosedPnL:
         if store is None:
             return
         from research.closed_pnl_backfill import backfill_records
-        cutoff = time.time_ns() - int(_PENDING_TTL * 1_000_000_000)
+        cutoff = time.time_ns() - int(_RECONCILE_HORIZON * 1_000_000_000)
         for symbol in store.list_intent_symbols(venue="bybit", opened_after_ns=cutoff):
             first = store.earliest_intent_ts(venue="bybit", symbol=symbol)
             start_ms = int((first or cutoff) / 1_000_000)

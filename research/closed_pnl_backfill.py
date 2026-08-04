@@ -19,7 +19,9 @@ def _record_ts_ns(venue: str, rec: dict) -> int:
 def backfill_records(store, *, venue: str, symbol: str, records: list[dict]) -> int:
     """FIFO link exchange closed-PnL records to prior intents, idempotently."""
     venue = venue.lower()
-    intents = store.list_intents(venue=venue, symbol=symbol)
+    intents = store.list_intents(
+        venue=venue, symbol=symbol, executed_only=(venue == "bybit"),
+    )
     records = sorted(records, key=lambda r: _record_ts_ns(venue, r))
     used = set()
     inserted = 0

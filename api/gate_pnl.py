@@ -45,6 +45,7 @@ _CLOSE_PATH = "/api/v4/futures/%s/position_close" % _SETTLE
 _PENDING_TTL = 24 * 3600
 # Период опроса (closed-pnl не время-критичен — пост-фактум статистика).
 _POLL_INTERVAL = 60.0
+_RECONCILE_HORIZON = 30 * 24 * 3600
 
 
 def authoritative_record(rec: dict, *, signal_id: str,
@@ -203,7 +204,7 @@ class GateClosedPnL:
         if store is None:
             return
         from research.closed_pnl_backfill import backfill_records
-        cutoff = time.time_ns() - int(_PENDING_TTL * 1_000_000_000)
+        cutoff = time.time_ns() - int(_RECONCILE_HORIZON * 1_000_000_000)
         for contract in store.list_intent_symbols(venue="gate", opened_after_ns=cutoff):
             first = store.earliest_intent_ts(venue="gate", symbol=contract)
             from_ts = int((first or cutoff) / 1_000_000_000)
