@@ -47,6 +47,24 @@ _PENDING_TTL = 24 * 3600
 _POLL_INTERVAL = 60.0
 
 
+def authoritative_record(rec: dict, *, signal_id: str,
+                         client_order_id: str) -> dict:
+    contract = str(rec.get("contract") or "")
+    close_id = str(rec.get("id") or rec.get("order_id") or
+                   f"{contract}:{rec.get('time')}")
+    fees = float(rec.get("pnl_fee", 0) or 0) if "pnl_pnl" in rec else 0.0
+    funding = float(rec.get("pnl_fund", 0) or 0) if "pnl_pnl" in rec else 0.0
+    return {
+        "venue": "gate", "close_id": close_id,
+        "signal_id": signal_id, "client_order_id": client_order_id,
+        "symbol": contract, "side": str(rec.get("side") or ""),
+        "net_pnl": _extract_pnl(rec), "fees": fees, "funding": funding,
+        "exit_price": _extract_exit_price(rec),
+        "closed_ts_ns": int(rec.get("time", 0) or 0) * 1_000_000_000,
+        "raw": rec,
+    }
+
+
 def _extract_pnl(rec: dict) -> float:
     """
     Realized PnL записи закрытия. Новый API разбивает на pnl_pnl (трейдинг),
@@ -84,10 +102,11 @@ class GateClosedPnL:
     """Матчит закрытия Gate-позиций с открытыми нами и зовёт callback с PnL."""
 
     def __init__(self, api_key: str, secret_key: str,
-                 poll_interval: float = _POLL_INTERVAL) -> None:
+                 poll_interval: float = _POLL_INTERVAL, execution_store=None) -> None:
         self._key = api_key or ""
         self._secret = secret_key or ""
         self._poll_interval = poll_interval
+        self._execution_store = execution_store
         self._lock = threading.Lock()
         # contract -> [ {coin, opened_ts, on_pnl}, ... ] (список — не теряем
         # регистрации при повторном входе на тот же контракт)
@@ -102,7 +121,8 @@ class GateClosedPnL:
 
     # ── регистрация открытой позиции ──────────────────────────────
     def register(self, contract: str, coin: str, opened_ts: float,
-                 on_pnl) -> None:
+                 on_pnl, *, signal_id: str = "", client_order_id: str = "",
+                 on_record=None) -> None:
         """
         contract — Gate-формат "FLR_USDT". on_pnl(coin, pnl_usdt, exit_price)
         вызовется один раз когда позиция закроется.
@@ -118,6 +138,9 @@ class GateClosedPnL:
                 "coin": coin,
                 "opened_ts": opened_ts,
                 "on_pnl": on_pnl,
+                "signal_id": signal_id,
+                "client_order_id": client_order_id,
+                "on_record": on_record,
             })
 
     # ── подпись и запрос ──────────────────────────────────────────
@@ -168,8 +191,24 @@ class GateClosedPnL:
             time.sleep(self._poll_interval)
             try:
                 self._tick()
+                self._reconcile_store()
             except Exception as e:  # noqa: BLE001
                 print(f"[GATE-PNL] tick err: {e!r}", flush=True)
+
+    def set_execution_store(self, store) -> None:
+        self._execution_store = store
+
+    def _reconcile_store(self) -> None:
+        store = self._execution_store
+        if store is None:
+            return
+        from research.closed_pnl_backfill import backfill_records
+        cutoff = time.time_ns() - int(_PENDING_TTL * 1_000_000_000)
+        for contract in store.list_intent_symbols(venue="gate", opened_after_ns=cutoff):
+            first = store.earliest_intent_ts(venue="gate", symbol=contract)
+            from_ts = int((first or cutoff) / 1_000_000_000)
+            backfill_records(store, venue="gate", symbol=contract,
+                             records=self._fetch_closed(contract, from_ts))
 
     def _tick(self) -> None:
         now = time.time()
@@ -193,27 +232,32 @@ class GateClosedPnL:
             recs = self._fetch_closed(contract, from_ts)
             if not recs:
                 continue
-            # Берём самое позднее закрытие после самого раннего открытия.
-            best = None
-            for rec in recs:
-                try:
-                    rt = int(rec.get("time", 0))
-                except (TypeError, ValueError):
+            available = sorted(recs, key=lambda rec: int(rec.get("time", 0) or 0))
+            remaining = []
+            for r in sorted(alive, key=lambda x: x["opened_ts"]):
+                idx = next((i for i, rec in enumerate(available)
+                            if int(rec.get("time", 0) or 0) >= int(r["opened_ts"])), None)
+                if idx is None:
+                    remaining.append(r)
                     continue
-                if rt < from_ts:
-                    continue
-                if best is None or rt >= int(best.get("time", 0)):
-                    best = rec
-            if best is None:
-                continue
-            pnl = _extract_pnl(best)
-            exit_price = _extract_exit_price(best)
-            # Закрытие net-позиции относится ко всем активным регистрациям —
-            # снимаем контракт и зовём все callback'и.
-            with self._lock:
-                self._pending.pop(contract, None)
-            for r in alive:
+                best = available.pop(idx)
+                pnl = _extract_pnl(best)
+                exit_price = _extract_exit_price(best)
+                on_record = r.get("on_record")
+                if on_record is not None:
+                    try:
+                        on_record(authoritative_record(
+                            best, signal_id=r.get("signal_id", ""),
+                            client_order_id=r.get("client_order_id", ""),
+                        ))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[GATE-PNL] durable record err {r['coin']}: {e!r}", flush=True)
                 try:
                     r["on_pnl"](r["coin"], pnl, exit_price)
                 except Exception as e:  # noqa: BLE001
                     print(f"[GATE-PNL] callback err {r['coin']}: {e!r}", flush=True)
+            with self._lock:
+                if remaining:
+                    self._pending[contract] = remaining
+                else:
+                    self._pending.pop(contract, None)

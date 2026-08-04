@@ -118,6 +118,24 @@ CREATE TABLE IF NOT EXISTS market_snapshot_events (
 );
 CREATE INDEX IF NOT EXISTS idx_market_snapshot_events_link_stage
     ON market_snapshot_events(client_order_id, stage, ts_ns);
+
+CREATE TABLE IF NOT EXISTS authoritative_pnl (
+    venue TEXT NOT NULL,
+    close_id TEXT NOT NULL,
+    signal_id TEXT NOT NULL DEFAULT '',
+    client_order_id TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL DEFAULT '',
+    net_pnl REAL NOT NULL,
+    fees REAL NOT NULL DEFAULT 0,
+    funding REAL NOT NULL DEFAULT 0,
+    exit_price REAL NOT NULL DEFAULT 0,
+    closed_ts_ns INTEGER NOT NULL,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(venue, close_id)
+);
+CREATE INDEX IF NOT EXISTS idx_authoritative_pnl_signal
+    ON authoritative_pnl(signal_id, closed_ts_ns);
 """
 
 
@@ -314,6 +332,65 @@ class ExecutionStore:
                    WHERE client_order_id=? AND stage=?""",
                 (client_order_id, stage),
             ).fetchone()[0])
+
+    def list_intent_symbols(self, *, venue: str, opened_after_ns: int) -> list[str]:
+        with self._lock:
+            return [str(r[0]) for r in self.connection.execute(
+                """SELECT DISTINCT symbol FROM orders
+                   WHERE venue=? AND signal_id!='' AND created_ts_ns>=?""",
+                (venue, int(opened_after_ns)),
+            ).fetchall()]
+
+    def earliest_intent_ts(self, *, venue: str, symbol: str) -> int | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT MIN(created_ts_ns) FROM orders WHERE venue=? AND symbol=?",
+                (venue, symbol),
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+
+    def list_intents(self, *, venue: str, symbol: str) -> list[dict]:
+        with self._lock:
+            return [dict(r) for r in self.connection.execute(
+                """SELECT * FROM orders WHERE venue=? AND symbol=? AND signal_id!=''
+                   ORDER BY created_ts_ns""", (venue, symbol)
+            ).fetchall()]
+
+    def find_recent_intent(self, *, venue: str, symbol: str,
+                           opened_after_ns: int = 0) -> dict | None:
+        with self._lock:
+            row = self.connection.execute(
+                """SELECT * FROM orders
+                   WHERE venue=? AND symbol=? AND created_ts_ns>=?
+                   ORDER BY created_ts_ns DESC LIMIT 1""",
+                (venue, symbol, int(opened_after_ns)),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def record_authoritative_pnl(
+        self, *, venue: str, close_id: str, signal_id: str,
+        client_order_id: str, symbol: str, side: str, net_pnl: float,
+        fees: float = 0, funding: float = 0, exit_price: float = 0,
+        closed_ts_ns: int | None = None, raw: Any = None,
+    ) -> bool:
+        ts = int(closed_ts_ns if closed_ts_ns is not None else time.time_ns())
+        with self._lock, self.connection:
+            cur = self.connection.execute(
+                """INSERT OR IGNORE INTO authoritative_pnl(
+                       venue,close_id,signal_id,client_order_id,symbol,side,
+                       net_pnl,fees,funding,exit_price,closed_ts_ns,raw_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (venue, close_id, signal_id or "", client_order_id or "",
+                 symbol, side or "", float(net_pnl), float(fees or 0),
+                 float(funding or 0), float(exit_price or 0), ts, _json(raw)),
+            )
+            return cur.rowcount == 1
+
+    def get_authoritative_pnl(self) -> list[dict]:
+        with self._lock:
+            return [dict(row) for row in self.connection.execute(
+                "SELECT * FROM authoritative_pnl ORDER BY closed_ts_ns"
+            ).fetchall()]
 
     def get_order(self, client_order_id: str) -> dict | None:
         with self._lock:

@@ -816,19 +816,61 @@ def _sig_lag(coin: str, loser: str, winner: str, lag_ms: float) -> None:
 
 
 def _register_pnl(coin: str, src: str, venue: str) -> None:
-    """Регистрирует позицию в closed-pnl поллере (Bybit ИЛИ Gate)."""
+    """Регистрирует authoritative closed PnL с lifecycle linkage."""
     v = (venue or "").lower()
+    opened_ts = time.time()
+    symbol = f"{coin}USDT" if v == "bybit" else f"{coin}_USDT"
+    signal_id = ""
+    client_order_id = ""
+    on_record = None
+    try:
+        from storage import runtime as _storage_runtime
+        store = _storage_runtime.get_store()
+        writer = _storage_runtime.get_writer()
+        if store is not None:
+            recent = store.find_recent_intent(
+                venue=v, symbol=symbol,
+                opened_after_ns=int((opened_ts - 30) * 1_000_000_000),
+            )
+            if recent is None and v == "gate":
+                import uuid
+                client_order_id = f"gate-{uuid.uuid4().hex}"
+                signal_id = f"delisting:{coin}:{time.time_ns()}"
+                writer.submit(
+                    "record_intent", signal_id=signal_id,
+                    client_order_id=client_order_id, venue="gate",
+                    symbol=symbol, side="Buy", requested_qty=0,
+                    route="gate_fallback", ts_ns=time.time_ns(),
+                )
+            elif recent is not None:
+                signal_id = recent.get("signal_id", "")
+                client_order_id = recent.get("client_order_id", "")
+        if writer is not None:
+            def on_record(record):
+                if not record.get("signal_id") and store is not None:
+                    recent = store.find_recent_intent(
+                        venue=v, symbol=symbol,
+                        opened_after_ns=int((opened_ts - 30) * 1_000_000_000),
+                    )
+                    if recent:
+                        record["signal_id"] = recent.get("signal_id", "")
+                        record["client_order_id"] = recent.get("client_order_id", "")
+                return writer.submit("record_authoritative_pnl", **record)
+    except Exception as e:  # noqa: BLE001
+        log_warn("PNL", f"lifecycle lookup failed {coin}: {e!r}")
 
     def _on_pnl(c: str, pnl: float, exit_price: float, _s=src) -> None:
         if _sig_stats is not None:
             _sig_stats.log_pnl(c, _s, pnl, exit_price)
     try:
+        kwargs = dict(signal_id=signal_id, client_order_id=client_order_id,
+                      on_record=on_record)
         if v == "bybit" and _pnl_poller is not None:
-            _pnl_poller.register(f"{coin}USDT", coin, time.time(), _on_pnl)
+            _pnl_poller.register(symbol, coin, opened_ts, _on_pnl, **kwargs)
         elif v == "gate" and _gate_pnl_poller is not None:
-            _gate_pnl_poller.register(f"{coin}_USDT", coin, time.time(), _on_pnl)
-    except Exception:  # noqa: BLE001
-        pass
+            _gate_pnl_poller.register(symbol, coin, opened_ts, _on_pnl, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        log_warn("PNL", f"register failed {coin}/{v}: {e!r}")
 
 
 def _measure_lag(coin: str) -> tuple[str, float] | None:
@@ -1816,6 +1858,15 @@ if __name__ == "__main__":
                     from storage import runtime as _storage_runtime
                     writer = _storage_runtime.init(Path(STATE_DIR) / "execution.sqlite3")
                     priv_inst.set_execution_store(writer)
+                    if _pnl_poller is not None:
+                        _pnl_poller.set_execution_store(writer.store)
+                    if _gate_pnl_poller is not None:
+                        _gate_pnl_poller.set_execution_store(writer.store)
+                    from research.legacy_gate_import import import_gate_intents
+                    import_gate_intents(writer.store, [
+                        (Path(STATE_DIR) / "signal_events.jsonl", "listing"),
+                        (Path(STATE_DIR) / "delist_signal_events.jsonl", "delisting"),
+                    ])
                     from api.delist_api import _get as _bybit_public_get
                     _storage_runtime.init_l2(
                         lambda symbol, limit: _bybit_public_get(

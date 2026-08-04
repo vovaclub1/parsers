@@ -20,6 +20,7 @@ def build_production_report(state_dir: str | Path) -> dict:
     state = Path(state_dir)
     db = state / "execution.sqlite3"
     con = sqlite3.connect(str(db), timeout=10)
+    con.row_factory = sqlite3.Row
     integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
     counts = {}
     for table in ("orders", "order_events", "fills", "positions",
@@ -31,9 +32,22 @@ def build_production_report(state_dir: str | Path) -> dict:
     unmatched_fills = int(con.execute(
         "SELECT COUNT(*) FROM fills WHERE client_order_id=''"
     ).fetchone()[0])
+    authoritative = [dict(r) for r in con.execute(
+        "SELECT * FROM authoritative_pnl ORDER BY closed_ts_ns"
+    ).fetchall()]
     con.close()
 
-    trades = reconcile_trades(db)
+    by_venue = {}
+    for venue in ("bybit", "gate"):
+        rows = [r for r in authoritative if r["venue"] == venue]
+        by_venue[venue] = {
+            "closed": len(rows),
+            "net_pnl": sum(float(r["net_pnl"] or 0) for r in rows),
+            "fees": sum(float(r["fees"] or 0) for r in rows),
+            "funding": sum(float(r["funding"] or 0) for r in rows),
+            "unlinked": sum(not r["signal_id"] for r in rows),
+        }
+    trades = reconcile_trades(db)  # execution-derived diagnostics only
     statuses = {name: sum(x["status"] == name for x in trades)
                 for name in ("OPEN", "PARTIALLY_CLOSED", "CLOSED")}
     source_stats = _read_json(state / "source_stats.json")
@@ -46,14 +60,21 @@ def build_production_report(state_dir: str | Path) -> dict:
             "unmatched_exit_fills": unmatched_fills,
         },
         "tca": build_tca_report(db),
-        "reconciliation": {
+        "authoritative_pnl": {
+            "source": "exchange_closed_pnl",
+            "closed": len(authoritative),
+            "net_pnl": sum(float(r["net_pnl"] or 0) for r in authoritative),
+            "by_venue": by_venue,
+            "unlinked": sum(not r["signal_id"] for r in authoritative),
+        },
+        "execution_diagnostics": {
             "trades": len(trades),
             "open": statuses["OPEN"],
             "partially_closed": statuses["PARTIALLY_CLOSED"],
             "closed": statuses["CLOSED"],
-            "realized_exec_pnl": sum(x["realized_pnl"] for x in trades),
+            "sum_exec_pnl": sum(x["realized_pnl"] for x in trades),
             "recorded_fees": sum(x["fees"] for x in trades),
-            "pnl_after_recorded_fees": sum(x["net_pnl"] for x in trades),
+            "exec_pnl_minus_fees": sum(x["net_pnl"] for x in trades),
         },
         "sources": {
             "first_wins": source_stats.get("first_wins", {}),
@@ -64,13 +85,26 @@ def build_production_report(state_dir: str | Path) -> dict:
 
 
 def render_text(report: dict) -> str:
-    e, r, t = report["execution"], report["reconciliation"], report["tca"]
+    e = report["execution"]
+    a = report["authoritative_pnl"]
+    d = report["execution_diagnostics"]
+    t = report["tca"]
+    bybit = a["by_venue"]["bybit"]
+    gate = a["by_venue"]["gate"]
+    authoritative_line = (
+        f"Authoritative net PnL: {a['net_pnl']:.4f} USDT "
+        f"(Bybit {bybit['net_pnl']:.4f}, Gate {gate['net_pnl']:.4f}; "
+        f"closed {a['closed']}, unlinked {a['unlinked']})"
+        if a["closed"] else
+        "Authoritative net PnL: нет новых exchange closed-PnL records"
+    )
     return "\n".join([
         "📊 PRODUCTION REPORT",
         f"DB integrity: {report['database']['integrity']}",
         f"Orders/fills/snapshots: {e['orders']}/{e['fills']}/{e['market_snapshots']}",
-        f"Trades closed/open/partial: {r['closed']}/{r['open']}/{r['partially_closed']}",
-        f"ExecPnl/fees/after fees: {r['realized_exec_pnl']:.4f} / {r['recorded_fees']:.4f} / {r['pnl_after_recorded_fees']:.4f} USDT",
+        authoritative_line,
+        f"Execution diagnostics only — closed/open/partial: {d['closed']}/{d['open']}/{d['partially_closed']}",
+        f"Diagnostic execPnl/fees/difference: {d['sum_exec_pnl']:.4f} / {d['recorded_fees']:.4f} / {d['exec_pnl_minus_fees']:.4f} USDT",
         f"BBO coverage: {t['coverage_pct']:.1f}%",
         f"Unlinked exit fills: {e['unmatched_exit_fills']}",
     ])
