@@ -51,17 +51,45 @@ _PENDING_TTL = 24 * 3600
 _POLL_INTERVAL = 60.0
 
 
+def _epoch_ns(value) -> int:
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        return time.time_ns()
+    return raw * 1_000_000 if len(str(abs(raw))) <= 13 else raw
+
+
+def authoritative_record(rec: dict, *, signal_id: str,
+                         client_order_id: str) -> dict:
+    """Normalize Bybit closed-pnl response; closedPnl is authoritative net."""
+    symbol = str(rec.get("symbol") or "")
+    close_id = str(rec.get("orderId") or rec.get("execId") or
+                   f"{symbol}:{rec.get('updatedTime') or rec.get('createdTime')}")
+    return {
+        "venue": "bybit", "close_id": close_id,
+        "signal_id": signal_id, "client_order_id": client_order_id,
+        "symbol": symbol, "side": str(rec.get("side") or ""),
+        "net_pnl": float(rec.get("closedPnl", 0) or 0),
+        "fees": float(rec.get("openFee", 0) or 0) + float(rec.get("closeFee", 0) or 0),
+        "funding": 0.0,
+        "exit_price": float(rec.get("avgExitPrice", 0) or 0),
+        "closed_ts_ns": _epoch_ns(rec.get("updatedTime") or rec.get("createdTime")),
+        "raw": rec,
+    }
+
+
 class BybitClosedPnL:
     """Матчит закрытые позиции Bybit с открытыми нами и зовёт callback с PnL."""
 
     def __init__(self, api_key: str, secret_key: str,
-                 poll_interval: float = _POLL_INTERVAL) -> None:
+                 poll_interval: float = _POLL_INTERVAL, execution_store=None) -> None:
         self._key = api_key or ""
         self._secret = (secret_key or "").encode()
         self._poll_interval = poll_interval
+        self._execution_store = execution_store
         self._lock = threading.Lock()
-        # symbol -> {coin, opened_ts, on_pnl}
-        self._pending: dict[str, dict] = {}
+        # symbol -> [{coin, opened_ts, lifecycle...}, ...]
+        self._pending: dict[str, list[dict]] = {}
         self._session = requests.Session()
         self._session.headers.update({
             "X-BAPI-API-KEY":     self._key,
@@ -74,7 +102,8 @@ class BybitClosedPnL:
 
     # ── регистрация открытой позиции ──────────────────────────────
     def register(self, symbol: str, coin: str, opened_ts: float,
-                 on_pnl) -> None:
+                 on_pnl, *, signal_id: str = "", client_order_id: str = "",
+                 on_record=None) -> None:
         """
         Регистрирует только что открытую Bybit-позицию для отслеживания.
         on_pnl(coin: str, pnl_usdt: float, exit_price: float) — вызовётся
@@ -83,11 +112,14 @@ class BybitClosedPnL:
         if not self.enabled:
             return
         with self._lock:
-            self._pending[symbol] = {
+            self._pending.setdefault(symbol, []).append({
                 "coin": coin,
                 "opened_ts": opened_ts,
                 "on_pnl": on_pnl,
-            }
+                "signal_id": signal_id,
+                "client_order_id": client_order_id,
+                "on_record": on_record,
+            })
 
     # ── подпись и запрос ──────────────────────────────────────────
     def _signed_get(self, path: str, params: dict) -> dict:
@@ -132,33 +164,78 @@ class BybitClosedPnL:
             time.sleep(self._poll_interval)
             try:
                 self._tick()
+                self._reconcile_store()
             except Exception as e:  # noqa: BLE001
                 print(f"[BYBIT-PNL] tick err: {e!r}", flush=True)
+
+    def set_execution_store(self, store) -> None:
+        self._execution_store = store
+
+    def _reconcile_store(self) -> None:
+        store = self._execution_store
+        if store is None:
+            return
+        from research.closed_pnl_backfill import backfill_records
+        cutoff = time.time_ns() - int(_PENDING_TTL * 1_000_000_000)
+        for symbol in store.list_intent_symbols(venue="bybit", opened_after_ns=cutoff):
+            first = store.earliest_intent_ts(venue="bybit", symbol=symbol)
+            start_ms = int((first or cutoff) / 1_000_000)
+            backfill_records(store, venue="bybit", symbol=symbol,
+                             records=self._fetch_closed(symbol, start_ms))
 
     def _tick(self) -> None:
         now = time.time()
         with self._lock:
             items = list(self._pending.items())
-        for symbol, info in items:
-            # Просрочка — снимаем с отслеживания.
-            if now - info["opened_ts"] > _PENDING_TTL:
+        for symbol, regs in items:
+            alive = [r for r in regs if now - r["opened_ts"] <= _PENDING_TTL]
+            if not alive:
                 with self._lock:
                     self._pending.pop(symbol, None)
                 continue
-            start_ms = int(info["opened_ts"] * 1000)
-            for rec in self._fetch_closed(symbol, start_ms):
+            start_ms = int(min(r["opened_ts"] for r in alive) * 1000)
+            recs = self._fetch_closed(symbol, start_ms)
+            if not recs:
+                with self._lock:
+                    self._pending[symbol] = alive
+                continue
+            def _rec_ms(rec):
+                try:
+                    return int(rec.get("updatedTime") or rec.get("createdTime") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            available = sorted(recs, key=_rec_ms)
+            remaining = []
+            for info in sorted(alive, key=lambda x: x["opened_ts"]):
+                opened_ms = int(info["opened_ts"] * 1000)
+                match_idx = next((i for i, rec in enumerate(available)
+                                  if _rec_ms(rec) >= opened_ms), None)
+                if match_idx is None:
+                    remaining.append(info)
+                    continue
+                rec = available.pop(match_idx)
                 try:
                     closed_pnl = float(rec.get("closedPnl", 0))
                     exit_price = float(rec.get("avgExitPrice", 0) or 0)
                 except (TypeError, ValueError):
+                    remaining.append(info)
                     continue
-                # Нашли закрытие для нашей позиции — зовём callback и снимаем.
-                cb = info["on_pnl"]
                 coin = info["coin"]
-                with self._lock:
-                    self._pending.pop(symbol, None)
+                on_record = info.get("on_record")
+                if on_record is not None:
+                    try:
+                        on_record(authoritative_record(
+                            rec, signal_id=info.get("signal_id", ""),
+                            client_order_id=info.get("client_order_id", ""),
+                        ))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[BYBIT-PNL] durable record err {coin}: {e!r}", flush=True)
                 try:
-                    cb(coin, closed_pnl, exit_price)
+                    info["on_pnl"](coin, closed_pnl, exit_price)
                 except Exception as e:  # noqa: BLE001
                     print(f"[BYBIT-PNL] callback err {coin}: {e!r}", flush=True)
-                break  # одна позиция = одно закрытие, дальше не смотрим
+            with self._lock:
+                if remaining:
+                    self._pending[symbol] = remaining
+                else:
+                    self._pending.pop(symbol, None)
